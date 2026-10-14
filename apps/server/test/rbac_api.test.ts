@@ -1213,19 +1213,71 @@ test('★ 缓存命中时 auth/settings/retrieval 必须**实时**（HTTP 级：
     assert.equal(kgOf(fresh.body).dataCount, 1);
     assert.deepEqual(kgOf(fresh.body), kgOf(hit.body), '★ 两条路径的 retrieval 段必须逐字段一致');
 
-    // ⑥ 明确标注了"哪些字段实时"（新增字段时被迫做一次显式决定，见 AGENTS.md 坑 19）
-    assert.deepEqual(
-      hit.body.realtime_fields,
-      ['auth', 'settings', 'retrieval'],
-      '★ 白名单必须显式可见（这就是防止第 4 次踩坑的机制）',
+    // ⑥ 明确标注了"哪些字段可缓存 / 哪些实时"（新增字段时被迫做一次显式决定，见 AGENTS.md 坑 19）
+    assert.ok(
+      (hit.body.cacheable_fields as string[]).includes('pi'),
+      '★ 可缓存白名单必须显式可见（这是防止第 4 次踩坑的机制）',
     );
+    assert.deepEqual(
+      hit.body.live_fields,
+      ['auth', 'settings', 'retrieval', 'search'],
+      '★ 实时字段必须显式可见（承诺实时的字段全在这里）',
+    );
+    assert.deepEqual(hit.body.unclassified_fields, [], '★ 不许有未分类字段');
   } finally {
     await live.built.close();
   }
 });
 
-test('users/courses/members：admin 建号、教师建课加成员、学生只能读自己课程', async () => {
+test('★★ 结构守卫：每个顶层字段都必须被显式分类（可缓存 or 实时）—— 忘分类就会红', async () => {
   const live = await listen(await makeApp());
+  try {
+    // 预热（`?deep=0` 浅探测：227ms，避免深探测 19.5s 拖垮测试）
+    const warm = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal(warm.status, 200);
+    const cacheable = warm.body.cacheable_fields as string[];
+    const liveFields = warm.body.live_fields as string[];
+    assert.ok(Array.isArray(cacheable) && cacheable.length > 0, '必须报出可缓存字段白名单');
+    assert.ok(Array.isArray(liveFields) && liveFields.length > 0, '必须报出实时字段白名单');
+    // ★ 实时白名单必须包含"承诺实时"的那几个（语义漂了这里会红）
+    for (const k of ['auth', 'settings', 'retrieval', 'search']) {
+      assert.ok(liveFields.includes(k), `★ ${k} 必须在实时白名单里（承诺实时）`);
+    }
+    // ★ 昂贵探测必须可缓存（否则缓存没意义、首屏又变 7–14s）
+    for (const k of ['pi', 'llm', 'asr', 'sandbox']) {
+      assert.ok(cacheable.includes(k), `${k} 应可缓存（昂贵探测）`);
+    }
+
+    // ★★ 核心：**顶层每个 key 要么可缓存、要么实时** —— 新增字段忘分类时这里会红
+    //    （缓存自身的元数据字段不算"能力字段"，不参与分类）
+    const CACHE_META = new Set([
+      'cached',
+      'cached_age_ms',
+      'cache_ttl_ms',
+      'cacheable_fields',
+      'live_fields',
+      'unclassified_fields',
+    ]);
+    const classified = new Set([...cacheable, ...liveFields]);
+    const unclassified = Object.keys(warm.body).filter((k) => !classified.has(k) && !CACHE_META.has(k));
+    assert.deepEqual(
+      unclassified,
+      [],
+      `★ 有顶层字段没分类：${JSON.stringify(unclassified)} —— ` +
+        '请把它加进 CACHEABLE_FIELDS（允许陈旧）或 LIVE_FIELDS（每次实时），' +
+        '不要依赖"默认缓存"（那是坑 19：忘了就悄悄变陈旧，且测试不会红）',
+    );
+    // 缓存命中路径同样不许出现未分类字段（否则说明"不冒险走重算"被触发了）
+    const hit = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal(hit.body.cached, true, '第二次应命中缓存');
+    assert.deepEqual(hit.body.unclassified_fields, [], '缓存命中时不许有未分类字段');
+    assert.deepEqual(hit.body.cacheable_fields, cacheable, '两条路径的白名单必须一致');
+  } finally {
+    await live.built.close();
+  }
+});
+
+test('users/courses/members：admin 建号、教师建课加成员、学生只能读自己课程', async () => {  const live = await listen(await makeApp());
   try {
     const admin = await login(live, 'admin', ADMIN_PASS);
     await createUser(live, admin.cookie, 'stu9', ['student']);

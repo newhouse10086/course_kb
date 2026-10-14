@@ -644,7 +644,7 @@ export class ManagedAgentSession implements ChatSessionLike {
       sessionId: this.id,
       model: this.modelId(),
       tools,
-      toolsSource: this.manager.toolsSource,
+      toolsSource: this.manager.toolsSource === 'dangerous-opt-in' ? 'dangerous-opt-in' : 'explicit',
       version: this._version,
       persistence: this._persistence,
       persistenceReason: this._persistenceReason,
@@ -895,7 +895,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   readonly agentDir: string | undefined;
   readonly sessionDir: string | null;
   /** 工具从哪来：explicit（我们显式给的，含默认的空集）/ pi-default（**仅当显式放行**） */
-  readonly toolsSource: 'explicit' | 'pi-default';
+  readonly toolsSource: 'explicit' | 'dangerous-opt-in';
   readonly idleTtlMs: number;
   readonly settleGraceMs: number;
 
@@ -948,7 +948,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     }
     // ★ 诚实的来源标注：原实现把"没配"标成 'none'（读起来像"没有工具"），
     //   而实际是 pi 的默认全集 —— 那个自相矛盾的信号（tools=[read,bash…] 而 source='none'）就是事故线索。
-    this.toolsSource = this.toolsConfig === null ? 'pi-default' : 'explicit';
+    this.toolsSource = this.toolsConfig === null ? 'dangerous-opt-in' : 'explicit';
     this.excludeTools = opts.excludeTools;
     this.idleTtlMs = opts.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
     this.settleGraceMs = opts.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;

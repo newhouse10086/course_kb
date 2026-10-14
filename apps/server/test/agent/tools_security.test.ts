@@ -154,7 +154,7 @@ test('★★ 危险内置工具即使被显式列出也会被剔除（除非 all
   m2.closeAll();
 });
 
-test('★ allowPiDefaultTools:true 才允许 pi 默认全集，并如实标 pi-default', async () => {
+test('★ allowPiDefaultTools:true 才允许 pi 默认全集，并标刺眼的 dangerous-opt-in', async () => {
   const { sdk, captured } = capturingSdk();
   const manager = new AgentSessionManager({
     sessionDir: null,
@@ -164,7 +164,8 @@ test('★ allowPiDefaultTools:true 才允许 pi 默认全集，并如实标 pi-d
   });
   await manager.getOrCreate('sec-pi-default');
   assert.equal(captured[0]!.tools, undefined, '显式放行时才不传（= pi 默认）');
-  assert.equal(manager.toolsSource, 'pi-default');
+  // 命名刻意刺眼：lead 裁定不要把它做成「管理员就该有」的默认
+  assert.equal(manager.toolsSource, 'dangerous-opt-in');
   assert.equal(manager.tools, null);
   manager.closeAll();
 });
@@ -208,44 +209,101 @@ test('★ capabilities 如实上报工具（原来是恒为 [] 的假信息）',
   const m2 = new AgentSessionManager({ sessionDir: null, persist: false, sdkLoader: async () => sdk, allowPiDefaultTools: true });
   const caps2 = await capabilities({ force: true, sdkLoader: async () => sdk, manager: m2, llm: { configured: false, missingEnv: ['X'] } });
   assert.equal(caps2.tools, null);
-  assert.equal(caps2.toolsSource, 'pi-default');
+  assert.equal(caps2.toolsSource, 'dangerous-opt-in');
   assert.match(String(caps2.toolsWarning), /bash|read/);
   m2.closeAll();
 });
 
-test('★ chat 通道不传 toolsFor → **不覆盖**管理器配置（安全由管理器默认 [] 兜底）', async () => {
-  let seen: string[] | undefined = ['sentinel'];
-  const session: ChatSessionLike = {
-    id: 'sec-2',
-    isRunning: false,
-    subscribe: () => () => {},
-    prompt: async () => ({ disposition: 'started', aborted: false, syntheticSettled: false }),
-    abort: async () => {},
-    reset: async () => session.readyFrame(),
-    readyFrame: (): ReadyFrame => ({
-      type: 'ready', session_id: 'sec-2', model: null, tools: [], tools_source: 'explicit', version: null,
-      mode: 'sdk', persistence: 'ephemeral', persistence_reason: 't', session_file: null,
-      pi_session_id: null, thinking_level: null, restarted: false,
-    }),
-  };
-  const conn = await createChatConnection({
-    sessionId: 'sec-default-tools',
-    send: () => {},
-    manager: {
-      async getOrCreate(_id: string, init?: { tools?: string[] }) {
-        seen = init?.tools;
-        return session;
-      },
-      release: () => {},
-    },
-  });
-  assert.equal(seen, undefined, '没配 toolsFor 就不该指定工具（交给管理器；管理器默认就是 []）');
-  await conn.close();
+test('★★ 通道层三态策略：disabled-by-role / explicit / dangerous-opt-in（与 tools 永远一致）', async () => {
+  function probe(connOpts: Record<string, unknown>, managerTools: string[] | null = []) {
+    const seen: { tools?: string[] } = {};
+    const frames: AgentFrame[] = [];
+    const session: ChatSessionLike = {
+      id: 'p',
+      isRunning: false,
+      subscribe: () => () => {},
+      prompt: async () => ({ disposition: 'started', aborted: false, syntheticSettled: false }),
+      abort: async () => {},
+      reset: async () => session.readyFrame(),
+      readyFrame: (): ReadyFrame => ({
+        type: 'ready', session_id: 'p', model: null, tools: [], tools_source: 'explicit', version: null,
+        mode: 'sdk', persistence: 'ephemeral', persistence_reason: 't', session_file: null,
+        pi_session_id: null, thinking_level: null, restarted: false,
+      }),
+    };
+    return (async () => {
+      const conn = await createChatConnection({
+        sessionId: 'policy-probe',
+        send: (f) => {
+          frames.push(f);
+        },
+        manager: {
+          get tools() {
+            return managerTools;
+          },
+          async getOrCreate(_id: string, init?: { tools?: string[] }) {
+            seen.tools = init?.tools;
+            return session;
+          },
+          release: () => {},
+        },
+        ...connOpts,
+      });
+      await conn.close();
+      return { passedTools: seen.tools, ready: frames.find((f) => f.type === 'ready') as ReadyFrame };
+    })();
+  }
 
-  // 安全底线仍在**管理器**层：默认管理器就是无工具（见第 1、2 条测试）
-  const { sdk, captured } = capturingSdk();
-  const manager = new AgentSessionManager({ sessionDir: null, persist: false, sdkLoader: async () => sdk });
-  await manager.getOrCreate('sec-default-tools-2');
-  assert.deepEqual(captured[0]!.tools, [], '★ 管理器默认必须显式传 []');
-  manager.closeAll();
+  // ① 什么都不传（缺省）→ **显式空数组** + disabled-by-role
+  const a = await probe({});
+  assert.deepEqual(a.passedTools, [], '★ 必须显式传 []（不依赖"不传 = 空"这种隐式默认）');
+  assert.equal(a.ready.tools_source, 'disabled-by-role');
+
+  // ② teacher/student（allowTools=false）→ 同上
+  const b = await probe({ allowTools: false, user: { id: 'u1', roles: ['student'] } });
+  assert.deepEqual(b.passedTools, []);
+  assert.equal(b.ready.tools_source, 'disabled-by-role');
+
+  // ★★ ③ admin（allowTools=true）→ **也是空集**（lead 裁定：管理员不等于可以借浏览器执行主机命令）
+  const c = await probe({ allowTools: true, user: { id: 'a1', roles: ['admin'] } }, null);
+  assert.deepEqual(c.passedTools, [], '★ admin 默认也必须显式传 []（不依赖角色推断危险能力）');
+  assert.equal(c.ready.tools_source, 'disabled-by-role');
+
+  // ③' admin + 管理器放行过 pi 默认 → 仍被连接层按策略关掉（连接层是权威）
+  const c2 = await probe({ allowTools: true, user: { id: 'a1', roles: ['admin'] } }, null);
+  assert.deepEqual(c2.passedTools, [], '管理器配了什么都不能让 admin 悄悄拿到全集');
+
+  // ④ admin + 显式白名单 → explicit 且下传
+  const d = await probe({ allowTools: true, tools: ['kb_read'], user: { id: 'a1', roles: ['admin'] } });
+  assert.deepEqual(d.passedTools, ['kb_read']);
+  assert.equal(d.ready.tools_source, 'explicit');
+
+  // ⑤ ★ 危险 opt-in 必须**独立开关**（不来自角色）→ 才允许落到 pi 默认
+  const g = await probe({ dangerousTools: true, user: { id: 'a1', roles: ['admin'] } });
+  assert.equal(g.passedTools, undefined, '危险 opt-in：交给管理器（它还需 allowPiDefaultTools）');
+  assert.equal(g.ready.tools_source, 'dangerous-opt-in');
+  // ★ 危险状态要**在帧里说出来**（独立验收建议：免得教师借 admin 账号演示时把 shell 交给学生）
+  assert.match(String(g.ready.tools_warning), /主机工具|bash/);
+  assert.match(String(g.ready.tools_warning), /演示|共享账号|浏览器/);
+  // 安全状态下不能有这条警告（否则成噪音、失去警示作用）
+  assert.equal(a.ready.tools_warning, undefined, '默认（无工具）不该有危险警告');
+  assert.equal(d.ready.tools_warning, undefined, 'explicit 白名单也不该有危险警告');
+
+  // ⑤' 危险 opt-in + 白名单 → explicit
+  const g2 = await probe({ dangerousTools: true, tools: ['kb_read'] });
+  assert.deepEqual(g2.passedTools, ['kb_read']);
+
+  // ⑥ toolsFor 优先（按角色自定义）
+  const e = await probe({
+    toolsFor: (u: { roles?: string[] }) => (u.roles?.includes('admin') ? ['kb_read'] : []),
+    user: { id: 'a1', roles: ['admin'] },
+  });
+  assert.deepEqual(e.passedTools, ['kb_read']);
+  assert.equal(e.ready.tools_source, 'explicit');
+  const f = await probe({
+    toolsFor: (u: { roles?: string[] }) => (u.roles?.includes('admin') ? ['kb_read'] : []),
+    user: { id: 's1', roles: ['student'] },
+  });
+  assert.deepEqual(f.passedTools, []);
+  assert.equal(f.ready.tools_source, 'disabled-by-role');
 });

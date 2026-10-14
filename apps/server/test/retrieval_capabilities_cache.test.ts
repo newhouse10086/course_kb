@@ -112,7 +112,12 @@ interface CapsBody {
   cached?: boolean;
   cached_age_ms?: number;
   cache_ttl_ms?: number;
-  realtime_fields?: string[];
+  /** ★ Lead 裁定的 fail-safe 方向：**可缓存**白名单（昂贵探测 + 静态值） */
+  cacheable_fields?: string[];
+  /** ★ 缓存命中时必须实时重算的字段（`realtime_fields` 已被它取代） */
+  live_fields?: string[];
+  /** 既不可缓存、也不在实时集 → 结构守卫生效时为 `[]` */
+  unclassified_fields?: string[];
   retrieval?: {
     wiki?: { available: boolean; dataReady: boolean; dataCount: number };
     kg?: { available: boolean; dataReady: boolean; dataCount: number; reason: string };
@@ -123,7 +128,7 @@ interface CapsBody {
 
 /**
  * ★ 统一走 `?deep=0`（浅探测）—— **本文件测的是"缓存有没有冻住状态字段"，
- * 与深/浅探测无关**：`realtimeFields()`（`auth`/`settings`/`retrieval`）在**两条路径上
+ * 与深/浅探测无关**：`liveFields()`（`auth`/`settings`/`retrieval`/`search`）在**两条路径上
  * 都会被调用**，所以浅探测足以覆盖本 bug class。
  *
  * `[实测]` 本机：深探测单次 **19.5s**（pi 加载 + 模型探测 + 4 引擎探测），
@@ -272,7 +277,36 @@ test('★ 缓存机制本身仍生效（修实时性不许把缓存整个删掉�
   const second = await getCaps();
   assert.equal(second.cached, true, 'TTL 内应命中缓存（性能优化必须保留）');
   assert.ok((second.cached_age_ms ?? -1) >= 0, 'age 必须如实上报');
-  assert.deepEqual(second.realtime_fields, ['auth', 'settings', 'retrieval'], '实时白名单要如实列出');
+
+  // ★ Lead 裁定的**方向反转**（fail-safe）：白名单从"实时"改成"可缓存"。
+  //   忘了分类 → 新字段按**实时**处理（安全，只是慢一点），
+  //   而不是被悄悄缓存成陈旧值（不安全且测试不红）。
+  //   字段名随之改变：`realtime_fields` → `live_fields`（且多了 `search`：
+  //   它是"当前状态" —— 抽完资料 FTS 行数要立刻可见，与 `dataReady` 同类）。
+  //
+  //   ⚠️ 这里用 **"包含"而不是"相等"**（Lead 裁定）：
+  //   将来**新增实时字段**不该让本测试红（那是进步，不是回归）；
+  //   真正该红的是"**漏分类**"，由 `unclassified_fields` 与 backend-api 的结构守卫管。
+  //   若用"相等"，每次扩清单都要来改这条断言 → 会训练人"顺手改断言"而削弱它。
+  //   **测试该断言"承诺实时的字段确实实时"，不是"清单恰好等于某值"。**
+  for (const f of ['auth', 'settings', 'retrieval', 'search']) {
+    assert.ok(
+      (second.live_fields ?? []).includes(f),
+      `★ 承诺实时的字段必须出现在 live_fields：缺 ${f}（实测 ${JSON.stringify(second.live_fields)}）`,
+    );
+  }
+  assert.ok(
+    second.cacheable_fields?.includes('pi'),
+    `可缓存白名单要如实列出（否则"缓存昂贵探测"就无从验证）；实测 ${JSON.stringify(second.cacheable_fields)}`,
+  );
+  assert.deepEqual(
+    second.unclassified_fields,
+    [],
+    '★ 不许有未分类字段 —— 这是"新字段忘分类会被抓住"的结构守卫',
+  );
+  // 两个白名单必须**互斥**（同一字段既缓存又实时 = 两处真相，迟早漂）
+  const overlap = (second.cacheable_fields ?? []).filter((f) => (second.live_fields ?? []).includes(f));
+  assert.deepEqual(overlap, [], `★ 可缓存与实时白名单不许有交集，实测重叠：${JSON.stringify(overlap)}`);
 
   // 再确认一次强制刷新仍能绕过
   const forced = await getCaps('?refresh=1');

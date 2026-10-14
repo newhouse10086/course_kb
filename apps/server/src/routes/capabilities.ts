@@ -135,34 +135,66 @@ function llmBlock(deps: AppDeps, caps: Record<string, unknown> | undefined): Rec
 const CAPS_TTL_MS = 15_000;
 
 /**
- * 缓存命中时**必须实时重算**的字段（白名单）。
+ * ★★ **只有这些字段允许"陈旧"**（走缓存）；**其余一律实时重算** —— fail-safe 方向。
  *
- * ## 为什么要有这个白名单（这个 bug class 已踩**两次**）
- * 加 15s 缓存是为了修"首屏 7–14s"，但缓存会**悄悄抵消**掉"某些字段承诺实时"的语义：
- * 1. `auth.bootstrap` —— 语义是"实时反映库里有没有用户"（启动后 `create-admin` 建号要立刻变
- *    `initialized`）。被缓存冻住 → 复活"启动瞬间快照"那个 bug。（kg-rag 抓到）
- * 2. `retrieval.*.dataReady` —— 语义是"**当前**有没有数据"（抽完资料要立刻变 `true`）。
- *    被缓存冻住 → 抽完后 15s 内仍显示"知识库为空 → 先去抽取" → **学生会重复去抽**。（kg-rag 实测）
+ * ## 为什么是"可缓存白名单"而不是"实时白名单"（Lead 裁定的方向反转）
+ * 我原先写的是 `REALTIME_ON_CACHE_HIT`（默认缓存、靠记得把新字段加进实时白名单）——
+ * 这个坑**一轮内踩了 3 次**（`auth.bootstrap` / `settings.activeModel` / `retrieval.dataReady`），
+ * 说明"靠记得加"不可靠。反转之后：
+ * - **忘了分类 → 新字段按"实时"处理**（安全，最多慢一点）
+ * - 而不是 → 新字段被悄悄缓存成**陈旧值**（不安全，且**测试不会红**）
  *
- * 三者共同点：**都是"当前状态"**，且都**极便宜**（`auth` 一次 COUNT；`retrieval.capabilities()`
- * 实测 0.05ms；`settings` 读内存 store）—— 与"昂贵探测"（pi 加载 ≈2.9s / 模型探测 ≈2.5s /
- * 4 引擎探测 / FTS 计数）差好几个数量级。
+ * ## 判据（写在这里，防止再犯）
+ * **一个"忘了就出错"的设计不可靠；一个"忘了就退化成保守"的设计才可靠。**
+ * 与本项目其它原则一致：默认拒绝鉴权、默认不假装可用、`available` 与 `dataReady` 正交。
  *
- * **判据（写在这里防止第三次）**：加缓存/去重优化时，逐个字段问
- * "这个字段承诺的是**实时**还是**快照**？" —— 承诺实时的，一律放进这里。
+ * ## 漏分类的兜底（靠机制，不靠记得）
+ * 缓存命中前先检查：缓存体里是否有**既不在本白名单、也不在实时集**的顶层 key（= 有人新增字段却没分类）
+ * → 那就**不冒险用缓存**，直接走完整重算，并把清单放进响应的 `unclassified_fields`；
+ * 测试断言它为空 ⟹ **新字段忘分类时会红**。
+ *
+ * ## 历史（这些字段为什么"承诺实时"）
+ * 1. `auth.bootstrap` —— "实时反映库里有没有用户"（启动后 `create-admin` 建号要立刻变 `initialized`）
+ * 2. `settings.activeModel` —— 模型热切换后要立刻可见
+ * 3. `retrieval.*.dataReady` —— "**当前**有没有数据"（抽完资料要立刻变 `true`）
+ * 4. `search` —— FTS 行数（抽完资料要立刻可见）
+ * 共同点：**都是"当前状态"**，且都**极便宜**（一次 COUNT / 读内存 store / 0.05ms / 0.007ms），
+ * 与"昂贵探测"（pi 加载 ≈2.9s / 模型探测 ≈2.5s / 4 引擎探测）差好几个数量级。
  */
-const REALTIME_ON_CACHE_HIT = ['auth', 'settings', 'retrieval'] as const;
+const CACHEABLE_FIELDS = [
+  // 昂贵**真探测**（秒级）：pi 加载 ≈2.9s / 模型探测 ≈2.5s / 4 引擎探测 / worker import
+  'pi',
+  'llm',
+  'asr',
+  'sandbox',
+  'providers',
+  'worker',
+  'ffmpeg',
+  'adapters',
+  'policy',
+  'providers_error',
+  // 启动期就定下来的**静态**值（运行期不变）
+  'version',
+  'schema',
+  'pipeline',
+  'paths',
+] as const;
+
+/** 缓存命中时**必须实时重算**的字段（都很便宜）。 */
+const LIVE_FIELDS = ['auth', 'settings', 'retrieval', 'search'] as const;
 
 export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): void {
   let capsCache: { at: number; key: string; body: Record<string, unknown> } | null = null;
 
-  /** 构造白名单里那几个**实时**字段（缓存命中路径与主路径共用 → 两处语义不会漂）。 */
-  async function realtimeFields(): Promise<Record<string, unknown>> {
+  /** 构造**实时**字段（缓存命中路径与主路径共用 → 两处语义不会漂）。 */
+  async function liveFields(): Promise<Record<string, unknown>> {
     const out: Record<string, unknown> = {
       auth: {
         required: deps.auth.required,
         bootstrap: deps.repo.rbac.countUsers() > 0 ? 'initialized' : 'not_initialized',
       },
+      // 检索/FTS 统计：抽完资料后必须立刻可见（否则 UI 会显示"知识库为空"）
+      search: { ...searchStats(deps.db), selftest: selftestBigram() },
     };
     if (deps.settingsCapabilities) {
       try {
@@ -211,20 +243,30 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
       const forceRefresh = q.refresh === '1' || q.force === '1';
 
       // ★ 短 TTL 缓存：命中就**如实标注** `cached:true` + 年龄（不假装是实时值）
-      // ⚠️ 但白名单里的字段（`REALTIME_ON_CACHE_HIT`）必须**每次实时重算** —— 见那里的注释
-      //   （这个 bug class 已踩两次：`auth.bootstrap` 一次、`retrieval.dataReady` 一次）
+      // ⚠️ 只把 `CACHEABLE_FIELDS`（昂贵探测 + 静态值）走缓存，**其余一律实时重算**；
+      //    若发现**未分类**的顶层字段 → **不冒险用缓存**（走完整重算）—— 见 `CACHEABLE_FIELDS` 注释。
       if (!forceRefresh && capsCache && capsCache.key === cacheKey) {
         const age = Date.now() - capsCache.at;
-        if (age < CAPS_TTL_MS) {
+        const cachedBody = capsCache.body;
+        const cacheable = new Set<string>(CACHEABLE_FIELDS);
+        const live = new Set<string>(LIVE_FIELDS);
+        // 漏分类检测：既不可缓存、也不在实时集 → 新字段默认按"实时/重算"处理（安全方向）
+        const unclassified = Object.keys(cachedBody).filter((k) => !cacheable.has(k) && !live.has(k));
+        if (age < CAPS_TTL_MS && unclassified.length === 0) {
+          const cachedPart: Record<string, unknown> = {};
+          for (const k of CACHEABLE_FIELDS) if (k in cachedBody) cachedPart[k] = cachedBody[k];
           return reply.send({
-            ...capsCache.body, // 只有**昂贵探测**（pi 加载 / 模型探测 / 4 引擎 / FTS 计数）走缓存
-            ...(await realtimeFields()), // ★ 承诺实时的字段：auth / settings / retrieval
+            ...cachedPart, // 只有**允许陈旧**的字段来自缓存
+            ...(await liveFields()), // ★ 其余实时重算：auth / settings / retrieval / search
             cached: true,
             cached_age_ms: age,
             cache_ttl_ms: CAPS_TTL_MS,
-            realtime_fields: [...REALTIME_ON_CACHE_HIT],
+            cacheable_fields: [...CACHEABLE_FIELDS],
+            live_fields: [...LIVE_FIELDS],
+            unclassified_fields: [],
           });
         }
+        // age 到期 或 有未分类字段 → 落到下面**完整重算**（并在响应里如实报出未分类清单）
       }
 
       // worker：真 import 探测（缓存 300s）。走注入的探针，保证测试可控、生产为真执行
@@ -264,7 +306,7 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
 
       const schema = schemaSummary(deps.enums);
 
-      // ④ 检索能力 / ⑤ 系统设置段：**由 `realtimeFields()` 统一构造**（见 `REALTIME_ON_CACHE_HIT`）——
+      // ④ 检索能力 / ⑤ 系统设置段：**由 `liveFields()` 统一构造**（见 `CACHEABLE_FIELDS`）——
       //    这里不再各自算一遍，否则缓存命中路径与主路径就有**两处真相**，迟早漂。
 
       // ④ 学生 SQL 沙箱：逐引擎**真探测**（不可用必给 reason + 指向部署文档）
@@ -284,14 +326,14 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
         };
       }
 
-      // ⑤ 系统设置段：**由 `realtimeFields()` 统一构造**（同 ④，避免两处真相）
+      // ⑤ 系统设置段：**由 `liveFields()` 统一构造**（同 ④，避免两处真相）
 
       const body = {
         version: SERVER_VERSION,        // ⓪ RBAC 自述（docs/RBAC.md §8）：UI 据此决定要不要显示登录页
-        //   `auth` / `retrieval` / `settings` 三个字段与**缓存命中路径共用** `realtimeFields()`
-        //   （见 `REALTIME_ON_CACHE_HIT`）→ 两条路径的语义不会漂。
+        //   `auth` / `settings` / `retrieval` / `search` 与**缓存命中路径共用** `liveFields()`
+        //   （见 `CACHEABLE_FIELDS` / `LIVE_FIELDS`）→ 两条路径的语义不会漂。
         //   历史：`bootstrap` 曾在组装期算一次 → 建号后仍报 `not_initialized`（已修，并加了结构级守卫）。
-        ...(await realtimeFields()),
+        ...(await liveFields()),
         // ④ 学生 SQL 沙箱：**真探测**（逐引擎 + 不可用必给 reason）——
         //    `sqlite` 永远可用；MySQL/PostgreSQL/openGauss 未部署 → 如实 false + 指向部署文档
         sandbox: sandbox,
@@ -318,8 +360,7 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
         providers,
         policy: (providerCaps?.policy as Record<string, string>) ?? deps.cfg.providers.policy,
         ...(providersError ? { providers_error: providersError } : {}),
-        // ④ 检索自述（坑 15 的诚实标注）
-        search: { ...searchStats(deps.db), selftest: selftestBigram() },
+        // ④ 检索自述（坑 15 的诚实标注）+ `search` —— 由 `liveFields()` 统一构造（与缓存命中路径共用）
         // ⑤ 封闭枚举规模（来自 schema/*.json；不许发明）
         schema,
         // ⑥ 已验证的管线常量（AGENTS.md §5：不要重新发明）
@@ -339,7 +380,15 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
       };
       // 只缓存**成功**的响应（出错不缓存，避免把一次故障钉在 TTL 里）
       capsCache = { at: Date.now(), key: cacheKey, body };
-      return reply.send({ ...body, cached: false, cache_ttl_ms: CAPS_TTL_MS });
+      return reply.send({
+        ...body,
+        cached: false,
+        cache_ttl_ms: CAPS_TTL_MS,
+        // 如实报出分类：前端/验收脚本能看出"哪些字段允许陈旧、哪些每次实时"
+        cacheable_fields: [...CACHEABLE_FIELDS],
+        live_fields: [...LIVE_FIELDS],
+        unclassified_fields: [],
+      });
     } catch (err) {
       return sendError(reply, err);
     }

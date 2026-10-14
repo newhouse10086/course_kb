@@ -23,14 +23,7 @@
  * T-BACKEND 接到 WebSocket 或 SSE 上（见文件末尾的使用示例）。
  */
 
-import {
-  AGENT_ERROR_CODES,
-  agentError,
-  classifyFailure,
-  sdkUnavailableError,
-  type AgentErrorCode,
-  type AgentErrorFrame,
-} from './errors.ts';
+import { AGENT_ERROR_CODES, agentError, classifyFailure, sdkUnavailableError, type AgentErrorCode, type AgentErrorFrame } from './errors.ts';
 import {
   describeCitationMode,
   extractCitations,
@@ -44,8 +37,21 @@ import {
 } from './guards.ts';
 
 // ---------------------------------------------------------------------------
-// 帧类型（契约 §7.2；**只允许这 9 种**，多一种都算发明协议）
+// 帧类型（契约 §7.2 的 9 种 + `RETRIEVAL.md` §4 的 `retrieval`）
 // ---------------------------------------------------------------------------
+
+/**
+ * 工具策略三态（`ready.tools_source`），**必须与 `ready.tools` 一致**：
+ * - `disabled-by-role`：按角色策略关掉（student / teacher / **以及未显式放行的 admin**）
+ * - `explicit`：显式白名单（含默认的空集）
+ * - `dangerous-opt-in`：★ **危险**：有人显式开启了危险工具（pi 默认全集）。
+ *   命名刻意刺眼 —— **不要**把它做成"管理员就该有"的默认（lead 裁定：危险能力必须显式开启，
+ *   不能从角色推断；管理员要调试请直接在本机开终端，不必绕道浏览器）。
+ *
+ * ⚠️ 原实现标的是 `none` —— 读起来像"没有工具"，而当时实际是 pi 的默认全集
+ * （`read`/`bash`/`edit`/`write`）。那个自相矛盾的信号就是 shell 漏洞的线索。
+ */
+export type ToolsSource = 'disabled-by-role' | 'explicit' | 'dangerous-opt-in';
 
 export interface ReadyFrame {
   type: 'ready';
@@ -54,8 +60,15 @@ export interface ReadyFrame {
   model: string | null;
   tools: string[];
   /** 扩展（§7.3.1 ⚠️9） */
-  /** ★ 诚实标注：explicit = 我们显式给的（默认空集）/ pi-default = pi 的默认全集（危险，仅显式放行时） */
-  tools_source: 'explicit' | 'pi-default';
+  /** ★ 工具策略（三态；**永远与实际 `tools` 一致**，见 `ToolsSource`） */
+  tools_source: ToolsSource;
+  /**
+   * ★ `tools_source='dangerous-opt-in'` 时的**刺眼警告**（in-band，不让它只活在枚举值里）。
+   *
+   * 来自独立验收的建议：让"本次会话具备主机命令执行能力"**在帧里就能被看到** ——
+   * 免得教师借用 admin 账号演示时把 shell 交到学生手里而没人察觉。
+   */
+  tools_warning?: string;
   version: string | null;
   mode: 'sdk';
   persistence: 'native' | 'ephemeral';
@@ -553,11 +566,33 @@ export function makeRetrievalFrame(opts: {
   };
 }
 
-/** 构造 `ready` 帧（把 ⚠️9 的可观测字段一次给全）。 */export function makeReadyFrame(opts: {
+/**
+ * 把**策略标签**盖到 ready 帧上（工具策略由连接层按角色决定，会话层不知道角色）。
+ *
+ * `tools` 字段保持会话的**真实值**（`getActiveToolNames()`），只把 `tools_source` 标成
+ * 三态策略之一 —— 两者必须一致：`disabled-by-role` 时 `tools` 必然是 `[]`。
+ */
+export function withToolsPolicy(frame: ReadyFrame, policy: ToolsSource): ReadyFrame {
+  return {
+    ...frame,
+    tools_source: policy,
+    // 危险状态**必须在帧里说出来**（不只是枚举值）—— 独立验收建议
+    ...(policy === 'dangerous-opt-in'
+      ? {
+          tools_warning:
+            '本会话已开启主机工具（read/bash/edit/write）：浏览器用户可让 agent 执行服务器命令、读取主机文件。' +
+            '这是显式 opt-in 的结果，不是默认状态 —— 请勿在演示/共享账号下使用。',
+        }
+      : {}),
+  };
+}
+
+/** 构造 `ready` 帧（把 ⚠️9 的可观测字段一次给全）。 */
+export function makeReadyFrame(opts: {
   sessionId: string;
   model: string | null;
   tools: string[];
-  toolsSource: 'explicit' | 'pi-default';
+  toolsSource: ToolsSource;
   version: string | null;
   persistence: 'native' | 'ephemeral';
   persistenceReason: string;
@@ -640,6 +675,11 @@ export interface ChatSessionManagerLike {
    */
   getOrCreate(sessionId: string, init?: { tools?: string[] }): Promise<ChatSessionLike>;
   release(sessionId: string): void;
+  /**
+   * 管理器**当前配置**的工具白名单（`null` = pi 默认全集）。
+   * 可选：连接层用它判断"管理员未指定白名单"时是否真的会落到 pi 默认。
+   */
+  readonly tools?: string[] | null;
 }
 
 export interface ChatConnection {
@@ -672,13 +712,29 @@ export interface CreateChatConnectionOptions {
    */
   user?: { id: string | null; roles?: string[] };
   /**
-   * ★ 按角色的**工具白名单**（RBAC：学生/教师一律无工具；只有管理员按策略给）。
+   * ★ **服务端权威的角色策略**（由 backend-api 按 `req.user.roles` 判定后传入）。
    *
-   * 不传 = 不给任何工具（fail-safe，与 `AgentSessionManager` 的默认一致）。
+   * ⚠️ Lead 裁定：**它不再决定"给不给工具"** —— 任何角色（含 admin）默认都是 `[]`。
+   * 现在它只用于**诊断/审计**（说明是哪个角色、以及为什么没工具）。
+   * 要工具请走 `tools` 白名单；要**危险**工具请走独立开关 `dangerousTools`。
+   */
+  allowTools?: boolean;
+  /**
+   * ★ **危险 opt-in**（独立开关，**不来自角色**）：允许 pi 的默认工具全集
+   * （`read`/`bash`/`edit`/`write`）。
+   *
+   * 默认 **false**。开启意味着"浏览器用户可以让 agent 执行主机命令/读主机文件"——
+   * 仅限本机可信运维场景，且**必须**同时给 `AgentSessionManager` 配 `allowPiDefaultTools: true`
+   * 才真的会生效（两道显式开关）。`ready.tools_source` 会标成刺眼的 `dangerous-opt-in`。
+   */
+  dangerousTools?: boolean;
+  /**
+   * 允许的工具白名单（管理员按策略给；危险内置工具仍会被管理器过滤）。
+   */
+  tools?: string[];
+  /**
+   * ★ 按角色的**工具白名单**（可选，优先级高于 `allowTools`；不传则用 `allowTools` 策略）。
    * 例如：`toolsFor: (u) => (u.roles?.includes('admin') ? ['kb_read'] : [])`
-   *
-   * ⚠️ **危险内置工具**（`bash`/`edit`/`write`/`read`）会被 `AgentSessionManager` 过滤掉
-   * （除非那边显式开了 `allowDangerousTools`）—— 见真事故：学生曾能用 `bash` 在服务器执行命令。
    */
   toolsFor?: (user: { id: string | null; roles?: string[] }) => string[];
   /**
@@ -771,18 +827,45 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
   }
 
   let session: ChatSessionLike;
+  let toolsPolicy: ToolsSource;
   try {
-    // ★ 按角色决定工具白名单。
-    //   - 传了 `toolsFor` → 用它（RBAC：学生/教师给 `[]`，仅 admin 按策略给）
-    //   - **没传 → 不指定**，交给 `AgentSessionManager` 自己的配置决定
-    //     （它现在的默认就是 `[]` = 无工具，fail-safe；只有**显式** `allowPiDefaultTools:true`
-    //      才会放开 pi 的默认全集）。
-    //     ⚠️ 原实现这里硬给 `[]` → 会把管理器上**显式**的 `allowPiDefaultTools` 静默覆盖掉
-    //     （两种配置互相打架，属于"看起来生效其实没有"）。
-    //   真事故：学生连上 chat 后 `ready.tools = ["read","bash","edit","write"]`，
-    //   说一句"用 bash 执行 X"服务器就真的执行 —— 同时绕过 RBAC 与 SQL 沙箱。
-    const requestedTools = typeof opts.toolsFor === 'function' ? opts.toolsFor(opts.user ?? { id: null }) : undefined;
-    session = await manager.getOrCreate(sessionId, requestedTools ? { tools: requestedTools } : undefined);
+    // ★ 角色 → 工具策略（**服务端权威**；客户端帧里的任何 roles/allowTools 一律不读）。
+    //
+    //   真事故（prober 在 live 8787 用 student 复现）：`ready.tools = [read,bash,edit,write]`
+    //   而 `tools_source` 却是 `"none"` —— 代码以为关了、pi 用了默认全集，
+    //   学生一句"用 bash 执行 X"服务器就真的执行。**隐式默认（不传）在 pi 那边 = 全集**。
+    //
+    //   ★ Lead 裁定：**任何角色（含 admin）默认都是 `[]`**。
+    //     "管理员"不等于"可以借浏览器执行主机命令"（产品没有这需求：管理员的合法操作是建号/建课/审核/配模型；
+    //      要调试请直接在本机开终端）。危险能力必须**显式 opt-in**，且**不能从角色推断**。
+    let perSessionTools: string[] | undefined;
+    let policyNote = '';
+    if (typeof opts.toolsFor === 'function') {
+      // 按角色自定义白名单（最明确的一条路）
+      perSessionTools = opts.toolsFor(opts.user ?? { id: null });
+      toolsPolicy = perSessionTools.length > 0 ? 'explicit' : 'disabled-by-role';
+    } else if (opts.dangerousTools === true) {
+      // ★ 危险 opt-in（**独立开关**，不来自角色）：不指定 → 交给管理器（只有它 allowPiDefaultTools 时才真是全集）
+      perSessionTools = opts.tools && opts.tools.length > 0 ? opts.tools : undefined;
+      toolsPolicy = 'dangerous-opt-in';
+      policyNote = `会话 ${sessionId} 显式开启了危险工具（dangerousTools:true）`;
+    } else if (opts.tools && opts.tools.length > 0) {
+      // 显式白名单（管理员按策略给）—— 危险内置工具仍会被管理器剔除，除非 allowDangerousTools
+      perSessionTools = opts.tools;
+      toolsPolicy = 'explicit';
+    } else {
+      // ★ 默认：任何角色都 **显式空数组**（含 admin；`allowTools:true` 但没给白名单也是空集）
+      perSessionTools = [];
+      toolsPolicy = 'disabled-by-role';
+      if (opts.allowTools === true) {
+        policyNote = `会话 ${sessionId} 的调用方放行了工具（allowTools:true）但未提供白名单 → 仍是空集（要危险工具请显式 dangerousTools:true）`;
+      }
+    }
+    if (policyNote) {
+      // 这条要能被看到（默认拒绝 + 显式放行的边界）
+      process.stderr.write(`[agent][tools] ${policyNote}\n`);
+    }
+    session = await manager.getOrCreate(sessionId, perSessionTools !== undefined ? { tools: perSessionTools } : undefined);
   } catch (err) {
     const classified = classifyFailure(err, { where: '创建会话' });
     // ★ 凭据文件**形状**错（就是让 pi 静默挂死的那种）：给可读原因 + 修法，
@@ -877,7 +960,7 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
     void flush();
   });
 
-  await safeSend(send, session.readyFrame());
+  await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy));
   readySent = true;
   await flush(); // 把 ready 之前缓冲的事件按原顺序补发
 
@@ -1028,16 +1111,16 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                 hint: '模型必须已在 pi 的 models.json/目录里且凭据可用',
               }));
             }
-            await safeSend(send, session.readyFrame());
+            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy));
             break;
           }
           case 'new_session': {
             const ready = await session.reset();
-            await safeSend(send, ready);
+            await safeSend(send, withToolsPolicy(ready, toolsPolicy));
             break;
           }
           case 'get_state': {
-            await safeSend(send, session.readyFrame());
+            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy));
             break;
           }
           default: {

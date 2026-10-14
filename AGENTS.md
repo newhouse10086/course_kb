@@ -127,6 +127,7 @@ course-kb/
 | **17** | **`JSON.stringify` 不转义 `U+2028`/`U+2029`**（Node 24 实测）→ 打穿 SSE 契约 §6「`data:` 是单行 JSON」的保证 | **主动转义**（同 §7.3.1 P1 思路）+ 断言 `data:` 里出现 `\u2028` |
 | **18** | **argv 有大小上限**（Windows ~32KB）→ 大 payload 塞 `--in <json>` 会 `ENAMETOOLONG`；**本机小样本跑得过、真实规模必炸** | **> 8KB 的 payload 走 stdin**（显式 `--in -`）。阈值留余量（路径含中文 + 编码放大 + Windows 版本差异） |
 | **19** | ★ **缓存静默破坏「承诺实时」的字段语义**（而且**测试可能仍绿**） | **加缓存前逐个字段问：它承诺的是「实时」还是「快照」？** 把必须实时的做成**显式白名单**（如 `REALTIME_FIELDS`），缓存只作用于其余字段。<br>**本坑一轮内踩了 3 次**（`auth.bootstrap` / `settings.activeModel` / `retrieval.dataReady`）—— 靠"记得改"不可靠，白名单的价值是**迫使新增字段时做一次显式决定**。<br>⚠️ **为什么最隐蔽**：`auth.bootstrap` 有实时性回归测试 → **红了被抓住**；而 `dataReady` 的测试**直接调检索层、不经过路由缓存** → **全绿**。⟹ **「承诺实时」的字段一旦被缓存，其测试若不走真实 HTTP 就不会失败。**<br>**必需测试形态**：同一进程内 `GET`（预热缓存）→ **写入数据** → 立刻再 `GET`（命中缓存）→ 断言字段**已变新值**。 |
+| **20** | ★★ **用 PowerShell 文本管线改源码 → 中文注释整份变乱码**（`Get-Content \| Set-Content` 按 ANSI/带 BOM 重写，UTF-8 中文必坏） | **源码批量替换禁止走 PowerShell 文本管线**：用 `edit`/`write` 工具，或 Node/Python 的**显式 UTF-8 读写**。<br>⚠️ **它不会立刻报错** —— 文件写"成功"了，直到下一次 `node --test` 才炸，**而且报的是 `SyntaxError`（中文字符串里的引号被破坏）→ 极易误判成代码逻辑问题**。<br>**本坑一轮内被两个不同的人各踩一次**（`backend-api` 改 `capabilities.ts`、`kg-rag-architect` 改测试文件），两人都靠 `git checkout HEAD -- <file>` 恢复后用 `edit` 重做。 |
 | 10 | 能力不可用**假装可用** | **Provider 层强制**：`configured` vs `available` 分开 + 可读 `reason` |
 
 > **坑 12 / 17 / 18 是同一类**：本机能跑，**放大到真实数据就静默或直接失败**。

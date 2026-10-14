@@ -17,6 +17,7 @@ const router = useRouter()
 const { caps, error: capsError, reload } = useCaps()
 const docsApi = useDocuments()
 const apiBase = ref('')
+const capsReprobing = ref(false)
 
 /**
  * 身份（RBAC §3）：只用来控制入口可见性；**权限判定永远在服务端**。
@@ -34,6 +35,20 @@ const roleLabel = computed(() => roles.value.join(', ') || '未上报')
 const userLabel = computed(() => me.value?.user?.display_name || me.value?.user?.username || '')
 const showLogin = computed(() => authRequired.value === true && !me.value?.user)
 const capsPending = computed(() => !caps.value && !capsError.value)
+/**
+ * 能力数据"年龄"（真后端 15s TTL 缓存：`cached`/`cached_age_ms`/`cache_ttl_ms`）
+ * ⚠️ 缓存不改变语义：15s 内就是**同一份真探测结果**（backend-api 明确）→ 如实标注年龄即可，别当"数据不可信"
+ */
+const capsAge = computed(() => {
+  const raw = (caps.value?.raw || {}) as any
+  if (raw.cached !== true) return ''
+  const ms = Number(raw.cached_age_ms)
+  return Number.isFinite(ms) ? `更新于 ${(ms / 1000).toFixed(0)} 秒前` : '来自缓存'
+})
+async function reprobeCaps() {
+  capsReprobing.value = true
+  try { await reload(true) } finally { capsReprobing.value = false }
+}
 
 const navItems = computed(() => [
   { to: '/wiki', label: '知识库', enabled: true, reason: '' },
@@ -182,6 +197,9 @@ function toggleTheme() {
     >{{ theme === 'dark' ? '☾ 暗' : '☀ 亮' }}</button>
     <!-- 能力接口慢时如实显示"加载中"（真后端实测 7–8.4s：每次调用都做真探测） -->
     <span v-if="capsPending" class="meta faint" data-testid="caps-loading">能力接口加载中…（真探测较慢）</span>
+    <span v-else-if="capsAge" class="meta faint" data-testid="caps-age">{{ capsAge }}</span>
+    <button v-if="caps" type="button" class="small" data-testid="caps-reprobe" :disabled="capsReprobing"
+            @click="reprobeCaps()">{{ capsReprobing ? '探测中…' : '重新探测' }}</button>
     <CapabilityBanner :caps="caps" compact />
     <span v-if="capsError" class="gate-note" data-testid="caps-error" :title="capsError">
       能力接口读取失败：{{ capsError }} <button type="button" @click="reload()">重试</button>
@@ -204,6 +222,7 @@ function toggleTheme() {
 -->
   <RouterView :key="route.path" />
 </template>
+
 
 
 

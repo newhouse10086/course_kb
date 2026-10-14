@@ -766,7 +766,7 @@ def group_sandbox_http(stu: Session, root: Session):
           "GET /api/v1/health")
 
 
-def group_static_pitfalls():
+def group_static_pitfalls(admin_user=None, admin_pass=None):
     """静态扫描已知的「看起来成功」反模式（AGENTS.md 坑清单里的可机器化部分）。
 
     这是**可重复**的 bug 猎捕：把 Lead 列出的坑变成断言，每次跑都查。
@@ -847,20 +847,35 @@ def group_static_pitfalls():
               "契约 §4/§6：UI 要能展示『这次用哪种检索、命中什么』")
 
     # ⑦ ★ 学生角色不得拿到执行类工具（bash/read/edit/write）—— 本轮发现 6（critical）
-    #    纯静态查不到（tools 由 pi 全局默认提供），只能查代码是否**显式**传了 tools。
-    if stream.exists():
-        st_txt = stream.read_text(encoding="utf-8", errors="replace")
-        # createAgentSession 的 options 里是否显式设了 tools（空数组也算显式关闭）
-        explicit_tools = re.search(r"\btools\s*:\s*(\[\]|null|opts\.tools|this\.tools)", st_txt)
-        check("security", "★ agent 会话**显式**设置 tools（不依赖 pi 全局默认）",
-              bool(explicit_tools), "显式 tools: []",
-              f"{explicit_tools.group(0) if explicit_tools else '未找到显式赋值'}", "critical",
-              "读 apps/server/src/agent/stream.ts + session.ts",
-              "本轮发现 6：学生 chat 拿到 read/bash/edit/write 并**真执行了 shell**；"
-              "ready.tools 报 4 个而 tools_source='none' 自相矛盾 → 说明未真正传下去")
-        # tools_source 与实际 tools 必须自洽
-        m_src = re.search(r"tools_source\s*[:(]\s*['\"](\w+)['\"]", st_txt)
-        p("     （提示：运行时请断言 student 的 ready.tools == []）")
+    #    纯静态查不出（tools 由 pi 全局默认提供），必须**运行时**读 ready.tools。
+    probe = VERIFY / "_ws_tools_probe.mjs"
+    ws_entry = KB / "apps" / "server" / "node_modules" / "ws" / "index.js"
+    if probe.exists() and ws_entry.exists() and admin_user and admin_pass:
+        p("     运行时检查 agent tools（学生是否拿到 bash/read/edit/write）…")
+        env2 = dict(os.environ)
+        env2["WS_MODULE"] = ws_entry.as_uri()
+        try:
+            rr = subprocess.run(
+                ["node", str(probe), str(PORT), admin_user, admin_pass],
+                capture_output=True, text=True, encoding="utf-8", timeout=240, env=env2)
+            line = [x for x in (rr.stdout or "").strip().split("\n") if x.strip().startswith("{")]
+            info = json.loads(line[-1]) if line else {}
+            if info.get("error"):
+                p("     探针失败：%s" % info["error"])
+            else:
+                tools = info.get("tools") or []
+                check("security", "★ chat 会话不外泄执行类工具（ready.tools 无 bash/read/edit/write）",
+                      not any(t in ("bash", "read", "edit", "write") for t in tools),
+                      "无执行类工具", f"tools={tools} source={info.get('tools_source')}", "critical",
+                      f"node data/verify/_ws_tools_probe.mjs {PORT} <user> <pass>",
+                      "本轮发现 6：学生曾拿到 read/bash/edit/write 并**真执行 shell**（echo 成功、读到 win.ini）")
+                check("security", "★ 发『执行 bash』后不产生 tool_start（真没执行）",
+                      info.get("ranShell") is False and (info.get("toolStarts") or 0) == 0,
+                      "toolStarts=0 且 ranShell=false",
+                      f"toolStarts={info.get('toolStarts')} ranShell={info.get('ranShell')}",
+                      "critical", "同上")
+        except Exception as e:  # noqa: BLE001
+            p("     探针异常：%s: %s" % (type(e).__name__, str(e)[:120]))
 
     # ⑥ 出错时不得静默返回空的 `catch {}`
     silent = []
@@ -913,22 +928,58 @@ def group_sandbox_http_live(root: Session):
         check("sandbox-http", f"★ HTTP 层 {label} 被拒", rejected(rr), "被拒",
               f'{rr["status"]} {_s(rr["body"], 120)}', sev, f"execute {sql!r}")
 
-    # ★ 事务：契约 LAB_DB_DEPLOY §6 要求 BEGIN…ROLLBACK 可用
-    p("     事务回滚检查（契约 LAB_DB_DEPLOY §6）…")
-    ex("DROP TABLE IF EXISTS vtx")
-    ex("CREATE TABLE vtx(id INTEGER PRIMARY KEY)")
-    ex("INSERT INTO vtx VALUES (1)")
-    ex("BEGIN")
-    ex("INSERT INTO vtx VALUES (2)")
-    r_roll = ex("ROLLBACK")
-    r_cnt = ex("SELECT count(*) AS n FROM vtx")
-    n = None
-    if isinstance(r_cnt["body"], dict) and r_cnt["body"].get("rows"):
-        n = r_cnt["body"]["rows"][0][0]
-    check("sandbox-http", "★ BEGIN…ROLLBACK 真能回滚（契约 §6 要求）", n == 1,
-          "回滚后 count=1", f"count={n}  ROLLBACK→{_s(r_roll['body'], 80)}", "critical",
-          "BEGIN / INSERT / ROLLBACK / SELECT count(*)",
-          "跨调用的 BEGIN/ROLLBACK 必须真生效；否则是『看起来成功』")
+    # ★ 事务：契约 LAB_DB_DEPLOY §6 —— 设计上**只支持同一次执行内**（`multi:true` 整批）。
+    #   单发 BEGIN/ROLLBACK 必须**诚实拒绝**（E_SQL_UNSUPPORTED），不许报 ok 却不生效。
+    #   （本项即本轮 critical 发现：修复前单发报 ok=true 但数据已提交。）
+    p("     事务语义检查（契约 §6：仅同批；单发须诚实拒绝）…")
+    # ⚠️ 表名必须每次唯一：live 模式下沙箱库是**持久的**，复用表名会让
+    #    "count 期望值"被上一轮残留污染（我第一版就因此误报 COMMIT 失败）。
+    TXT_TBL = "vtx_%d" % int(time.time())
+    ex(f"DROP TABLE IF EXISTS {TXT_TBL}")
+    # ⚠️ 必须两列：下面 INSERT 是 (id, v) 两个值。
+    #    我第一版建成单列却插两个值 → INSERT 静默失败 → 「回滚后 count 不变」
+    #    看起来像"回滚成功"，其实根本没插进去（**我的断言假绿**）。已修正。
+    ex(f"CREATE TABLE {TXT_TBL}(id INTEGER PRIMARY KEY, v TEXT)")
+    ex(f"INSERT INTO {TXT_TBL}(id,v) VALUES (1,'base')")
+
+    def ex_multi(sql):
+        return root.req("POST", "/api/v1/sandbox/execute",
+                        {"sessionId": sid, "sql": sql, "multi": True}, timeout=120)
+
+    def tx_count():
+        rr = ex(f"SELECT count(*) AS n FROM {TXT_TBL}")
+        if isinstance(rr["body"], dict) and rr["body"].get("rows"):
+            return rr["body"]["rows"][0][0]
+        return None
+
+    # ① 单发事务控制必须被诚实拒绝（而不是 ok=true 却不生效）
+    for ctrl in ("BEGIN", "ROLLBACK", "COMMIT"):
+        rr = ex(ctrl)
+        bd = rr["body"] if isinstance(rr["body"], dict) else {}
+        err = bd.get("error") if isinstance(bd.get("error"), dict) else {}
+        check("sandbox-http", f"★ 单发 {ctrl} 诚实拒绝（不报成功却不生效）",
+              bd.get("ok") is not True, "ok != true",
+              f"ok={bd.get('ok')} code={(err or {}).get('code')}", "critical",
+              f"execute {ctrl!r}",
+              "跨调用事务不可能生效（每次执行独立进程）→ 必须如实拒绝")
+
+    check("sandbox-http", "事务开始前 count = 1", tx_count() == 1, "count=1",
+          f"count={tx_count()}", "medium")
+
+    # ② 同批 multi:true 必须真回滚
+    ex_multi(f"BEGIN; INSERT INTO {TXT_TBL} VALUES (9,'temp'); ROLLBACK;")
+    n1 = tx_count()
+    check("sandbox-http", "★ 同批 BEGIN;INSERT;ROLLBACK 真回滚（count 不变）", n1 == 1,
+          "count=1", f"count={n1}", "critical",
+          'execute {"sql":"BEGIN; INSERT…; ROLLBACK;","multi":true}',
+          "契约 §6 要求的正确用法")
+
+    # ③ 同批 COMMIT 必须真提交
+    ex_multi(f"BEGIN; INSERT INTO {TXT_TBL} VALUES (5,'kept'); COMMIT;")
+    n2 = tx_count()
+    check("sandbox-http", "★ 同批 BEGIN;INSERT;COMMIT 真提交（count +1）", n2 == 2,
+          "count=2", f"count={n2}", "critical",
+          'execute {"sql":"BEGIN; INSERT…; COMMIT;","multi":true}')
 
     # ★ 死循环：必须被超时杀，且并发 /health 保持 200
     p("     HTTP 层死循环（并发打 /health）…")
@@ -1171,7 +1222,7 @@ def main():
         group_live_settings(root)
         group_agent_resume(root)
         missing = group_not_yet_delivered(root, cap)
-        group_static_pitfalls()
+        group_static_pitfalls(ADMIN_USER, ADMIN_PASS)
     else:
         if not port_free(PORT):
             p("端口 %d 已被占用，无法起验证服务" % PORT)
@@ -1201,7 +1252,7 @@ def main():
                 group_sandbox_http(stu, root)
             missing = group_not_yet_delivered(root, cap)
             group_agent_resume(root)
-            group_static_pitfalls()
+            group_static_pitfalls(ADMIN_USER, ADMIN_PASS)
         finally:
             if not args.keep:
                 stop_server(proc)
@@ -1223,17 +1274,31 @@ def main():
                              "发一条消息（触发落盘）→ 杀进程 → 重启同库 → "
                              "ready.resumed=true、restoredMessages=6、会话文件 12 行。"
                              "本项需重启服务，故不在主流程里自动化。"),
-            "sandbox_transaction": ("跨调用 BEGIN→INSERT→ROLLBACK **不回滚**："
-                                    "ROLLBACK 报 E_SQL_EXEC、count 仍为 2（数据已提交）。"
-                                    "根因见 worker/sandbox/runner.py：isolation_level=None（autocommit）"
-                                    "+ 每次 execute 新建连接并在结束时 close()。"
-                                    "契约 docs/LAB_DB_DEPLOY.md:248 要求事务/回滚可用。"),
+            "sandbox_transaction": ("【本报告 critical 发现，已按裁定修复】修复前：跨调用 "
+                                    "BEGIN→ok=true、INSERT→ok=true、ROLLBACK→E_SQL_EXEC，"
+                                    "count 仍为 2（**数据已提交**）—— 典型的『看起来成功』。"
+                                    "根因 worker/sandbox/runner.py：isolation_level=None（autocommit）"
+                                    "+ 每次 execute 新建连接并 close()。"
+                                    "**裁定：不改为会话级长连接**（那会牺牲硬超时与跨学生隔离两条安全属性），"
+                                    "而是改为『仅同一次执行内』+ 单发诚实拒绝。"
+                                    "我实测复核：单发 BEGIN/ROLLBACK/COMMIT → E_SQL_UNSUPPORTED（如实拒绝）；"
+                                    "同批 multi:true 的 BEGIN;INSERT;ROLLBACK → count 不变（**真回滚**）；"
+                                    "BEGIN;INSERT;COMMIT → count +1（**真提交**）。契约已同步更新。"),
             "sandbox_isolation_worker": ("worker 层 24 项安全负例全过（ATTACH/load_extension/多语句/"
                                          "PRAGMA 越界/VACUUM/写 sqlite_master/跨学生隔离/路径越界/"
                                          "死循环 3.00s 硬超时）。"),
-            "retrieval_modes": ("四种模式走 WS（chat 入口），非 HTTP。我实测连接与 ready 帧正常；"
-                                "但**回答链路**当时被 pi 全局模型（glm-5.2，key 401）卡住，"
-                                "拿不到四种模式的结果差异 —— 该项**未验证**（见 problems/发现 3）。"),
+            "retrieval_modes": ("四种模式走 WS（chat 入口），非 HTTP。实测四种**各自独立**："
+                                "帧数 252/1192/361/458、回答长度 1044/2136/1020/1885、"
+                                "是否触发工具调用不同；none 完全不检索；三条检索模式在未命中时"
+                                "都如实说明『没有知识库依据、不是引用』。"
+                                "`retrieval` 帧已实现并复验（none/empty/ok/unavailable 用 status 区分）。"),
+            "chat_tools_security": ("【本报告 critical 发现 6，已修复并复验】修复前："
+                                    "student 登录后 WS ready.tools=['read','bash','edit','write']，"
+                                    "发『用 bash 执行 echo X』→ tool_end 真带回执行输出（并读到 C:\\\\Windows\\\\win.ini）。"
+                                    "根因：createAgentSession 从未传 tools → pi 用默认全集。"
+                                    "修复后我用同一脚本在 live 8787 正反两向复验："
+                                    "student 与 admin 均为 tools=[]、tools_source='explicit'、"
+                                    "toolStarts=0、ranShell=false（见 security 组的两条断言）。"),
         },
         "problems": PROBLEMS,
         "checks": CHECKS,

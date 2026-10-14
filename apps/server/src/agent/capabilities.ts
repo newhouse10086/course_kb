@@ -109,9 +109,9 @@ export interface AgentCapabilities {
    * （真事故里"自相矛盾的信号"之一；已修）。
    */
   tools: string[] | null;
-  /** 工具从哪来：`explicit` = 我们显式给的；`pi-default` = pi 默认全集（**危险**，必须显式放行才会出现） */
-  toolsSource: 'explicit' | 'pi-default';
-  /** `toolsSource='pi-default'` 时的**警告**（不许安静：这就是"学生能执行 bash"的信号） */
+  /** 工具从哪来：`explicit` = 我们显式给的；`pi-default` = pi 默认全集（**危险**：必须显式 opt-in 才会出现） */
+  toolsSource: 'explicit' | 'dangerous-opt-in';
+  /** `toolsSource='dangerous-opt-in'` 时的**警告**（不许安静：这就是"学生能执行 bash"的信号） */
   toolsWarning: string | null;
   /** SDK 可用但模型不可用 → degraded=true（UI 可据此禁用输入并说明原因） */
   degraded: boolean;
@@ -430,7 +430,7 @@ export async function capabilities(opts: AgentCapabilitiesOptions = {}): Promise
   let sessionDir: string | null = null;
   // `null` = 未知/pi 默认全集；`[]` = 明确无工具
   let tools: string[] | null = null;
-  let toolsSource: 'explicit' | 'pi-default' = 'pi-default';
+  let toolsSource: 'explicit' | 'dangerous-opt-in' = 'dangerous-opt-in';
   let toolsWarning: string | null = null;
   if (manager) {
     try {
@@ -441,7 +441,7 @@ export async function capabilities(opts: AgentCapabilitiesOptions = {}): Promise
       // ★ 如实取**管理器实际配置**的白名单（原实现恒为 []，把危险默认掩盖了）
       tools = manager.tools;
       toolsWarning =
-        toolsSource === 'pi-default'
+        toolsSource === 'dangerous-opt-in'
           ? '会话工具回落到 pi 默认全集（read/bash/edit/write）—— 学生若可达将能执行命令、读主机文件；' +
             '请给 AgentSessionManager 传 tools:[]（默认已是）或按角色收窄'
           : null;

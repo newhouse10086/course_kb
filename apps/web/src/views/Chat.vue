@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 /**
  * Chat —— pi AI 助教（契约 §7.2 WebSocket；PROVIDERS §7 能力门控）
  *
@@ -19,7 +19,7 @@ import { queryFlag, testBarrier, testBarrierDone, writeReport } from '../utils/r
 interface ToolCall { id: string; tool: string; args?: unknown; partial?: string; ok?: boolean; duration_ms?: number; done: boolean }
 interface Msg { role: 'user' | 'assistant' | 'system'; text: string; thinking: string; tools: ToolCall[]; error?: { code?: string; msg?: string } }
 
-const { caps } = useCaps()
+const { caps, error: capsError } = useCaps()
 const sessionId = `web-${Math.random().toString(36).slice(2, 10)}`
 const input = ref('')
 const msgs = ref<Msg[]>([])
@@ -65,6 +65,17 @@ function foldToolMarkers(text: string): { text: string; folded: number } {
   return { text: out.replace(/\n{3,}/g, '\n\n').trim(), folded }
 }
 const retrieval = ref<RetrievalState | null>(null)
+/** 本轮会话**实际可用**的工具（`ready.tools` 真值）与其来源标签（pi-bridge 三态） */
+const sessionTools = ref<string[]>([])
+const toolsSource = ref('')
+const TOOLS_SOURCE_LABEL: Record<string, string> = {
+  'disabled-by-role': '按角色/缺省关闭（无工具 —— **这是正确的安全状态**）',
+  explicit: '显式白名单',
+  'dangerous-opt-in': '⚠️ 有人在服务端显式开启了危险工具',
+}
+const toolsSourceLabel = computed(() => TOOLS_SOURCE_LABEL[toolsSource.value] || (toolsSource.value || '未上报'))
+/** capabilities.pi.toolsWarning：非 null = 会话工具回落到 pi 默认全集（**能执行命令的信号**） */
+const toolsWarning = computed(() => String(((caps.value?.raw as any)?.pi?.toolsWarning) || ''))
 const whyOpen = ref(false)
 /** 同轮的工具调用（retrieval → settled 之间） */
 const roundTools = ref<Array<{ id: string; tool: string; args?: unknown; done: boolean; ok?: boolean }>>([])
@@ -116,7 +127,14 @@ const piOk = computed(() => !!caps.value?.isAvailable('pi'))
 const piReason = computed(() => caps.value?.reasonFor('pi') || 'pi 能力未上报')
 const modelOk = computed(() => !!caps.value?.isAvailable('llm'))
 const modelReason = computed(() => caps.value?.reasonFor('llm') || 'LLM 能力未上报')
-const canSend = computed(() => piOk.value && modelOk.value && state.value === 'open' && !busy.value && input.value.trim().length > 0)
+/**
+ * caps 是否还在探测（真后端首次可达 19.4s；之后 15s 缓存内毫秒级）
+ * ★ Lead 裁定：**慢的能力探测不该阻塞可用功能** → 探测中允许发消息，失败再如实报错
+ */
+const capsPending = computed(() => !caps.value && !capsError.value)
+/** 门控：只有 caps **已到达且确实不可用**时才禁用（探测中不禁用） */
+const gated = computed(() => !capsPending.value && (!piOk.value || !modelOk.value || !piModelStatus.value.modelAvailable))
+const canSend = computed(() => !gated.value && state.value === 'open' && !busy.value && input.value.trim().length > 0)
 
 /**
  * pi 的两层能力（backend T-AGENT 的约定）：
@@ -161,6 +179,10 @@ function onEvent(e: ChatServerEvent) {
   switch (e.type) {
     case 'ready':
       model.value = String((e as any).model || model.value)
+      // ★ pi-bridge：**判断工具有没有一律用 `ready.tools`（真值）**，`tools_source` 只是来源标签
+      //   三态：disabled-by-role（学生/教师，tools 必为 []）/ admin-full（管理员默认全集）/ explicit（显式白名单）
+      sessionTools.value = Array.isArray((e as any).tools) ? (e as any).tools.map((x: unknown) => String(x)) : []
+      toolsSource.value = String((e as any).tools_source || '')
       break
     case 'text_delta':
       updateLast((m) => { m.text += String((e as any).delta || '') })
@@ -244,30 +266,34 @@ function newSession() {
 
 onMounted(async () => {
   testBarrier()
-  // ⚠️ 必须**先等能力接口返回**再判断门控：caps 是异步拉的，
-  //    第一版在 onMounted 里直接读 piOk/modelOk → 能力还没到就误判成"不可用"，
-  //    于是自检走了 gated 分支（页面看起来正常，但 ws/流式断言全空）。
+  /**
+   * ★ Lead 裁定（2026-10-15）：**慢的能力探测不该阻塞可用功能**。
+   *   · 进对话页只判鉴权（401 由 client 的 handler 统一跳登录）→ **立刻连 WS**
+   *   · caps 还在探测 → 显示"能力探测中（真探测较慢）"并**允许先试**；
+   *     徽标/正文都来自后端帧，**不依赖 caps**
+   *   · caps 到达后若确实不可用 → 仍然如实禁用 + 显示原因（契约 §7 不能放弃）
+   *   ⚠️ 第一版是"先 await caps 再判断"：真后端 caps 19.4s → 页面卡在 connecting，
+   *      看起来像 WS 坏了（实测踩到）。
+   */
   const { reload } = useCaps()
-  if (!caps.value) await reload()
-  if (!piOk.value || !modelOk.value || !piModelStatus.value.modelAvailable) {
-    // 能力不可用：不建连、不假装能用（PROVIDERS §7 + T-AGENT 的两层能力约定）
-    writeReport('chat-report', {
-      ok: false, gated: true, session: sessionId,
-      pi_available: piOk.value, pi_reason: piReason.value,
-      model_available: modelOk.value, model_reason: modelReason.value || piModelNote.value,
-    })
-    if (queryFlag('selftest')) await runSelftest(true)
-    await testBarrierDone()
-    return
-  }
+  void reload()                       // 后台预热（命中 15s 缓存后后续毫秒级）
   socket = new ChatSocket(sessionId)
   socket.onState((s, info) => { state.value = s; if (info) stateNote.value = info })
   socket.on('*', onEvent)
   writeReport('chat-report', {
-    ok: true, gated: false, session: sessionId, url: socket.url,
-    pi_available: true, model_available: true,
+    ok: true, gated: false, caps_pending: capsPending.value, session: sessionId, url: socket.url,
+    pi_available: piOk.value, model_available: modelOk.value,
   })
-  if (queryFlag('selftest')) await runSelftest(false)
+  // caps 到达后**重写报告**（连 WS 不等 caps，但报告必须反映"能力到达后的真值"）
+  watch(caps, () => {
+    if (!socket) return
+    writeReport('chat-report', {
+      ok: true, gated: gated.value, caps_pending: capsPending.value, session: sessionId, url: socket.url,
+      pi_available: piOk.value, model_available: modelOk.value,
+      pi_reason: piReason.value, model_reason: modelReason.value || piModelNote.value,
+    })
+  })
+  if (queryFlag('selftest')) await runSelftest(gated.value)
   await testBarrierDone()
 })
 
@@ -355,10 +381,29 @@ void _esc
         <span class="pill" :class="state === 'open' ? 'ok' : 'bad'" data-testid="ws-state">{{ state }}</span>
         <span v-if="model" class="pill blue">{{ model }}</span>
         <span v-if="stateNote" class="small faint" data-testid="ws-note">{{ stateNote }}</span>
+        <span class="small" :class="toolsSource === 'dangerous-opt-in' ? 'tools-danger' : 'faint'"
+              data-testid="session-tools" :data-tools="sessionTools.join(',')" :data-source="toolsSource">
+          工具：{{ sessionTools.length ? sessionTools.join(', ') : '无' }}
+          <span v-if="toolsSource">（{{ toolsSourceLabel }}）</span>
+        </span>
+        <!-- ★ dangerous-opt-in = 异常状态，用最刺眼的样式（不是"管理员正常状态"） -->
+        <span v-if="toolsSource === 'dangerous-opt-in'" class="pill bad" data-testid="tools-danger">
+          ⚠️ 本会话已开启主机工具（{{ sessionTools.join(', ') || '见 tools' }}）
+        </span>
         <span class="right" />
         <button type="button" data-testid="chat-newsession" @click="newSession">新会话</button>
       </div>
-      <div v-if="!piOk || !modelOk" class="note bad" style="margin-top: 8px" data-testid="chat-gate">
+      <!-- ★ 工具回落警告：非 null 表示会话工具回落到 pi 默认全集（**能执行命令**） -->
+      <div v-if="toolsWarning" class="note bad" style="margin-top: 8px" data-testid="tools-warning">
+        <b>工具回落警告</b>：{{ toolsWarning }}
+        <div class="small" style="margin-top: 4px">这意味着会话可能拿到 pi 的默认工具集（含命令执行）—— 请让后端确认策略，前端不自行拦截。</div>
+      </div>
+      <!-- 探测中：如实说"还在探测"，但**允许先试**（不阻塞可用功能） -->
+      <div v-if="capsPending" class="note warn" style="margin-top: 8px" data-testid="caps-pending">
+        <b>能力探测中（真探测较慢）</b>：现在就可以发消息 —— 若后端确实不可用，会在这一轮如实报错；
+        检索模式徽标来自后端帧，不依赖能力接口。
+      </div>
+      <div v-else-if="!piOk || !modelOk || !piModelStatus.modelAvailable" class="note bad" style="margin-top: 8px" data-testid="chat-gate">
         <b>对话入口已禁用</b>
         <ul style="margin: 4px 0 0; padding-left: 18px">
           <li v-if="!piOk">pi 不可用：{{ piReason }}</li>
@@ -443,7 +488,7 @@ void _esc
         ref="box"
         v-model="input"
         data-testid="chat-input"
-        :disabled="!piOk || !modelOk"
+        :disabled="gated"
         rows="3"
         placeholder="问知识点 / 让 pi 读某节原文（Enter 发送，Shift+Enter 换行）"
         @keydown.enter.exact.prevent="send"
@@ -459,6 +504,8 @@ void _esc
 </template>
 
 <style scoped>
+.tools-danger { color: var(--bad); font-weight: 700; }
+
 /* 检索徽标：四种模式颜色不同；none（没查库）=灰虚线，empty（查了没命中）=橙，hit=绿，unavailable=灰 */
 .retr-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px;
   padding-top: 7px; border-top: var(--hair) dashed var(--rule); }
@@ -500,6 +547,7 @@ void _esc
 .thinking { border-left: 3px solid var(--rule-strong); padding-left: 8px; margin: 4px 0; }
 .thinking pre { white-space: pre-wrap; margin: 4px 0 0; background: transparent; border: none; padding: 0; color: var(--ink-2); }
 </style>
+
 
 
 
