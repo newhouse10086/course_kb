@@ -41,7 +41,7 @@ import { registerCardRoutes } from './routes/cards.ts';
 import { registerSearchRoutes } from './routes/search.ts';
 import { registerTaskRoutes } from './routes/tasks.ts';
 import { registerChatRoute } from './routes/chat.ts';
-import { registerSandboxRoutes, DEFAULT_LIMITS, ownerOfSession } from './routes/sandbox.ts';
+import { registerSandboxRoutes, DEFAULT_LIMITS, ownerOfSession, readCrossCallTx } from './routes/sandbox.ts';
 import { registerAuthRoutes } from './routes/auth.ts';
 import { registerRbacRoutes } from './routes/rbac.ts';
 import { installAuth } from './auth/middleware.ts';
@@ -500,15 +500,19 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
         engineCount: engines.length,
         engines,
         limits: DEFAULT_LIMITS,
-        // ★ 临时诚实标注（Lead 裁定加）：worker 的 `capabilities.transactions` 报 `true`，
-        //   但那只在**同一次执行内**成立 —— 每次 execute 都是独立进程 + autocommit
-        //   （这正是"硬超时能强杀 + 学生间天然隔离"两条安全属性的前提，**不是功能残缺**）。
-        //   `multi:true` 的单次事务实验**真正可用**（已实测：回滚行数不变 / 提交 +1）。
-        //   ⚠️ backend-core 实现会话级事务后删掉这两行（并把 `routes/sandbox.ts` 的
-        //      `REJECT_CROSS_CALL_TX` 改成 false）。
-        transactions_cross_call: false,
-        transactions_note:
-          '跨调用事务不支持：每次 execute 独立进程（硬超时强杀 + 学生间隔离的安全前提，有意设计）。事务实验请用 multi:true 单次执行。',
+        // ★ 跨调用事务能力：**从 worker 的能力报告派生**（不写死），避免"两处真相"漂移。
+        //   worker 的 `capabilities.transactions` 是结构化对象 `{same_call, cross_call, batch_param, note}`
+        //   （backend-core 已锁字段名并加断言防退回裸 bool）→ 这里如实透传：
+        //   `cross_call:false` 时给出可读说明（这是"硬超时能强杀 + 学生间天然隔离"两条安全属性的
+        //   前提，**不是功能残缺**；事务实验用 `multi:true` 单次执行，已实测回滚行数不变 / 提交 +1）。
+        //   ⚠️ 若 worker 将来真接会话级事务（`cross_call:true`），这里**零改动自动变 true**。
+        transactions_cross_call: readCrossCallTx(out) === true,
+        ...(readCrossCallTx(out) === true
+          ? {}
+          : {
+              transactions_note:
+                '跨调用事务不支持：每次 execute 独立进程（硬超时强杀 + 学生间隔离的安全前提，有意设计）。事务实验请用 multi:true 单次执行。',
+            }),
       };
     },
     auth: { required: true, bootstrap: bootstrapState },

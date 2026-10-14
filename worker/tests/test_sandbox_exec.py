@@ -130,7 +130,11 @@ def test_single_statement_tx_control_is_honestly_rejected(sc_db: Path, sql: str,
     assert "跨调用" in r["error"]["localReading"]
     assert r["error"]["who"] == "rules"           # 规则限制，**不是学生的错**
     assert r["txUnsupported"] is True
-    assert "multi" in r["error"]["hint"]          # 给出可用路径
+    # ① 给出**可操作**的可用路径
+    assert "multi" in r["error"]["hint"] and "同一次" in r["error"]["hint"]
+    # ② ★ 必须解释**为什么**（教学场景里解释本身有价值；HTTP 层文案同源）
+    assert "独立进程" in r["error"]["hint"]
+    assert "硬超时" in r["error"]["hint"] and "互不影响" in r["error"]["hint"]
     # 拒绝后数据不变（不能"报错还写进去"）
     assert ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0] == 6
 

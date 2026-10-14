@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 沙箱 SQL 迷你引擎（**只用于 mock**，不是产品实现）
  *
  * 为什么要有它：SQL 练习台的验收是"**完整 CRUD 交互**，不是只读"。
@@ -36,12 +36,41 @@ export class SandboxDb {
     }))
   }
 
+  /**
+   * ★ 整批执行（`multi:true`）：**同一次执行内**按顺序跑完所有语句 —— 事务才有意义。
+   * 真后端实测：`{sql:"BEGIN; INSERT …; ROLLBACK;", multi:true}` → `{ok:true, statements:[{index,kind,ok}]}`
+   * 且 ROLLBACK 后行数不变、COMMIT 后 +1。
+   */
+  executeMulti(sql, opts = {}) {
+    const parts = splitStatements(String(sql || ''))
+    const statements = []
+    let last = { columns: [], rows: [], rowCount: 0, elapsedMs: 0, truncated: false, maxRows: this.maxRows }
+    const t0 = performance.now()
+    for (let i = 0; i < parts.length; i++) {
+      const kind = (parts[i].match(/^\s*([A-Za-z]+)/) || [, 'SQL'])[1].toUpperCase()
+      try {
+        // 整批里每条都带 multi:true → 事务语句在批内合法（守卫与多语句检查都按批放行）
+        last = this.execute(parts[i], { ...opts, internal: true, multi: true })
+        statements.push({ index: i + 1, kind, ok: true })
+      } catch (e) {
+        statements.push({ index: i + 1, kind, ok: false, error: e.sandbox?.code || e.code })
+        return {
+          ...last, ok: false, statements, elapsedMs: Math.round(performance.now() - t0),
+          error: e.sandbox || { code: 'E_SQL_SYNTAX', message: e.message, who: 'student', who_label: '语法错' },
+        }
+      }
+    }
+    return { ...last, ok: true, statements, elapsedMs: Math.round(performance.now() - t0) }
+  }
+
   /** @returns {{columns:string[], rows:any[][], rowCount:number, elapsedMs:number, truncated:boolean, maxRows:number}} */
-  execute(sql, { internal = false, maxRows = 200 } = {}) {
+  execute(sql, opts = {}) {
+    // ⚠️ 必须保留 opts 本体：守卫要读 opts.multi（写成解构参数就没这个绑定了 —— 实测 opts is not defined）
+    const { internal = false, maxRows = 200 } = opts
     const t0 = performance.now()
     const text = String(sql || '').trim().replace(/;+\s*$/, '')
     if (!text) throw sandboxError('E_SQL_SYNTAX', 'SQL 为空')
-    if (!internal) {
+    if (!internal && !opts?.multi) {
       for (const stmt of splitStatements(text)) {
         if (stmt !== text) {
           throw sandboxError('E_SQL_MULTI', '只允许**单条**语句（检测到多个分号）：防注入式逃逸')
@@ -53,6 +82,16 @@ export class SandboxDb {
     if (/\bATTACH\b/.test(upper)) throw sandboxError('E_SQL_FORBIDDEN', '禁止 ATTACH：会读写沙箱外的库文件（含主知识库）')
     if (/\bDETACH\b/.test(upper)) throw sandboxError('E_SQL_FORBIDDEN', '禁止 DETACH')
     if (/LOAD_EXTENSION/i.test(text)) throw sandboxError('E_SQL_FORBIDDEN', '禁止 load_extension：可加载任意本地库')
+    // ★ 跨调用事务没有意义（每次 execute 独立进程）→ 后端如实拒绝（backend-api 契约 2026-10-15）
+    //    ⚠️ 判据是"**这次调用是不是整批**"：整批（multi:true）时 BEGIN/COMMIT/ROLLBACK 是合法的
+    if (/^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(text.trim()) && !opts?.multi) {
+      throw sandboxError('E_SQL_UNSUPPORTED',
+        '沙箱每次执行都在独立进程中运行，事务状态无法跨调用保留，因此单条 BEGIN/COMMIT/ROLLBACK 没有意义',
+        { who: 'rules', who_label: '沙箱设计约束', interim: true,
+          localReading: '沙箱不支持跨调用事务（不是你的 SQL 写错了，也不是语法错）——这是有意设计的安全属性，不是功能残缺',
+          hint: '事务必须在同一次执行内完成：把整批语句放一起并带 multi:true，例如 {"sql":"BEGIN; INSERT …; ROLLBACK;","multi":true}' })
+    }
+
     if (/\bPRAGMA\b/.test(upper)) {
       const name = (text.match(/PRAGMA\s+([a-z_]+)/i) || [])[1] || ''
       if (!ALLOWED_PRAGMA.has(name.toLowerCase())) {
@@ -427,6 +466,7 @@ function sandboxError(code, message, extra = {}) {
     localReading: extra.localReading ?? message,
     localMatched: extra.localMatched ?? who === 'student',
     who, who_label: whoLabel, who_source: extra.who_source ?? 'classifier',
+    ...(extra.interim ? { interim: true } : {}),
   }
   return err
 }
@@ -487,5 +527,7 @@ INSERT INTO enrollments VALUES (1,1,92,'2026春'),(1,2,85,'2026春'),(2,1,78,'20
     ].join(';\n'),
   },
 ]
+
+
 
 

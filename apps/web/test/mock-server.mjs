@@ -344,6 +344,10 @@ export function capabilitiesPayload(degraded = false) {
     ffmpeg: { available: true, version: 'N-124868' },
     sandbox: {
       available: true,
+      defaultEngine: 'sqlite',
+      // 诚实标注（真后端 backend-api 2026-10-15 加的）：跨调用事务不支持 —— 每次 execute 独立进程
+      transactions_cross_call: false,
+      transactions_note: '跨调用事务不支持：每次 execute 独立进程（硬超时强杀 + 学生间隔离的安全前提，有意设计）。事务实验请用 multi:true 单次执行。',
       engines: [
         { id: 'sqlite', label: 'SQLite（进程内）', available: true, dialect: 'SQLite 3.x' },
         { id: 'mysql', label: 'MySQL 8.0 容器', available: false, dialect: 'MySQL 8.0', reason: '未安装 Docker（见 docs/LAB_DB_DEPLOY.md §2.1）', doc: 'docs/LAB_DB_DEPLOY.md §2.1' },
@@ -713,10 +717,13 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
           const killExtra = (e) => ((e.sandbox?.code ?? e.code) === 'E_SQL_TIMEOUT'
             ? { killedBy: 'progress', hardKilled: false } : {})
           try {
-            const r = STATE.db.execute(sql, { maxRows: STATE.sandbox.limits.maxRows })
+            // 整批执行（multi:true）：同一次进程内跑完所有语句 —— 事务（BEGIN/COMMIT/ROLLBACK）才有意义
+            const r = body.multi === true
+              ? STATE.db.executeMulti(sql, { maxRows: STATE.sandbox.limits.maxRows })
+              : STATE.db.execute(sql, { maxRows: STATE.sandbox.limits.maxRows })
             STATE.lastSql.unshift({ sql, at: Date.now(), ok: true, rowCount: r.rowCount, elapsedMs: r.elapsedMs })
             STATE.audit.push({ at: Date.now(), action: 'sandbox_execute', sql: sql.slice(0, 200), ok: true })
-            json({ ...r, ok: true, sessionId: STATE.session.sessionId, engine: 'sqlite',
+            json({ ...r, ok: r.ok !== false, sessionId: STATE.session.sessionId, engine: 'sqlite',
               statementKind: r.statementKind || null, hints: [],
               schema: { dialect: 'sqlite', tables: STATE.db.snapshot().map((x) => ({
                 name: x.name, rows: x.rowCount, columns: x.columns.map((c) => ({ name: c, type: 'TEXT' })),
@@ -1145,6 +1152,7 @@ if (isMain) {
     setInterval(() => {}, 1 << 30)
   }
 }
+
 
 
 

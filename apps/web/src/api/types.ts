@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 契约类型 —— 字段唯一权威：docs/API_PROTOCOL.md §2（数据模型）/ §5（REST）
  * 写域：apps/web/**（T-FRONTEND）
  *
@@ -396,6 +396,8 @@ export interface SandboxError {
   who?: string
   who_label?: string
   who_source?: string
+  /** 后端标注：这是当前实现的**有意约束**（不是永久缺失），会随版本演进 */
+  interim?: boolean
 }
 
 export interface SandboxResult {
@@ -418,6 +420,8 @@ export interface SandboxResult {
   error?: SandboxError
   killedBy?: string
   hardKilled?: boolean
+  /** 整批执行（multi:true）的逐条结果 */
+  statements?: Array<{ index: number; kind: string; ok: boolean }>
   tables?: SandboxTable[]
   schema?: SandboxSchema
 }

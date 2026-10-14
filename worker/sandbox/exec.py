@@ -102,8 +102,12 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
                 "code": "E_SQL_UNSUPPORTED",
                 "message": msg,
                 "raw": msg,
-                "hint": ("做事务实验请把整批语句放进**同一次**请求："
-                         '{"sql":"BEGIN; INSERT …; ROLLBACK;","multi":true}（已实测可用）；'
+                # ★ 文案里带**为什么**（教学场景里解释本身有价值 —— Lead 裁定），
+                #   并给出**可操作**的替代写法；与 HTTP 层闸的文案对齐（同码同 who）
+                "hint": ("本沙箱**每次执行都在独立进程中运行**（这是硬超时能强杀死循环查询、"
+                         "且学生之间互不影响的前提），因此事务必须在**同一次执行内**完成。"
+                         "做事务实验请把整批语句放进同一次请求："
+                         '{"sql":"BEGIN; INSERT INTO … ; ROLLBACK;","multi":true}（已实测可用）；'
                          "或用 sandbox.reset 恢复初始数据"),
                 "localReading": "沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）",
                 "localMatched": True,

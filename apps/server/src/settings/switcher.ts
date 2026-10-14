@@ -38,6 +38,35 @@ export const DEFAULT_LLM_TASK_KINDS: readonly string[] = ['extract', 'rollup', '
 /** `drain` 默认最长等待（ms）。 */
 export const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
 
+/**
+ * 准入被暂停后**自动恢复**的默认时限（ms，10 分钟）。
+ *
+ * 为什么必须有它（Lead 裁定，比"加个恢复接口"更重要）：`drain` 超时会**保持准入暂停**
+ * 等人处理；如果只提供手动恢复入口，**人一旦忘了，队列就永久停摆** ——
+ * 全班再也提交不了任务，而 UI 上没有任何提示。所以"暂停"必须是**有期限**的。
+ * 可用 `COURSE_KB_ADMISSIONS_AUTO_RESUME_MS` 或构造参数覆盖；`0` = 关闭自动恢复。
+ */
+export const DEFAULT_AUTO_RESUME_MS = 600_000;
+
+/** 自动恢复定时器发现"有切换正在进行"时的重试间隔（ms）。 */
+const AUTO_RESUME_RETRY_MS = 15_000;
+
+/** 准入闸门的当前状态（`GET /settings/llm` 与 resume 响应都用它）。 */
+export interface AdmissionState {
+  /** 队列是否正在拒绝领取新任务 */
+  paused: boolean;
+  /** 已暂停多久（ms）；未暂停为 0 */
+  pausedForMs: number;
+  /** 进入暂停的时刻（ms）；未暂停为 null */
+  pausedSince: number | null;
+  /** 暂停原因（人话） */
+  reason: string;
+  /** 当时还剩哪些 LLM 任务（暂停时快照） */
+  stillRunning: { id: string; kind: string }[];
+  /** 距离自动恢复还有多久（ms）；`null` = 未启用自动恢复 */
+  autoResumeInMs: number | null
+}
+
 /** 等"在跑任务结束"的轮询间隔（ms）。 */
 const POLL_MS = 25;
 
@@ -125,6 +154,8 @@ export interface SwitchResult {
   admissionPaused: boolean;
   /** 仅 timeout：还剩哪些任务 */
   stillRunning: { id: string; kind: string }[];
+  /** 准入闸门状态快照（含"距离自动恢复还有多久"）—— `state:'timeout'` 时尤其要看它 */
+  admissions?: AdmissionState;
   rolledBack: boolean;
   notes: string[];
 }
@@ -139,6 +170,11 @@ export interface SwitcherOptions {
   admissionGate?: AdmissionGate | null;
   llmKinds?: readonly string[];
   drainTimeoutMs?: number;
+  /**
+   * 准入暂停后自动恢复的时限（ms）。默认取 `COURSE_KB_ADMISSIONS_AUTO_RESUME_MS`
+   * 或 `DEFAULT_AUTO_RESUME_MS`（10 分钟）；`0` = 关闭（不推荐：人会忘 → 永久停摆）。
+   */
+  autoResumeMs?: number;
   audit?: (e: { userId: string | null; action: string; target?: string; detail?: Record<string, unknown> }) => void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -165,9 +201,138 @@ export class ModelSwitcher {
   /** 切换互斥：两人同时点切换会互相回滚 → 串行化 */
   private chain: Promise<unknown> = Promise.resolve();
   private last: { from: string; to: string; at: number } | null = null;
+  /** 正在进行中的切换数（自动恢复要避开它：切到一半恢复准入会破坏 drain 语义） */
+  private inFlightSwitches = 0;
+  /** 因 drain 超时而**保持暂停**的状态；非 null 表示"准入被我们关着" */
+  private paused: { since: number; reason: string; stillRunning: { id: string; kind: string }[] } | null = null;
+  private autoResumeTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: SwitcherOptions) {
     this.o = opts;
+  }
+
+  private autoResumeMs(): number {
+    if (this.o.autoResumeMs !== undefined) return this.o.autoResumeMs;
+    const raw = process.env.COURSE_KB_ADMISSIONS_AUTO_RESUME_MS;
+    const n = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_AUTO_RESUME_MS;
+  }
+
+  /** 准入闸门当前状态（UI 与 resume 响应用它；**暂停中会如实报还剩多久自动恢复**）。 */
+  admissionState(): AdmissionState {
+    const now = this.now();
+    const gate = this.gate();
+    const pausedNow = this.paused !== null && (gate ? gate.paused() : true);
+    const auto = this.autoResumeMs();
+    return {
+      paused: pausedNow,
+      pausedForMs: this.paused ? now - this.paused.since : 0,
+      pausedSince: this.paused ? this.paused.since : null,
+      reason: this.paused?.reason ?? '',
+      stillRunning: this.paused?.stillRunning ?? [],
+      autoResumeInMs: pausedNow && auto > 0 && this.paused ? Math.max(0, auto - (now - this.paused.since)) : null,
+    };
+  }
+
+  /**
+   * 恢复准入（**手动入口**与**自动兜底**共用）。
+   *
+   * @param opts.by `'manual'`（管理员点了恢复）或 `'auto'`（超时兜底）—— 审计里要分清
+   * @returns 恢复动作前后的真实状态（幂等：本来就是开的也如实说）
+   */
+  resumeAdmissions(
+    opts: { by: 'manual' | 'auto'; userId?: string | null; username?: string | null } = { by: 'manual' },
+  ): { ok: true; resumed: boolean; note: string; state: AdmissionState; pending: number } {
+    const gate = this.gate();
+    const wasPaused = this.paused !== null || (gate ? gate.paused() : false);
+    const pausedForMs = this.paused ? this.now() - this.paused.since : 0;
+    const stillRunning = this.paused?.stillRunning ?? [];
+
+    this.clearAutoResumeTimer();
+    this.paused = null;
+    if (gate) gate.resume();
+
+    if (!wasPaused) {
+      return {
+        ok: true,
+        resumed: false,
+        note: '准入本来就是开的（未暂停），无需恢复',
+        state: this.admissionState(),
+        pending: this.o.queue?.pendingCount ?? 0,
+      };
+    }
+    const by = opts.by === 'auto' ? 'auto' : 'manual';
+    this.recordAudit({
+      userId: opts.userId ?? null,
+      action: by === 'auto' ? 'admissions_auto_resume' : 'admissions_resume',
+      target: 'settings.llm.admissions',
+      detail: {
+        by,
+        pausedForMs,
+        ...(opts.username ? { operator: opts.username } : {}),
+        stillRunning: stillRunning.map((t) => `${t.id}:${t.kind}`),
+        ...(by === 'auto' ? { why: '暂停超过自动恢复时限且当时没有进行中的切换' } : {}),
+      },
+    });
+    this.o.log?.(
+      `准入已恢复（${by === 'auto' ? '自动兜底' : '管理员手动'}，已暂停 ${Math.round(pausedForMs / 1000)}s）`,
+      'warn',
+    );
+    return {
+      ok: true,
+      resumed: true,
+      note:
+        by === 'auto'
+          ? `准入已由**自动兜底**恢复（暂停 ${Math.round(pausedForMs / 1000)}s，超过时限）；若仍需切换请重试`
+          : '准入已恢复；可以重新提交任务',
+      state: this.admissionState(),
+      pending: this.o.queue?.pendingCount ?? 0,
+    };
+  }
+
+  /** 暂停准入 + 记状态 + 挂自动恢复定时器（只有 drain 超时走这里）。 */
+  private markPaused(reason: string, stillRunning: { id: string; kind: string }[]): void {
+    this.paused = { since: this.now(), reason, stillRunning };
+    this.armAutoResume();
+  }
+
+  private armAutoResume(): void {
+    this.clearAutoResumeTimer();
+    const auto = this.autoResumeMs();
+    if (auto <= 0) {
+      this.o.log?.('准入自动恢复被关闭（autoResumeMs=0）→ 暂停会一直保持到人工恢复', 'warn');
+      return;
+    }
+    this.autoResumeTimer = setTimeout(() => {
+      this.autoResumeTimer = null;
+      if (this.paused === null) return; // 已被手动恢复
+      if (this.inFlightSwitches > 0) {
+        // 有切换正在进行 → 不能现在恢复（会破坏 drain 语义）→ 稍后重试
+        this.o.log?.('准入自动恢复推迟：有切换正在进行', 'warn');
+        this.autoResumeTimer = setTimeout(() => {
+          this.autoResumeTimer = null;
+          if (this.paused !== null && this.inFlightSwitches === 0) this.resumeAdmissions({ by: 'auto' });
+        }, AUTO_RESUME_RETRY_MS);
+        this.autoResumeTimer.unref?.();
+        return;
+      }
+      this.resumeAdmissions({ by: 'auto' });
+    }, auto);
+    // 定时器不该决定进程寿命（同 watcher 的教训）
+    this.autoResumeTimer.unref?.();
+  }
+
+  private clearAutoResumeTimer(): void {
+    if (this.autoResumeTimer) {
+      clearTimeout(this.autoResumeTimer);
+      this.autoResumeTimer = null;
+    }
+  }
+
+  /** 关闭（释放自动恢复定时器；测试与关服要调）。 */
+  close(): void {
+    this.clearAutoResumeTimer();
+    this.paused = null;
   }
 
   private now(): number {
@@ -247,11 +412,21 @@ export class ModelSwitcher {
   // ───────────────────────────────────────────────────────────────────
   switch(req: SwitchRequest): Promise<SwitchResult> {
     const run = this.chain.then(
-      () => this.doSwitch(req),
-      () => this.doSwitch(req),
+      () => this.wrap(req),
+      () => this.wrap(req),
     );
     this.chain = run.catch(() => undefined);
     return run;
+  }
+
+  /** 计"正在进行的切换"（自动恢复必须避开它）。 */
+  private async wrap(req: SwitchRequest): Promise<SwitchResult> {
+    this.inFlightSwitches += 1;
+    try {
+      return await this.doSwitch(req);
+    } finally {
+      this.inFlightSwitches -= 1;
+    }
   }
 
   private async doSwitch(req: SwitchRequest): Promise<SwitchResult> {
@@ -338,9 +513,20 @@ export class ModelSwitcher {
           notes.push(
             `drain 在 ${timeoutMs}ms 内没等到空闲 → **未切换**；剩 ${still.length} 个 LLM 任务（${still
               .map((s) => `${s.id}:${s.kind}`)
-              .join(',')}）` + (keepPaused ? '；准入**保持暂停**（恢复请调 resumeAdmissions 或重试切换）' : ''),
+              .join(',')}）` +
+              (keepPaused
+                ? `；准入**保持暂停**（可用 POST /api/v1/settings/llm/switch/resume 恢复；` +
+                  `${Math.round(this.autoResumeMs() / 1000)}s 后也会**自动恢复**，避免队列永久停摆）`
+                : ''),
           );
           this.auditEvent(req, from, model, 'failed', `drain 超时（剩 ${still.length} 个 LLM 任务）`);
+          // ★ 保持暂停 + 挂**自动恢复兜底**（人一旦忘了，队列会永久停摆 —— Lead 裁定）
+          if (admissionPaused) {
+            this.markPaused(
+              `drain 模式下等待空闲超时（${timeoutMs}ms），仍有 ${still.length} 个 LLM 任务在跑`,
+              still,
+            );
+          }
           return {
             ok: true, mode: req.mode, activeModel: from, switchedFrom: from, switchedAt: this.now(),
             probe: {
@@ -348,7 +534,9 @@ export class ModelSwitcher {
               checkedAt: this.now(), judgedBy: 'provider.healthCheck',
             },
             waitedMs: this.now() - t0, state: 'timeout', drained, aborted: [], resumed: [],
-            admissionPaused, stillRunning: still, rolledBack: false, notes,
+            admissionPaused, stillRunning: still, rolledBack: false,
+            admissions: this.admissionState(),
+            notes,
           };
         }
         notes.push(`等当前 LLM 单元跑完（${this.now() - t0}ms）`);
@@ -417,11 +605,16 @@ export class ModelSwitcher {
       return {
         ok: true, mode: req.mode, activeModel: model, switchedFrom: from, switchedAt: this.now(),
         probe, waitedMs: this.now() - t0, state: 'switched', drained, aborted, resumed,
-        admissionPaused, stillRunning: [], rolledBack: false, notes,
+        admissionPaused, stillRunning: [], rolledBack: false,
+        admissions: this.admissionState(), notes,
       };
     } finally {
-      // ★ 准入恢复：正常与失败路径都恢复；**只有 drain 超时**保持暂停
-      if (gate && admissionPaused && !keepPaused) gate.resume();
+      // ★ 准入恢复：正常与失败路径都恢复；**只有 drain 超时**保持暂停（那条路已挂自动恢复兜底）
+      if (gate && admissionPaused && !keepPaused) {
+        gate.resume();
+        this.clearAutoResumeTimer();
+        this.paused = null;
+      }
     }
   }
 
@@ -497,28 +690,36 @@ export class ModelSwitcher {
   }
 
   private auditEvent(req: SwitchRequest, from: string, to: string, result: 'ok' | 'failed', reason: string): void {
+    this.recordAudit({
+      userId: req.userId ?? null,
+      action: 'model_switch',
+      target: to,
+      detail: {
+        from, to, mode: req.mode, result,
+        ...(req.username ? { by: req.username } : {}),
+        ...(reason ? { reason } : {}),
+      },
+    });
+  }
+
+  /**
+   * 写审计。
+   *
+   * ★ 没注入 `audit` 时**默认写 `repo.rbac.audit`** —— 审计是硬要求
+   * （"audit_log 记 model_switch 含 from/to/who"），不能因为"调用方忘了传回调"
+   * 就**静默不落盘**（实测踩到：测试里自建 switcher 没传 audit，切换成功但 audit_log 里 0 条）。
+   */
+  private recordAudit(e: { userId: string | null; action: string; target?: string; detail?: Record<string, unknown> }): void {
     try {
-      // ★ 没注入 `audit` 时**默认写 `repo.rbac.audit`** ——
-      //   审计是硬要求（"audit_log 记 model_switch 含 from/to/who"），
-      //   不能因为"调用方忘了传回调"就**静默不落盘**（实测踩到：测试里自建 switcher 没传 audit，
-      //   切换成功但 audit_log 里 0 条）。
       const write =
         this.o.audit ??
-        ((e: { userId: string | null; action: string; target?: string; detail?: Record<string, unknown> }) => {
-          this.o.repo.rbac.audit(e);
+        ((ev: { userId: string | null; action: string; target?: string; detail?: Record<string, unknown> }) => {
+          this.o.repo.rbac.audit(ev);
         });
-      write({
-        userId: req.userId ?? null,
-        action: 'model_switch',
-        target: to,
-        detail: {
-          from, to, mode: req.mode, result,
-          ...(req.username ? { by: req.username } : {}),
-          ...(reason ? { reason } : {}),
-        },
-      });
-    } catch (e) {
-      this.o.log?.(`审计写入失败：${(e as Error).message}`, 'warn');
+      write(e);
+    } catch (err) {
+      // 审计失败不能影响切换结果，但必须吵一声
+      this.o.log?.(`审计写入失败（${e.action}）：${(err as Error).message}`, 'warn');
     }
   }
 }

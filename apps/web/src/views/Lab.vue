@@ -207,6 +207,7 @@ async function run() {
         hint: r.error.hint || '', localReading: r.error.localReading || '',
         who, whoLabel: r.error.who_label || '', kind,
         killedBy: r.killedBy, hardKilled: r.hardKilled,
+        interim: (r.error as any).interim === true,
       }
       history.value = [{ sql: text, ok: false, at: Date.now() }, ...history.value].slice(0, 30)
       note.value = `${r.error.code}：${r.error.message || r.error.raw || ''}`
@@ -375,6 +376,34 @@ async function runSelftest() {
   const agg = await exec('SELECT dept, COUNT(*) AS n FROM students GROUP BY dept')
   rec('agg', { cols: agg.result?.columns, rows: agg.result?.rows })
   need('agg', !agg.error && agg.result?.rowCount === 3)
+
+  // ★ 事务：单条被拒（E_SQL_UNSUPPORTED / who=rules / interim）→ 整批（multi）才有效
+  const singleTx = await exec('ROLLBACK')
+  rec('single_tx_rejected', { code: singleTx.error?.code, who: singleTx.error?.who, interim: (singleTx.error as any)?.interim })
+  need('single_tx_rejected', singleTx.error?.code === 'E_SQL_UNSUPPORTED' && singleTx.error?.who === 'rules')
+  const singleTxKind = document.querySelector('[data-testid="run-error"]') as HTMLElement | null
+  rec('single_tx_who_kind', singleTxKind?.dataset.whoKind)
+  need('single_tx_who_kind', singleTxKind?.dataset.whoKind === 'rules')
+  need('single_tx_interim_noted', !!document.querySelector('[data-testid="interim-note"]'))
+
+  // 整批执行：开关 → 请求带 multi:true → BEGIN/INSERT/ROLLBACK 全 ok 且行数不变
+  await exec('CREATE TABLE tx_probe (id INTEGER PRIMARY KEY, v TEXT)')
+  const cnt = async () => (await exec('SELECT * FROM tx_probe')).result?.rowCount ?? -1
+  multiMode.value = true
+  await nextTick()
+  const rb = await exec("BEGIN; INSERT INTO tx_probe (id, v) VALUES (1, 'x'); ROLLBACK")
+  const afterRb = await cnt()
+  const cm = await exec("BEGIN; INSERT INTO tx_probe (id, v) VALUES (2, 'y'); COMMIT")
+  const afterCm = await cnt()
+  rec('multi_rollback', { ok: rb.result?.ok, statements: (rb.result as any)?.statements, rows: afterRb })
+  rec('multi_commit', { ok: cm.result?.ok, statements: (cm.result as any)?.statements, rows: afterCm })
+  need('multi_rollback_no_effect', afterRb === 0 && !!(rb.result as any)?.statements?.length)
+  need('multi_commit_visible', afterCm === 1)
+  need('multi_toggle_visible', !!document.querySelector('[data-testid="multi-toggle"]'))
+  need('multi_statements_rendered', !!document.querySelector('[data-testid="statements"]'))
+  need('multi_note_explains_why', /独立进程/.test(document.querySelector('[data-testid="multi-note"]')?.textContent || ''))
+  multiMode.value = false
+  await exec('DROP TABLE tx_probe')
 
   // ★ 错误三档必须**长得不一样**（Lead 硬要求：由后端 error.who 驱动）
   const whoKind = async (sql: string) => {
@@ -686,6 +715,7 @@ async function runSelftest() {
 .who-badge[data-tone="unknown"] { color: var(--muted); }
 .who-body { margin-top: 5px; font-size: 13.5px; }
 </style>
+
 
 
 

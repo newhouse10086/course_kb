@@ -21,7 +21,15 @@ import { after, before, test } from 'node:test';
 import { loadConfig } from '../src/config.ts';
 import { buildApp } from '../src/index.ts';
 import type { BuiltApp } from '../src/index.ts';
-import { ownerOfSession, sanitizeIdPart, sandboxSseFrame, sessionIdFor } from '../src/routes/sandbox.ts';
+import {
+  isCrossCallTxControl,
+  ownerOfSession,
+  readCrossCallTx,
+  sanitizeIdPart,
+  sandboxSseFrame,
+  sessionIdFor,
+  shouldGuardCrossCallTx,
+} from '../src/routes/sandbox.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 const ADMIN_PASS = 'sandbox-admin-pass1';
@@ -507,11 +515,48 @@ test('★ 真跑 WITH RECURSIVE 死循环 → 超时被杀；**服务不阻塞**
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ⑦ ★ 事务语义（polysemy-prober 的 critical 发现 → 临时诚实闸 + 单次调用可用）
+// ⑦ ★ 事务语义（critical 发现 → 纵深防御闸 + 单次调用可用）
 // ═══════════════════════════════════════════════════════════════════════
 
-test('★ 跨调用事务：单发 BEGIN/COMMIT/ROLLBACK → **如实拒绝**（不再返回假的 ok:true）', async () => {
-  const live = await listen(await makeApp());
+test('闸的判定逻辑（纯函数）：worker 说支持 → 自动放开；说不支持/探测不到 → 保持拦截（fail-safe）', () => {
+  // worker 明确支持跨调用事务 → 闸自动放开（将来接会话级事务时零改动）
+  assert.equal(shouldGuardCrossCallTx(true, true), false);
+  // worker 说不支持 → 拦截
+  assert.equal(shouldGuardCrossCallTx(true, false), true);
+  // 探测不到（worker 挂了/形状不认识）→ **保持拦截**（宁可多说一句，也不说谎）
+  assert.equal(shouldGuardCrossCallTx(true, null), true);
+  // 总开关关闭 → 一律不拦
+  assert.equal(shouldGuardCrossCallTx(false, false), false);
+
+  // 结构化能力报告的解析（新形状 + 旧布尔形状兼容）
+  assert.equal(
+    readCrossCallTx({ engines: [{ id: 'sqlite', capabilities: { transactions: { same_call: true, cross_call: false } } }] }),
+    false,
+  );
+  assert.equal(
+    readCrossCallTx({ engines: [{ id: 'sqlite', capabilities: { transactions: { cross_call: true } } }] }),
+    true,
+  );
+  assert.equal(readCrossCallTx({ engines: [{ id: 'sqlite', capabilities: { transactions: true } }] }), true);
+  assert.equal(readCrossCallTx({ engines: [{ id: 'sqlite', capabilities: {} }] }), null);
+  assert.equal(readCrossCallTx({ engines: [] }), null);
+  assert.equal(readCrossCallTx(null), null);
+
+  // 词法判定：只认"整条语句就是事务控制"，批次（multi）与普通 SQL 都不算
+  for (const sql of ['BEGIN', 'begin transaction', 'COMMIT', 'ROLLBACK', 'SAVEPOINT sp1', 'RELEASE sp1', ' COMMIT ; ']) {
+    assert.equal(isCrossCallTxControl(sql), true, `${sql} 应判定为事务控制语句`);
+  }
+  for (const sql of [
+    'BEGIN; INSERT INTO t VALUES (1); ROLLBACK;', // 批次 → 不拦（交给 multi）
+    'SELECT * FROM tx',
+    'INSERT INTO tx VALUES (1)',
+    'CREATE TABLE tx(id INT)',
+  ]) {
+    assert.equal(isCrossCallTxControl(sql), false, `${sql} 不应被判定为事务控制语句`);
+  }
+});
+
+test('★ 跨调用事务：单发 BEGIN/COMMIT/ROLLBACK → **如实拒绝**（不再返回假的 ok:true）', async () => {  const live = await listen(await makeApp());
   try {
     const admin = await login(live, 'admin', ADMIN_PASS);
     await createUser(live, admin, 'stu-tx', ['student']);
@@ -537,7 +582,7 @@ test('★ 跨调用事务：单发 BEGIN/COMMIT/ROLLBACK → **如实拒绝**（
       assert.equal(e.who, 'rules', `${sql} 责任方 = 沙箱能力限制（不是学生写错）`);
       assert.match(String(e.hint), /multi/, `${sql} 必须指出可用路径（multi:true）`);
       assert.match(String(e.hint), /独立进程/, `${sql} hint 必须解释"为什么"（安全前提），不是"能力缺失"`);
-      assert.equal(e.interim, true, '标明这是过渡期的诚实闸');
+      assert.equal(e.defense_in_depth, true, '标明这是纵深防御（worker 侧也已拒绝）');
     }
 
     // ② 数据没有被"假回滚"骗到（我们根本没执行任何写）

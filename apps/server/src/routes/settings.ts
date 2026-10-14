@@ -282,6 +282,30 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): (app: FastifyIns
       }
     });
 
+    // ── POST /api/v1/settings/llm/switch/resume（仅 admin）──────────────
+    //
+    // 为什么必须存在：`mode:"drain"` 超时会**保持准入暂停**（等人工处理），
+    // 没有出口 = 队列**永久停摆**（学生/教师再也提交不了任务，只能重启服务）。
+    // 另有**自动兜底**（`ModelSwitcher` 的自动恢复定时器，默认 10 分钟）——
+    // 这条接口是"立刻恢复"，兜底是"人忘了也不会死"。
+    app.post('/api/v1/settings/llm/switch/resume', async (req, reply) => {
+      try {
+        const me = requireAdmin(req);
+        const sw = await getSwitcher();
+        const before = sw.admissionState();
+        const r = sw.resumeAdmissions({ by: 'manual', userId: me.id, username: me.username });
+        audit({
+          userId: me.id,
+          action: 'admissions_resume_requested',
+          target: 'settings.llm.admissions',
+          detail: { resumed: r.resumed, pausedForMs: before.pausedForMs, by: me.username },
+        });
+        return reply.send(r);
+      } catch (err) {
+        return sendError(reply, err);
+      }
+    });
+
     // ── GET /api/v1/settings/llm（切换相关的只读视图；给 UI 轮询忙状态）──
     app.get('/api/v1/settings/llm', async (req, reply) => {
       try {
@@ -296,6 +320,8 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): (app: FastifyIns
           switchedFrom: last?.from ?? null,
           switchedAt: last?.at ?? null,
           busy: sw.busy(),
+          // 让 UI 能显示"准入被暂停了 + 还有多久自动恢复"（否则用户只看到"提交没反应"）
+          admissions: sw.admissionState(),
         });
       } catch (err) {
         return sendError(reply, err);

@@ -424,3 +424,47 @@ def test_logs_after_execution_show_exactly_the_executions(tmp_path: Path) -> Non
     assert entries[1]["message"] == "no such table: nope"
     status, fact = logs_mod.status_fact(entries)
     assert status == "ok" and "2 条" in fact
+
+
+def test_capabilities_shape_is_typed() -> None:
+    """★ 锁**类型**而不只是值：能力上报是 `/capabilities` 的对外契约。
+
+    Lead 认可 `isinstance(tx, dict)` 的价值在于：它防的不是"值错"，而是
+    **"退回成误导性形状"**（例如有人把结构化事务能力改回裸 `true`，
+    于是 `/capabilities` 与前端又开始宣称"支持事务"）。
+    这里把**整张能力表**的类型都钉住（含 server 类引擎）。
+    """
+    engine_mod.register_default_engines()
+    for item in engine_mod.engines_report():
+        caps = item["capabilities"]
+        # 布尔开关
+        for key in ("crud", "ddl", "procedures"):
+            assert isinstance(caps[key], bool), f"{item['id']}.{key} 必须是 bool"
+        # 数字
+        assert isinstance(caps["maxRowsDefault"], int) and not isinstance(
+            caps["maxRowsDefault"], bool)
+        assert caps["maxRowsDefault"] > 0
+        # 事务能力：**必须**是结构化对象，字段类型固定
+        tx = caps["transactions"]
+        assert isinstance(tx, dict), f"{item['id']}.transactions 不能是裸 bool（误导信号）"
+        assert isinstance(tx["same_call"], bool)
+        assert isinstance(tx["cross_call"], bool)
+        assert tx["batch_param"] == "multi" and isinstance(tx["batch_param"], str)
+        assert isinstance(tx["note"], str) and len(tx["note"]) > 20
+        # 语义自洽：跨调用不支持时，note 必须说明"同一次执行内"
+        if tx["cross_call"] is False:
+            assert "同一次" in tx["note"] or "未接入" in tx["note"], tx["note"]
+
+
+def test_engines_report_json_roundtrip_keeps_shape() -> None:
+    """能力上报经 JSON 序列化后形状不变（Node 拿到的就是这份）。"""
+    import json as _json
+
+    engine_mod.register_default_engines()
+    raw = _json.dumps(engine_mod.engines_report(), ensure_ascii=True)
+    back = _json.loads(raw)
+    sqlite = [e for e in back if e["id"] == "sqlite"][0]
+    assert isinstance(sqlite["capabilities"]["transactions"], dict)
+    assert sqlite["capabilities"]["transactions"]["cross_call"] is False
+    assert sqlite["available"] is True
+

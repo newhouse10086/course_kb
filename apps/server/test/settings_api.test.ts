@@ -700,7 +700,132 @@ test('★ switch mode:drain **超时** → state:timeout、**没切**、准入�
     assert.equal(ctx.store.get().llm.active, MODEL_A);
     const onDisk = JSON.parse(fs.readFileSync(ctx.file, 'utf8')) as { llm: { active: string } };
     assert.equal(onDisk.llm.active, MODEL_A, '磁盘也不能变');
+    // ★ 响应里要给出"怎么恢复"与"还有多久自动恢复"，否则 UI/人不知道怎么办
+    const adm = res.admissions as { paused: boolean; autoResumeInMs: number | null; stillRunning: unknown[] };
+    assert.equal(adm.paused, true);
+    assert.equal(typeof adm.autoResumeInMs, 'number', '必须告诉人还有多久自动恢复');
+    assert.ok((adm.autoResumeInMs ?? 0) <= 600_000);
+    assert.equal(adm.stillRunning.length, 1);
   });
+});
+
+test('★ POST /settings/llm/switch/resume：手动恢复准入（否则队列**永久停摆**）', async () => {
+  await withCtx({ running: [{ kind: 'extract' }] }, async (ctx) => {
+    // 教师无权恢复
+    const denied = await req(ctx, 'POST', '/api/v1/settings/llm/switch/resume', { as: 'teacher' });
+    assert.equal(denied.status, 403);
+
+    // 先制造"暂停"
+    await ctx.switcher.switch({ model: MODEL_B, mode: 'drain', drainTimeoutMs: 60, userId: 'u-admin' });
+    assert.equal(ctx.queue.admissionsPaused, true);
+
+    const r = await req(ctx, 'POST', '/api/v1/settings/llm/switch/resume', { as: 'admin' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.resumed, true);
+    assert.match(String(r.body.note), /准入已恢复/);
+    assert.equal(ctx.queue.admissionsPaused, false, '★ 队列必须真的恢复领取任务');
+    assert.equal((r.body.state as { paused: boolean }).paused, false);
+    assert.equal((r.body.state as { pausedForMs: number }).pausedForMs, 0);
+
+    // 审计：手动恢复要留痕
+    const audit = ctx.repo.rbac.listAudit({ action: 'admissions_resume' });
+    assert.equal(audit.total, 1);
+    const detail = JSON.parse(String(audit.entries[0]?.detail_json ?? '{}')) as Record<string, unknown>;
+    assert.equal(detail.by, 'manual');
+    assert.equal(detail.operator, 'admin');
+
+    // 幂等：本来就开着 → 200 且如实说"无需恢复"
+    const again = await req(ctx, 'POST', '/api/v1/settings/llm/switch/resume', { as: 'admin' });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.resumed, false);
+    assert.match(String(again.body.note), /本来就是开的/);
+  });
+});
+
+test('★★ 自动兜底恢复：暂停超过时限后**无人干预也会自动恢复**（防"人忘了→永久停摆"）', async () => {
+  const ctx = await makeCtx({ running: [{ kind: 'extract' }] });
+  try {
+    // 用 80ms 的自动恢复时限（默认 10 分钟）
+    const { ModelCatalog } = await import('../src/settings/models.ts');
+    const { ModelSwitcher } = await import('../src/settings/switcher.ts');
+    const cat = new ModelCatalog({
+      cfg: ctx.cfg,
+      makeProvider: () => ({
+        info: { id: 'amr', kind: 'llm', label: 'x', vendor: 'x', runtime: 'cloud', configured: true, available: false, capabilities: {} },
+        async healthCheck() {
+          return { ok: true, latencyMs: 1, probe: 'fake' };
+        },
+      }),
+    });
+    const sw = new ModelSwitcher({
+      cfg: ctx.cfg, store: ctx.store, repo: ctx.repo, catalog: cat, queue: ctx.queue,
+      autoResumeMs: 80,
+      sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))),
+    });
+    try {
+      const res = await sw.switch({ model: MODEL_B, mode: 'drain', drainTimeoutMs: 60, userId: 'u-admin' });
+      assert.equal(res.state, 'timeout');
+      assert.equal(ctx.queue.admissionsPaused, true, '超时先暂停');
+      const adm = res.admissions as { autoResumeInMs: number | null };
+      assert.ok((adm.autoResumeInMs ?? 0) <= 80, `应报出 80ms 内自动恢复，实际 ${adm.autoResumeInMs}`);
+
+      // 等人为干预？不等 —— 什么都不做，让它自己恢复
+      const deadline = Date.now() + 2000;
+      while (ctx.queue.admissionsPaused && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(ctx.queue.admissionsPaused, false, '★ 超时后必须**自动恢复**（否则队列永久停摆）');
+      // 自动恢复要留痕，且区分 manual/auto
+      const audit = ctx.repo.rbac.listAudit({ action: 'admissions_auto_resume' });
+      assert.equal(audit.total, 1);
+      const detail = JSON.parse(String(audit.entries[0]?.detail_json ?? '{}')) as Record<string, unknown>;
+      assert.equal(detail.by, 'auto');
+      assert.match(String(detail.why), /暂停超过自动恢复时限/);
+      assert.equal(sw.admissionState().paused, false);
+    } finally {
+      sw.close();
+    }
+  } finally {
+    ctx.store.close();
+    await ctx.app.close();
+  }
+});
+
+test('自动兜底恢复：**手动恢复后定时器要被清掉**（不许之后再冒出一次 auto 事件）', async () => {
+  const ctx = await makeCtx({ running: [{ kind: 'extract' }] });
+  try {
+    const { ModelCatalog } = await import('../src/settings/models.ts');
+    const { ModelSwitcher } = await import('../src/settings/switcher.ts');
+    const cat = new ModelCatalog({
+      cfg: ctx.cfg,
+      makeProvider: () => ({
+        info: { id: 'amr', kind: 'llm', label: 'x', vendor: 'x', runtime: 'cloud', configured: true, available: false, capabilities: {} },
+        async healthCheck() {
+          return { ok: true, latencyMs: 1, probe: 'fake' };
+        },
+      }),
+    });
+    const sw = new ModelSwitcher({
+      cfg: ctx.cfg, store: ctx.store, repo: ctx.repo, catalog: cat, queue: ctx.queue,
+      autoResumeMs: 120,
+      sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))),
+    });
+    try {
+      await sw.switch({ model: MODEL_B, mode: 'drain', drainTimeoutMs: 60, userId: 'u-admin' });
+      assert.equal(ctx.queue.admissionsPaused, true);
+      sw.resumeAdmissions({ by: 'manual', userId: 'u-admin' }); // 立刻手动恢复
+      assert.equal(ctx.queue.admissionsPaused, false);
+      await new Promise((r) => setTimeout(r, 300)); // 等过定时器时限
+      assert.equal(ctx.repo.rbac.listAudit({ action: 'admissions_auto_resume' }).total, 0, '手动恢复后不该再有 auto 事件');
+      assert.equal(ctx.repo.rbac.listAudit({ action: 'admissions_resume' }).total, 1);
+    } finally {
+      sw.close();
+    }
+  } finally {
+    ctx.store.close();
+    await ctx.app.close();
+  }
 });
 
 test('★ switch mode:abort → cancel → 等终态 → 切 → 续推（同一 checkpoint_file + resume:true）', async () => {
