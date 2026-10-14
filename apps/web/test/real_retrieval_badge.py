@@ -76,8 +76,16 @@ def main() -> int:
                 " return JSON.stringify({mode:b.dataset.mode, status:b.dataset.status, hits:b.dataset.hits,"
                 " searched:b.dataset.searched, available:b.dataset.available, text:b.textContent.trim().slice(0,120)}) })()"))
             print('★ 真后端 retrieval 徽标：', json.dumps(badge, ensure_ascii=False))
-            # 等这一轮结束（settled）→ 再读工具徽标与依据
-            ch.wait_for("document.querySelector('[data-testid=\"assistant-text\"]')", timeout=300, interval=0.5)
+            # 等这一轮结束：**要么出正文，要么如实报错**（真模型可能慢/失败，两种都算有结论）
+            try:
+                ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"]') || !!document.querySelector('[data-testid=\"chat-error\"]')",
+                            timeout=300, interval=0.5)
+            except TimeoutError:
+                print('  ⚠️ 300s 内既无正文也无错误（真模型仍在跑？）—— 徽标本条已通过，继续记录状态')
+            note = ch.evaluate("JSON.stringify({ws:(document.querySelector('[data-testid=\"ws-state\"]')||{}).textContent,"
+                               " err:(document.querySelector('[data-testid=\"chat-error\"]')||{}).textContent||'',"
+                               " tools:(document.querySelector('[data-testid=\"session-tools\"]')||{}).dataset?.tools||''})")
+            print('  会话状态：', note)
             time.sleep(2)
             tools = ch.evaluate("Array.from(document.querySelectorAll('[data-testid=\"retrieval-tool\"]')).map(e => e.dataset.tool)")
             print('  同轮工具徽标：', tools)

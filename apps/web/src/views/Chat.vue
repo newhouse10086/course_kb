@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * Chat —— pi AI 助教（契约 §7.2 WebSocket；PROVIDERS §7 能力门控）
  *
@@ -10,7 +10,7 @@
  *   · 失败**显式呈现**（error 事件 → 红条），绝不留"空回复"
  *   · pi / 模型任一不可用 → 禁用输入并写明 reason（不允许点了才报错）
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ChatSocket, type ChatServerEvent } from '../api/chat'
 import { useCaps } from '../composables/useCaps'
 import { esc } from '../utils/text'
@@ -75,7 +75,9 @@ const TOOLS_SOURCE_LABEL: Record<string, string> = {
 }
 const toolsSourceLabel = computed(() => TOOLS_SOURCE_LABEL[toolsSource.value] || (toolsSource.value || '未上报'))
 /** capabilities.pi.toolsWarning：非 null = 会话工具回落到 pi 默认全集（**能执行命令的信号**） */
-const toolsWarning = computed(() => String(((caps.value?.raw as any)?.pi?.toolsWarning) || ''))
+const toolsWarningFromFrame = ref('')
+/** 优先用帧里的 `ready.tools_warning`（最权威、最及时）；其次 caps.pi.toolsWarning */
+const toolsWarning = computed(() => toolsWarningFromFrame.value || String(((caps.value?.raw as any)?.pi?.toolsWarning) || ''))
 const whyOpen = ref(false)
 /** 同轮的工具调用（retrieval → settled 之间） */
 const roundTools = ref<Array<{ id: string; tool: string; args?: unknown; done: boolean; ok?: boolean }>>([])
@@ -183,6 +185,10 @@ function onEvent(e: ChatServerEvent) {
       //   三态：disabled-by-role（学生/教师，tools 必为 []）/ admin-full（管理员默认全集）/ explicit（显式白名单）
       sessionTools.value = Array.isArray((e as any).tools) ? (e as any).tools.map((x: unknown) => String(x)) : []
       toolsSource.value = String((e as any).tools_source || '')
+      // ★ pi-bridge 新增 `ready.tools_warning`（只在危险工具被显式开启时出现）：
+      //   **不用匹配枚举值，直接看有没有** —— 有就显示成醒目横幅（等价于"能把服务器 shell 交给浏览器用户"）
+      const w = String((e as any).tools_warning || '')
+      if (w) toolsWarningFromFrame.value = w
       break
     case 'text_delta':
       updateLast((m) => { m.text += String((e as any).delta || '') })
@@ -395,7 +401,7 @@ void _esc
       </div>
       <!-- ★ 工具回落警告：非 null 表示会话工具回落到 pi 默认全集（**能执行命令**） -->
       <div v-if="toolsWarning" class="note bad" style="margin-top: 8px" data-testid="tools-warning">
-        <b>工具回落警告</b>：{{ toolsWarning }}
+        <b>⚠️ 本会话已开启主机工具</b>：{{ toolsWarning }}
         <div class="small" style="margin-top: 4px">这意味着会话可能拿到 pi 的默认工具集（含命令执行）—— 请让后端确认策略，前端不自行拦截。</div>
       </div>
       <!-- 探测中：如实说"还在探测"，但**允许先试**（不阻塞可用功能） -->

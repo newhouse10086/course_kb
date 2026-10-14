@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 契约 mock server（无头 DOM 断言 + 前端开发用）
  *
  * 为什么不是"几行假 JSON"：数据来自上游**冻结产物**
@@ -16,6 +16,7 @@
  * ⚠️ 仅测试/开发用：文件名就叫 mock-server，不参与生产构建。
  */
 import http from 'node:http'
+import net from 'node:net'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1140,6 +1141,27 @@ export function startProxyServer({ target, port = 0, dist = DIST } = {}) {
     up.on('error', (e) => { try { res.writeHead(502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { code: 'E_PROXY', msg: String(e.message) } })) } catch { /* ignore */ } })
     req.pipe(up)
   })
+  /**
+   * ★ WebSocket 升级也要转发 —— 否则 `/api/v1/chat/{session}` 永远连不上（`ws-state` 卡在 connecting）。
+   * 我第一版只写了 HTTP 转发：真后端的对话 WS 走这里，实测"页面看着正常但一条帧都收不到"。
+   * 做法：把原始 socket 直接接到后端的 TCP 端口上（升级握手是 HTTP，之后是双向字节流）。
+   */
+  server.on('upgrade', (req, socket, head) => {
+    const t = new URL(target)
+    const up = net.connect(Number(t.port) || 80, t.hostname, () => {
+      // 把原始请求行/头原样发给后端（含 Cookie —— 鉴权就靠它）
+      up.write(`${req.method} ${req.url} HTTP/1.1\r\n`)
+      for (let i = 0; i < req.rawHeaders.length; i += 2) up.write(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`)
+      up.write('\r\n')
+      if (head && head.length) up.write(head)
+      up.pipe(socket)
+      socket.pipe(up)
+    })
+    const kill = () => { try { socket.destroy() } catch { /* ignore */ } try { up.destroy() } catch { /* ignore */ } }
+    up.on('error', kill)
+    socket.on('error', kill)
+    socket.on('close', () => { try { up.destroy() } catch { /* ignore */ } })
+  })
   return new Promise((resolve) => {
     server.listen(port, '127.0.0.1', () => {
       const actual = server.address().port
@@ -1187,6 +1209,7 @@ if (isMain) {
     setInterval(() => {}, 1 << 30)
   }
 }
+
 
 
 

@@ -110,6 +110,8 @@ const askError = ref('')
 const askDegraded = ref<string[]>([])
 /** 后端回显的"用户消息"全文（真后端把学生 SQL/报错放在这里，证明 AI 真的看到了） */
 const askUserEcho = ref('')
+/** 后端对"引用为何缺失"的如实标注（`done.citationMode`：cited / missing …） */
+const citationMode = ref('')
 
 const CRUD_SNIPPETS: Array<{ label: string; sql: string; kind: 'ddl' | 'dml' | 'dql' | 'tx' }> = [
   { label: '建表', kind: 'ddl', sql: 'CREATE TABLE my_note (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_at TEXT)' },
@@ -299,6 +301,7 @@ async function ask() {
   askError.value = ''
   askDegraded.value = []
   askUserEcho.value = ''
+  citationMode.value = ''
   const body = {
     sessionId: session.value?.sessionId,
     sql: sql.value.trim(),
@@ -334,6 +337,7 @@ async function ask() {
       } else if (event === 'citation') {
         citations.value = normalizeCitations(d.citations || [])
       } else if (event === 'done') {
+        if (d.citationMode) citationMode.value = String(d.citationMode)
         if (d.text && String(d.text).length > askText.value.length) askText.value = String(d.text)
         citations.value = normalizeCitations(d.citations || citations.value)
         askStages.value = [...askStages.value, `完成（ok=${d.ok === true}，引用 ${citations.value.length} 张卡片）`]
@@ -483,9 +487,11 @@ async function runSelftest() {
   rec('single_tx_who_kind', singleTxKind?.dataset.whoKind)
   need('single_tx_who_kind', singleTxKind?.dataset.whoKind === 'rules')
   // backend-api 文档写 interim:true，**实测真后端给 false** → 条件断言（true 才要求提示条），差异已上报
-  const txDefense = (singleTx.error as any)?.defense_in_depth === true
+  // ⚠️ 这里读的是**页面映射后的对象**（camelCase `defenseInDepth`），不是后端原字段 `defense_in_depth`
+  const txDefense = (singleTx.error as any)?.defenseInDepth === true
   rec('single_tx_defense_in_depth', txDefense)
   rec('single_tx_interim_flag', (singleTx.error as any)?.interim === true)
+  await nextTick()   // ⚠️ DOM 断言前必须等一个 tick（第一版立刻查 → 偶发读不到提示条）
   // backend-api 口径：interim 恒 false、defense_in_depth=true → 提示条按后者出现
   need('single_tx_defense_noted', txDefense === !!document.querySelector('[data-testid="defense-note"]'))
 
@@ -591,8 +597,12 @@ async function runSelftest() {
   rec('ask_answered', answered)
   need('ask_streamed', (answered || !!askError.value) && askStages.value.length > 0)
   need('ask_not_silent', answered || !!askError.value)
+  // 三种"有结论"的状态都算通过：① 如实报错 ② 有可跳引用 ③ 后端标 citationMode（检索无命中）
+  rec('citation_mode', citationMode.value)
   need('ask_cites_kb_or_reports_failure',
-    askError.value ? true : citations.value.length > 0 && citations.value.every((c) => c.href.includes('#/wiki')))
+    !!askError.value
+    || (citations.value.length > 0 && citations.value.every((c) => c.href.includes('#/wiki')))
+    || (citations.value.length === 0 && !!citationMode.value))
   // 真环境实测：上游 403 → 后端如实给 E_LLM，页面必须显示出来（不许静默）
   if (askError.value) {
     need('ask_error_visible', !!document.querySelector('[data-testid="ask-error"]'))
@@ -604,7 +614,7 @@ async function runSelftest() {
   rec('citation_anchor', citeEl?.getAttribute('href'))
   // 真模型可能失败（实测上游 403）→ 没引用是**如实结果**；有引用时必须是可跳的 #/wiki 链接
   need('citation_anchor', citations.value.length === 0
-    ? !!askError.value
+    ? (!!askError.value || !!citationMode.value)          // 无引用 → 必须"如实报错"或"后端标注原因"
     : !!citeEl && (citeEl.getAttribute('href') || '').startsWith('#/wiki'))
 
   const report = { ok: failed.length === 0, checks, failed }
@@ -833,6 +843,11 @@ async function runSelftest() {
         <div v-for="(g, i) in askDegraded" :key="i" class="small" style="margin-top: 3px">{{ g }}</div>
       </div>
       <div v-if="askError" class="note bad" data-testid="ask-error">答疑流异常：{{ askError }}</div>
+      <!-- ★ 0 引用且后端标了 citationMode=missing → 如实说明"是检索没命中"，别让人以为引用丢了 -->
+      <div v-if="!citations.length && citationMode" class="note warn" data-testid="citation-missing">
+        后端标注 <code>citationMode={{ citationMode }}</code>：本次<b>没有可引用的知识库卡片</b>
+        （知识库为空或检索无命中）—— 这是**如实结果**，不是前端丢引用。
+      </div>
       <div v-if="citations.length" class="cites" data-testid="citation">
         <span class="small muted">引用的知识库卡片（可跳原文）：</span>
         <a v-for="c in citations" :key="c.card_id" class="xr" :href="c.href" :data-card="c.card_id" @click.prevent="gotoCitation(c.href)">{{ c.name }}</a>

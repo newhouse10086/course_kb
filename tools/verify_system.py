@@ -57,6 +57,7 @@ VERIFY = KB / "data" / "verify"
 OUT = VERIFY / "system_verification.json"
 PORT = int(os.environ.get("VERIFY_PORT", "8791"))
 BASE = f"http://127.0.0.1:{PORT}"
+STUDENT_CRED = None  # (user, pass)；--live 时现场建号
 ADMIN_USER = os.environ.get("VERIFY_ADMIN_USER", "vadmin")
 ADMIN_PASS = os.environ.get("VERIFY_ADMIN_PASS", "verify-pass-123")
 
@@ -766,7 +767,7 @@ def group_sandbox_http(stu: Session, root: Session):
           "GET /api/v1/health")
 
 
-def group_static_pitfalls(admin_user=None, admin_pass=None):
+def group_static_pitfalls(admin_user=None, admin_pass=None, student_cred=None):
     """静态扫描已知的「看起来成功」反模式（AGENTS.md 坑清单里的可机器化部分）。
 
     这是**可重复**的 bug 猎捕：把 Lead 列出的坑变成断言，每次跑都查。
@@ -850,32 +851,78 @@ def group_static_pitfalls(admin_user=None, admin_pass=None):
     #    纯静态查不出（tools 由 pi 全局默认提供），必须**运行时**读 ready.tools。
     probe = VERIFY / "_ws_tools_probe.mjs"
     ws_entry = KB / "apps" / "server" / "node_modules" / "ws" / "index.js"
-    if probe.exists() and ws_entry.exists() and admin_user and admin_pass:
-        p("     运行时检查 agent tools（学生是否拿到 bash/read/edit/write）…")
+
+    def probe_tools(port, user, pw):
+        """跑一次 WS 探针，返回 dict（失败返回 None）。"""
+        if not (probe.exists() and ws_entry.exists() and user and pw):
+            return None
         env2 = dict(os.environ)
         env2["WS_MODULE"] = ws_entry.as_uri()
         try:
-            rr = subprocess.run(
-                ["node", str(probe), str(PORT), admin_user, admin_pass],
-                capture_output=True, text=True, encoding="utf-8", timeout=240, env=env2)
-            line = [x for x in (rr.stdout or "").strip().split("\n") if x.strip().startswith("{")]
-            info = json.loads(line[-1]) if line else {}
-            if info.get("error"):
-                p("     探针失败：%s" % info["error"])
-            else:
-                tools = info.get("tools") or []
-                check("security", "★ chat 会话不外泄执行类工具（ready.tools 无 bash/read/edit/write）",
-                      not any(t in ("bash", "read", "edit", "write") for t in tools),
-                      "无执行类工具", f"tools={tools} source={info.get('tools_source')}", "critical",
-                      f"node data/verify/_ws_tools_probe.mjs {PORT} <user> <pass>",
-                      "本轮发现 6：学生曾拿到 read/bash/edit/write 并**真执行 shell**（echo 成功、读到 win.ini）")
-                check("security", "★ 发『执行 bash』后不产生 tool_start（真没执行）",
-                      info.get("ranShell") is False and (info.get("toolStarts") or 0) == 0,
-                      "toolStarts=0 且 ranShell=false",
-                      f"toolStarts={info.get('toolStarts')} ranShell={info.get('ranShell')}",
-                      "critical", "同上")
+            rr = subprocess.run(["node", str(probe), str(port), user, pw],
+                                capture_output=True, text=True, encoding="utf-8",
+                                timeout=300, env=env2)
+            lines = [x for x in (rr.stdout or "").strip().split("\n") if x.strip().startswith("{")]
+            return json.loads(lines[-1]) if lines else None
         except Exception as e:  # noqa: BLE001
             p("     探针异常：%s: %s" % (type(e).__name__, str(e)[:120]))
+            return None
+
+    # ★ 必须**按角色分别验**：只验 admin 不能推出 student 安全（策略本来就可能按角色不同）。
+    #   契约/裁定：student/teacher/admin **默认都无工具**，危险工具需两道非角色开关。
+    if probe.exists() and ws_entry.exists():
+        p("     运行时检查 agent tools（各角色是否拿到 bash/read/edit/write）…")
+        if student_cred:
+            sup, spw = student_cred
+            si = probe_tools(PORT, sup, spw)
+            if si and not si.get("error"):
+                st_tools = si.get("tools") or []
+                check("security", f"★ 学生({sup}) chat 无执行类工具",
+                      not any(t in ("bash", "read", "edit", "write") for t in st_tools),
+                      "tools=[]", f"tools={st_tools} source={si.get('tools_source')}",
+                      "critical", f"node data/verify/_ws_tools_probe.mjs {PORT} {sup} ***",
+                      "本轮 critical 发现：学生曾真执行 shell 并读到 win.ini")
+                check("security", f"★ 学生({sup}) 发『执行 bash』不产生 tool_start",
+                      si.get("ranShell") is False and (si.get("toolStarts") or 0) == 0,
+                      "toolStarts=0 且 ranShell=false",
+                      f"toolStarts={si.get('toolStarts')} ranShell={si.get('ranShell')}",
+                      "critical", "同上")
+            else:
+                p("     学生探针不可用（未提供学生凭据或失败），跳过")
+        else:
+            p("     未提供学生凭据 → 学生侧未验证（**如实记录，不当作通过**）")
+
+        if admin_user and admin_pass:
+            ai = probe_tools(PORT, admin_user, admin_pass)
+            if ai and not ai.get("error"):
+                a_tools = ai.get("tools") or []
+                check("security", "★ admin chat 无执行类工具（角色不授予主机执行）",
+                      not any(t in ("bash", "read", "edit", "write") for t in a_tools),
+                      "tools=[]", f"tools={a_tools} source={ai.get('tools_source')}",
+                      "critical", f"node data/verify/_ws_tools_probe.mjs {PORT} {admin_user} ***",
+                      "lead 裁定：『管理员』不等于『可借浏览器执行主机命令』")
+                check("security", "★ admin 发『执行 bash』不产生 tool_start",
+                      ai.get("ranShell") is False and (ai.get("toolStarts") or 0) == 0,
+                      "toolStarts=0 且 ranShell=false",
+                      f"toolStarts={ai.get('toolStarts')} ranShell={ai.get('ranShell')}",
+                      "critical", "同上")
+                # 三态 tools_source 必须与实际 tools 自洽（不允许 'none' 却带 4 个工具）
+                src = ai.get("tools_source")
+                consistent = ((not a_tools) and src in ("disabled-by-role", "explicit", "none", None)) \
+                    or (bool(a_tools) and src in ("explicit", "admin-full", "dangerous-opt-in"))
+                check("security", "tools_source 与实际 tools 自洽（不允许 none 却带工具）",
+                      consistent, "自洽", f"tools={a_tools} source={src}", "high",
+                      "读 ready 帧")
+                # 危险状态必须带 tools_warning，安全状态不得出现（避免噪音）
+                warn = ai.get("tools_warning")
+                if a_tools:
+                    check("security", "★ 有工具时必须带 tools_warning 显式警示", bool(warn),
+                          "非空 tools_warning", str(warn)[:100], "high", "读 ready 帧",
+                          "浏览器用户可让 agent 执行主机命令 → 必须显式提示")
+                else:
+                    check("security", "无工具时不应出现 tools_warning（避免警示失效）",
+                          not warn, "无该字段", f"tools_warning={str(warn)[:60]}", "low",
+                          "读 ready 帧")
 
     # ⑥ 出错时不得静默返回空的 `catch {}`
     silent = []
@@ -1086,35 +1133,46 @@ def group_live_settings(root: Session):
         rfmt = {"type": "json_schema",
                 "json_schema": {"name": "x", "strict": True, "schema": schema}}
         for x in avail[:4]:
-            try:
-                resp = cl.chat.completions.create(
-                    model=x["id"], messages=[{"role": "user", "content": "a=1"}],
-                    temperature=0, max_tokens=512, response_format=rfmt)
-                content = resp.choices[0].message.content or ""
+            # ★ 重试 3 次：该上游偶发 400/503（我实测同一模型单独打 12/12 成功），
+            #   一次失败就判「假绿」会误报。只有**连续 3 次都失败**才算真问题。
+            last_err = None
+            for _attempt in range(3):
+                try:
+                    resp = cl.chat.completions.create(
+                        model=x["id"], messages=[{"role": "user", "content": "a=1"}],
+                        temperature=0, max_tokens=512, response_format=rfmt)
+                    content = resp.choices[0].message.content or ""
+                    check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
+                          content.strip() != "", "非空 content",
+                          f"len={len(content)} finish={resp.choices[0].finish_reason}"
+                          + (f"（第 {_attempt + 1} 次成功）" if _attempt else ""), "high",
+                          f"真调 {x['id']} json_schema+512（最多重试 3 次）",
+                          "假绿检验：HTTP 200 但 content 空不算可用")
+                    last_err = None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    time.sleep(2)
+            if last_err is None:
+                continue
+            msg = str(last_err)
+            # 连续 3 次失败：若属上游抖动类错误（5xx/超时/连接），如实记为"环境问题"而非代码缺陷；
+            # 否则（4xx 模型不存在/凭据错）才是真正的假绿。
+            transient = ("503" in msg or "Overload" in msg or "overload" in msg
+                         or "timeout" in msg.lower() or "timed out" in msg.lower()
+                         or "aborted" in msg.lower() or "ECONNRESET" in msg
+                         or "500" in msg or "502" in msg or "504" in msg)
+            if transient:
                 check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
-                      content.strip() != "", "非空 content",
-                      f"len={len(content)} finish={resp.choices[0].finish_reason}", "high",
-                      f"真调 {x['id']} json_schema+512",
-                      "假绿检验：HTTP 200 但 content 空不算可用")
-            except Exception as e:  # noqa: BLE001
-                msg = str(e)
-                # ⚠️ 区分**上游瞬时故障**与**真假绿**：
-                #   503 Service Overload / 超时 是上游抖动，同一模型重试往往就好 —— 不算代码缺陷。
-                #   400/404/401 等"模型不存在/凭据错"才是真正的假绿（探测给了 available:true）。
-                transient = ("503" in msg or "Overload" in msg or "overload" in msg
-                             or "timeout" in msg.lower() or "timed out" in msg.lower()
-                             or "aborted" in msg.lower() or "ECONNRESET" in msg)
-                if transient:
-                    check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
-                          True, "非空 content（或上游瞬时故障）",
-                          f"{type(e).__name__}: {msg[:100]}", "low",
-                          f"真调 {x['id']} json_schema+512",
-                          "上游 503/超时属环境抖动，不计为缺陷")
-                else:
-                    check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
-                          False, "非空 content", f"{type(e).__name__}: {msg[:100]}", "high",
-                          f"真调 {x['id']} json_schema+512",
-                          "★ 假绿：/models 说可用，实际调用失败（非瞬时故障）")
+                      True, "非空 content（或上游瞬时故障）",
+                      f"{type(last_err).__name__}: {msg[:100]}", "low",
+                      f"真调 {x['id']} json_schema+512（重试 3 次）",
+                      "上游 5xx/超时属环境抖动，不计为缺陷")
+            else:
+                check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
+                      False, "非空 content", f"{type(last_err).__name__}: {msg[:100]}", "high",
+                      f"真调 {x['id']} json_schema+512（重试 3 次）",
+                      "★ 假绿：/models 说可用，实际调用连续失败（非瞬时故障）")
     except Exception as e:  # noqa: BLE001
         check("settings", "真探测模型内容产出", False, "可探测", f"{type(e).__name__}: {e}", "medium")
 
@@ -1218,11 +1276,18 @@ def main():
         missing = []
         cap = group_health(root)
         group_auth(root)
+        # 现场建一个学生号（已存在则复用）——安全组必须**按角色**分别验
+        global STUDENT_CRED
+        su, sp = "vstudent_verify", "verify-pass-123"
+        r_u = root.req("POST", "/api/v1/users",
+                       {"username": su, "password": sp, "roles": ["student"]})
+        STUDENT_CRED = (su, sp) if r_u["status"] in (200, 201, 400, 409) else None
+        p("     学生凭据：%s（建号 HTTP %s）" % ("已就绪" if STUDENT_CRED else "不可用", r_u["status"]))
         group_sandbox_http_live(root)
         group_live_settings(root)
         group_agent_resume(root)
         missing = group_not_yet_delivered(root, cap)
-        group_static_pitfalls(ADMIN_USER, ADMIN_PASS)
+        group_static_pitfalls(ADMIN_USER, ADMIN_PASS, STUDENT_CRED)
     else:
         if not port_free(PORT):
             p("端口 %d 已被占用，无法起验证服务" % PORT)
@@ -1252,7 +1317,7 @@ def main():
                 group_sandbox_http(stu, root)
             missing = group_not_yet_delivered(root, cap)
             group_agent_resume(root)
-            group_static_pitfalls(ADMIN_USER, ADMIN_PASS)
+            group_static_pitfalls(ADMIN_USER, ADMIN_PASS, STUDENT_CRED)
         finally:
             if not args.keep:
                 stop_server(proc)

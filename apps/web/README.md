@@ -90,6 +90,44 @@ npm test               # unit + e2e
 - `/sandbox/ask` 的 LLM 上游当前 **403**（`E_LLM`）→ 答疑面板显示错误 + 后端"日志读不到"的如实声明，**不假装给出答案**；引用 0 张（因为没答成）。
 - `npm run dev` = `node --watch`：**队友改后端源码会重启进程** → 我的真后端 e2e 期间出现过 `ECONNREFUSED`（2s 窗口）。改用 `npm start`（8799，不带 watch）后 80/80 全绿 → **这是开发模式重启，不是崩溃**。
 
+## 3A-2. 检索模式徽标（契约 §4 / `docs/RETRIEVAL.md` §2）
+
+字段名与 `pi-bridge` **真机逐条对齐**（不是猜的形状）：
+
+```jsonc
+{ "type":"retrieval", "mode":"none|wiki|kg|rag", "status":"none|ok|empty|unavailable|error",
+  "available":true, "hits":2, "elapsedMs":1240,
+  "why":["bigram 命中「聚簇索引」","DEPENDS_ON 1 跳：索引 → B+树"], "reason":"",
+  "sources":[{"kind":"unit","ref_id":"unt_0001","title":"3.1 聚簇索引","score":27.8}] }
+```
+
+| 要求（Lead） | 实现 |
+|---|---|
+| 显示本次用了哪种检索 + 命中几条 + 耗时 | 徽标 `[wiki（词法/bigram）：命中 2 条] 耗时 1.2s` |
+| **`available:false` → "未使用知识库" + 可读原因** | `[rag（向量）：不可用，未使用知识库] 原因：未配置 embedding provider（…）` |
+| `why` 可展开 | 「看依据（2）▸」展开 `why[]` + `sources`（title/score/ref_id；**正文不下发**是设计如此） |
+| ★ **`none` 必须与"查了但 0 命中"视觉可分** | **判色以 `status` 为准**：`none`=灰虚线「本次没查库」/ `empty`=橙「查了但 0 命中」/ `ok`=绿 / `unavailable|error`=红；三者**文案+颜色+副注都不同** |
+| （补充）同轮工具调用可见 | tool 帧是**独立帧**（`retrieval → tool_* → text_delta → settled`）→ 按轮归组显示 `tool: read ✓`；**默认学生/教师 `tools: []`，无 tool 帧是常态**（已按"有检索帧但无 tool 帧"处理） |
+
+**真后端实测（`npm start` + 真 WS + 真模型）**：
+`{"mode":"none","status":"none","hits":"0","searched":"0","available":"1"}` → 徽标文案「none（不检索）：本次没查库 … （没查知识库 → 与「查了但没命中」不是一回事）」；`why=["用户选择了不使用知识库检索（none）"]`。
+
+**同轮其它帧（pi-bridge 变更，已落地）**：
+- `ready.tools` = **工具真值数组**（判断有没有工具只认它）；`ready.tools_source ∈ disabled-by-role | explicit | dangerous-opt-in`
+  - `disabled-by-role`（学生/教师/**未显式放行的 admin**）显示为「**正确的安全状态**」，不是异常
+  - `dangerous-opt-in` → 最刺眼样式 + `⚠️ 本会话已开启主机工具`
+- `ready.tools_warning`（非空即显示红色横幅，**不匹配枚举**）：等价于"本会话能把服务器 shell 交给浏览器用户"
+- `capabilities.pi.toolsWarning` 作为兜底来源
+
+## 3A-3. 「慢的能力探测不该阻塞可用功能」（Lead 裁定）
+
+真后端 `/capabilities` **首次 19.4s**（真探测：pi SDK 3.3s + 模型探测 + 4 引擎 + FTS 计数），之后 15s TTL 缓存内 **31ms**。
+
+- 对话页**不再等 caps**：进页只判鉴权（401 → 跳登录）→ **立刻连 WS**；caps 未到时显示「能力探测中（真探测较慢）」并**允许发消息**（徽标/正文都来自后端帧，不依赖 caps）
+- caps **到达后**若确实不可用 → 仍如实禁用入口 + 显示原因（契约 §7 的诚实门控不放弃）；报告在 caps 到达时**重写**（不写"假的门控结论"）
+- App 挂载时**后台预热** `/capabilities`（不阻塞路由）
+- 顶栏显示「更新于 X 秒前」（`cached_age_ms`）+「重新探测」走 **`?refresh=1`**；不因 `cached:true` 就当作数据不可信
+
 ## 3B. 模型设置（教师 / admin）—— `docs/SETTINGS_AND_SANDBOX.md` §2
 
 > ⚠️ 本页依赖的 `/models`、`/settings/*` **真后端还没实现（404）** → 真后端下本页显示"未实现"；下表的数字是**契约 mock** 下跑出来的（等 backend-api 就绪后同样适用，前端无需改动）。—— `docs/SETTINGS_AND_SANDBOX.md` §2
@@ -124,8 +162,9 @@ npm test               # unit + e2e
 ```powershell
 npm run typecheck   # vue-tsc：0 错
 npm run build       # vite：✓ built
-npm test            # Vitest 63/63 + headless Chrome DOM 断言 186/186（契约 mock）
-python test/real_e2e.py --backend http://127.0.0.1:8799   # 真后端 80/80（登录/cookie、真 SQL CRUD、E_SQL_* + who、整批事务、答疑 SSE）
+npm test            # Vitest 63/63 + headless Chrome DOM 断言 201/201（契约 mock，含检索徽标 15 条）
+python test/real_e2e.py --backend http://127.0.0.1:8799   # 真后端（登录/cookie、真 SQL CRUD、E_SQL_* + who、整批事务、答疑 SSE）
+python test/real_retrieval_badge.py --backend http://127.0.0.1:8799  # 真后端检索徽标（真 WS + 真模型）
 python test/screenshots_real.py --backend http://127.0.0.1:8799  # 真后端截图 12 张（空态如实保留）
 npm run test:perf   # 真实体量性能数字
 python test/screenshots.py   # 14 张（契约 mock）+ 对比度实测
@@ -153,7 +192,7 @@ python test/screenshots_real.py --backend http://127.0.0.1:8799  # 12 张（真�
 
 ## 5. 实测数字（本机）
 
-**测试**：`npm test` = Vitest 单测 **63/63** + 契约 mock 的 headless Chrome DOM 断言 **186/186**；
+**测试**：`npm test` = Vitest 单测 **63/63** + 契约 mock 的 headless Chrome DOM 断言 **201/201**；
 **真后端** `python test/real_e2e.py --backend http://127.0.0.1:8799` = **80/80**（真 cookie 登录 + 真 SQL/真错误码/真答疑 + 如实降级）。
 新增页贡献：模型设置页 30 条（热切换状态机：409 拒绝 / 502 回滚 / 断点续推）、SQL 练习台 26 条（完整 CRUD / SQL 红线 / 答疑引用 / 截断明示 / 降级门控）、文档页真 multipart 上传 6 条。
 
