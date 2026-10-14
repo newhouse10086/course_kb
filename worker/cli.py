@@ -69,6 +69,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from worker import stdio
+
 #: 版本号：Node 侧可用 ``--version`` 做兼容判断
 WORKER_VERSION = "2.0.0"
 
@@ -171,17 +173,20 @@ def read_payload(in_path: str | None) -> dict[str, Any]:
     if in_path and in_path != "-":
         p = Path(in_path)
         if p.exists() and p.is_file():
-            candidates.append(p.read_text(encoding="utf-8"))
+            # ★ 显式解码（BOM 识别 + UTF-8 strict），不用默认编码
+            candidates.append(stdio.read_text_file(p))
         else:
             candidates.append(in_path)  # 内联 JSON
-    stdin_raw = ""
     try:
         if not sys.stdin.isatty():
-            stdin_raw = sys.stdin.read()
-    except (OSError, ValueError):
-        stdin_raw = ""
-    if stdin_raw.strip():
-        candidates.append(stdin_raw)
+            # ★★ 关键修复：**不用 sys.stdin.read()** —— 它按语言环境解码
+            #    （Windows 中文机 = GBK）→ 中文 payload 走 stdin 会**静默乱码**。
+            #    而 stdin 正是我们**推荐**的大 payload 通道（argv 有 32KB 上限，坑 18）。
+            #    第一版只在调用方恰好设了 PYTHONIOENCODING=utf-8 时才对 ——
+            #    "靠调用方的巧合"正是最脆的安全（T-BACKEND 实测：Node 调用器设了 env 所以一直绿）。
+            candidates.append(stdio.read_stdin_text())
+    except stdio.PayloadEncodingError:
+        raise
 
     errors: list[str] = []
     for raw in candidates:
@@ -1253,7 +1258,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    # 日志一律走 stderr（stdout 只走协议）
+    # 日志一律走 stderr（stdout 只走协议）；stderr 显式 UTF-8（可读且不会因编码崩）
+    stdio.configure_stdio_utf8()
     logging.basicConfig(
         level=getattr(logging, (args.log_level or "WARNING").upper(), logging.WARNING),
         stream=sys.stderr,

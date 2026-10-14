@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """沙箱执行子进程 —— **真正的执行体**（父进程用 ``subprocess`` + 硬超时杀它）。
 
 为什么要单独一个进程（规格 §3 资源限制）：
@@ -279,7 +279,15 @@ def run_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     """子进程入口：stdin 一行 JSON payload → stdout 一行 JSON 结果。"""
-    raw = sys.stdin.read()
+    # ★ 显式 UTF-8（不用 sys.stdin.read()：它按语言环境解码 —— Windows 中文机=GBK，
+    #   中文 SQL 会静默乱码。沙箱里学生的 SQL/数据全是任意文本，必须显式解码）
+    from worker.stdio import read_stdin_text
+    try:
+        raw = read_stdin_text(source="沙箱执行体 stdin")
+    except Exception as exc:  # noqa: BLE001 - 编码错误也要变成 JSON 错误帧
+        print(json.dumps({"error": {"code": "E_PAYLOAD", "msg": str(exc)}},
+                         ensure_ascii=True))
+        return 2
     try:
         payload = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:

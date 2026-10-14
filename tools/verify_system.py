@@ -1169,6 +1169,23 @@ def main():
         "checks_failed": len(PROBLEMS),
         "by_severity": dict(Counter(x["severity"] for x in PROBLEMS)),
         "not_yet_delivered": missing,
+        "manual_verification_notes": {
+            "agent_resume": ("用隔离实例（8795，独立库）实测：ready.resumed=false（首次）→ "
+                             "发一条消息（触发落盘）→ 杀进程 → 重启同库 → "
+                             "ready.resumed=true、restoredMessages=6、会话文件 12 行。"
+                             "本项需重启服务，故不在主流程里自动化。"),
+            "sandbox_transaction": ("跨调用 BEGIN→INSERT→ROLLBACK **不回滚**："
+                                    "ROLLBACK 报 E_SQL_EXEC、count 仍为 2（数据已提交）。"
+                                    "根因见 worker/sandbox/runner.py：isolation_level=None（autocommit）"
+                                    "+ 每次 execute 新建连接并在结束时 close()。"
+                                    "契约 docs/LAB_DB_DEPLOY.md:248 要求事务/回滚可用。"),
+            "sandbox_isolation_worker": ("worker 层 24 项安全负例全过（ATTACH/load_extension/多语句/"
+                                         "PRAGMA 越界/VACUUM/写 sqlite_master/跨学生隔离/路径越界/"
+                                         "死循环 3.00s 硬超时）。"),
+            "retrieval_modes": ("四种模式走 WS（chat 入口），非 HTTP。我实测连接与 ready 帧正常；"
+                                "但**回答链路**当时被 pi 全局模型（glm-5.2，key 401）卡住，"
+                                "拿不到四种模式的结果差异 —— 该项**未验证**（见 problems/发现 3）。"),
+        },
         "problems": PROBLEMS,
         "checks": CHECKS,
     }

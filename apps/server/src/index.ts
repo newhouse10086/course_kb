@@ -16,7 +16,7 @@ import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import path from 'node:path';
 
-import { loadConfig, ensureDirs, redact } from './config.ts';
+import { loadConfig, ensureDirs, redact, materializePiModels } from './config.ts';
 import type { ServerConfig } from './config.ts';
 import { Db } from './store/db.ts';
 import { Repo } from './store/repo.ts';
@@ -216,7 +216,46 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   } else {
     const streamMod = await tryImport<{ createChatConnection?: ChatConnectionFactory }>('./agent/stream.ts');
     if (streamMod.mod?.createChatConnection) {
-      chatFactory = streamMod.mod.createChatConnection;
+      const createConn = streamMod.mod.createChatConnection;
+      /**
+       * ★ 模型绑定（critical：不接这一步 = 学生发问后 **180s 零帧**）
+       *
+       * pi 的 `createAgentSession` 不传模型时会用它**自己的全局默认**
+       * （`~/.pi/agent/settings.json`，实测 `opencode-go/glm-5.2`，key 已 401），
+       * 而项目配置是 `amr/deepseek-v4.1-flash` → 模型根本没被喂给 pi。
+       * 我这边负责**物化一个 pi 格式的 `models.json`**（写在 `data/pi-agent/`，.gitignore 覆盖、不回显 key），
+       * 再把它交给 pi-bridge 的 `AgentSessionManager({ modelsPath, model })`。
+       */
+      const sessionMod = await tryImport<{
+        AgentSessionManager?: new (opts: Record<string, unknown>) => unknown;
+      }>('./agent/session.ts');
+      const piModels = materializePiModels(cfg);
+      if (piModels && typeof sessionMod.mod?.AgentSessionManager === 'function') {
+        try {
+          const manager = new sessionMod.mod.AgentSessionManager({
+            modelsPath: piModels.modelsPath,
+            model: piModels.modelRef,
+          });
+          chatFactory = (connOpts) => createConn({ ...connOpts, manager } as never);
+          process.stderr.write(
+            `[agent] 模型已绑定项目配置：${piModels.modelRef}` +
+              `（models.json → ${path.relative(cfg.root, piModels.modelsPath)}，apiKey 只写 data/，不回显）\n`,
+          );
+        } catch (err) {
+          chatFactory = createConn;
+          process.stderr.write(
+            `[agent] 模型绑定失败（${redact(err instanceof Error ? err.message : String(err))}）→ ` +
+              'pi 会回落它自己的全局默认模型（ready 帧会带 model_warning）\n',
+          );
+        }
+      } else {
+        chatFactory = createConn;
+        process.stderr.write(
+          piModels
+            ? '[agent] 未能构造会话管理器（AgentSessionManager 不可用）→ pi 回落全局默认\n'
+            : '[agent] 无可用 LLM 凭据 → 无法物化 models.json → pi 回落全局默认（chat 可能 401/无响应）\n',
+        );
+      }
     } else if (!agentError) {
       agentError = streamMod.error ?? 'agent/stream.ts 未导出 createChatConnection';
     }
