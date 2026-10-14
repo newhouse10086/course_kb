@@ -301,13 +301,27 @@ export function createTranslateHandler(deps: TranslateHandlerDeps): TaskHandler 
       if (it.kind === 'evidence') return /[\u4e00-\u9fff]/.test(it.text);
       return shouldKeepEnglish(it.text, keepAsIs);
     };
-    /** 统计用：某条是否**真的译出来了**（有非空译文且不是保留） */
+    /** 统计用：某条是否**真的译出来了**（有非空译文、不是保留、且**文本确实变了**） */
     const isTranslated = (it: TranslateItem): boolean => {
       const d = cp.done[it.id];
       // ⚠️ 必须先 `if (!d) return false` 再访问字段 —— 写 `Boolean(d) && d.kept` 时
       //    TS 不会把 `Boolean(d)` 当作收窄（实测 TS18048 'd' is possibly 'undefined'）。
       if (!d) return false;
-      return d.kept === false && (d.text ?? '').trim().length > 0;
+      if (d.kept !== false) return false;
+      const text = (d.text ?? '').trim();
+      // ★ **文本没变 ≠ 译出来了**：模型按"标识符保留英文"的规则原样回传
+      //   （实测：`--allow-mismatches` → `--allow-mismatches`）。
+      //   原错误写法：只看 `kept===false && text非空` → 把这些算成"已翻译"，
+      //   于是报出 62.3% 的翻译率，而其中一部分压根没动（**数字对但结论撒谎**）。
+      return text.length > 0 && text !== it.text.trim();
+    };
+
+    /** 统计用：送过模型但**原样返回**（既没译、也不算按规则保留） */
+    const isUnchanged = (it: TranslateItem): boolean => {
+      const d = cp.done[it.id];
+      if (!d || d.kept !== false) return false;
+      const text = (d.text ?? '').trim();
+      return text.length > 0 && text === it.text.trim();
     };
 
     const summarize = (
@@ -315,6 +329,7 @@ export function createTranslateHandler(deps: TranslateHandlerDeps): TaskHandler 
     ): Record<string, unknown> => {
       const keptCount = items.filter(isKept).length;
       const translatedCount = items.filter(isTranslated).length;
+      const unchangedCount = items.filter(isUnchanged).length;
       const total = items.length;
       return {
         glossary_terms: glossarySize(glossary),
@@ -322,8 +337,11 @@ export function createTranslateHandler(deps: TranslateHandlerDeps): TaskHandler 
         // ★ 领域特征：保留英文**是正确行为，不是失败**
         kept_english: keptCount,
         translated: translatedCount,
+        // 送过模型但原样返回（多为标识符被模型正确保留）—— 单列，不混进 translated
+        unchanged_by_model: unchangedCount,
         kept_ratio: total > 0 ? keptCount / total : 0,
         translated_ratio: total > 0 ? translatedCount / total : 0,
+        unchanged_ratio: total > 0 ? unchangedCount / total : 0,
         ...stats,
         ...extra,
       };
@@ -468,6 +486,9 @@ export async function applyTranslations(
       const node = byId.get(entId);
       if (!node) continue;
       if ((node.name_zh ?? '').trim()) continue; // 已有中文名不覆盖（人工/上游优先）
+      // ★ 模型原样回传（文本没变）→ **不算译文**，不写库。
+      //   否则 `name_zh` 会等于英文名，前端显示"中文名"，而检索时中英混在一起。
+      if (v.text.trim() === (node.name ?? '').trim()) continue;
       try {
         repo.db.run('UPDATE entities SET name_zh = ? WHERE id = ? AND doc_id = ?', v.text, entId, docId);
         entities += 1;

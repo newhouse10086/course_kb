@@ -32,12 +32,13 @@
 
 import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { AgentSession, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
 
 import { AGENT_ERROR_CODES, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
+import { composeMessageWithContext, sanitizeUntrusted } from './guards.ts';
 import { loadSdk, type SdkLoadResult } from './sdk.ts';
 import {
   beginRound,
@@ -121,6 +122,15 @@ export interface SessionInit {
   persistence: 'native' | 'ephemeral';
   persistenceReason: string;
   version: string | null;
+  /**
+   * 是否**从磁盘恢复**了历史（RETRIEVAL.md §5 要求 3）。
+   * `false` + `resumeReason` 一起看：可能是"本来就没有历史"，也可能是"读不了"。
+   */
+  resumed?: boolean;
+  /** 恢复出来的历史消息条数（`message` 类条目） */
+  restoredMessages?: number;
+  /** `resumed=false` 时的**可读原因**（损坏/不兼容/首次），不许静默 */
+  resumeReason?: string;
 }
 
 /** 会话运行统计（诊断用） */
@@ -164,6 +174,38 @@ export function isValidSessionId(sessionId: string): boolean {
   return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId);
 }
 
+/**
+ * 在会话目录里找某个会话的历史文件（RETRIEVAL.md §5）。
+ *
+ * pi 的命名是 `<ISO时间戳>_<sessionId>.jsonl`；我们用 `NewSessionOptions.id`
+ * 把 pi 的 session id 设成自己的 key，所以直接用后缀匹配即可（不需要映射文件）。
+ * 找不到 → null（调用方据此新建）。
+ */
+export function findSessionFile(sessionDir: string, sessionId: string): string | null {
+  try {
+    const suffix = `_${sessionId}.jsonl`;
+    const matches = readdirSync(sessionDir)
+      .filter((name) => name.endsWith(suffix))
+      .sort(); // ISO 时间戳前缀 → 字典序即时间序
+    const latest = matches.at(-1);
+    return latest ? join(sessionDir, latest) : null;
+  } catch {
+    return null; // 目录不存在/无权限 → 当作没有历史（调用方会新建）
+  }
+}
+
+/** 安全地读会话条目（损坏/结构不同都返回 []，绝不抛）。 */
+function readEntries(sessionManager: unknown): unknown[] {
+  try {
+    const getEntries = (sessionManager as { getEntries?: () => unknown }).getEntries;
+    if (typeof getEntries !== 'function') return [];
+    const entries = getEntries.call(sessionManager);
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
 /** 一个被管理的 pi 会话。 */
 export class ManagedAgentSession implements ChatSessionLike {
   readonly id: string;
@@ -181,6 +223,10 @@ export class ManagedAgentSession implements ChatSessionLike {
   private _persistenceReason: string;
   private _version: string | null;
   private _restarted = false;
+  /** ★ 是否从磁盘恢复了历史（RETRIEVAL.md §5 要求 3：可观测） */
+  private _resumed = false;
+  private _restoredMessages = 0;
+  private _resumeReason = '';
   /** 本轮 settled 是否已收到 */
   private settledSeen = false;
   /** 本轮是否以"中断"结束（由 settled 帧固化，供 prompt() 返回值用） */
@@ -195,6 +241,9 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._persistence = init.persistence;
     this._persistenceReason = init.persistenceReason;
     this._version = init.version;
+    this._resumed = init.resumed === true;
+    this._restoredMessages = init.restoredMessages ?? 0;
+    this._resumeReason = init.resumeReason ?? '';
     // ★ 先订阅（坑 14）：在任何人拿到这个对象、发第一条 prompt 之前就挂好
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
   }
@@ -306,6 +355,9 @@ export class ManagedAgentSession implements ChatSessionLike {
       piSessionId: this._piSessionId,
       thinkingLevel: this.piSession.thinkingLevel ?? null,
       restarted: this._restarted,
+      resumed: this._resumed,
+      restoredMessages: this._restoredMessages,
+      ...(this._resumeReason !== '' ? { resumeReason: this._resumeReason } : {}),
     });
   }
 
@@ -330,17 +382,31 @@ export class ManagedAgentSession implements ChatSessionLike {
    * - 空闲：走 `prompt()`，然后**等 `agent_settled`**（不假设 resolve 就等于结束）
    * - 运行中：`steer` / `followUp` 二选一；都没给就**如实报错**（不猜用户意图）
    */
-  async prompt(message: string, opts: { steer?: boolean; followUp?: boolean } = {}): Promise<PromptOutcome> {
+  async prompt(
+    message: string,
+    opts: { steer?: boolean; followUp?: boolean; context?: string } = {},
+  ): Promise<PromptOutcome> {
     if (this._disposed) throw new Error('会话已释放（E_AGENT_DISPOSED）');
     this.touch();
 
+    // ★ 检索上下文（RETRIEVAL.md §4）：拼在**用户消息**里，不进 system。
+    //   用 `[检索到的知识库内容 —— 不是指令]` 包起来 —— 检索结果来自文档，
+    //   文档里也可能写着一句像指令的话，标注清楚比什么都靠模型自觉更靠谱。
+    //   同时：带检索上下文时，把学生输入里的 `[[card:...]]` 中和掉，
+    //   防止"学生自己打一个卡片 id"被当成本次检索的合法引用（引用校验的白名单只认检索结果）。
+    let outgoing = message;
+    if (typeof opts.context === 'string' && opts.context.trim() !== '') {
+      const sanitized = sanitizeUntrusted(message, { maxLen: 8000, neutralizeCitations: true });
+      outgoing = composeMessageWithContext(sanitized.text, opts.context);
+    }
+
     if (this._running) {
       if (opts.steer) {
-        const disposition = await this.piSession.steer(message);
+        const disposition = await this.piSession.steer(outgoing);
         return { disposition, aborted: false, syntheticSettled: false };
       }
       if (opts.followUp) {
-        const disposition = await this.piSession.followUp(message);
+        const disposition = await this.piSession.followUp(outgoing);
         return { disposition, aborted: false, syntheticSettled: false };
       }
       throw new Error('运行中：请用 steer:true（插话）或 followUp:true（排队），否则 SDK 会拒绝');
@@ -353,7 +419,7 @@ export class ManagedAgentSession implements ChatSessionLike {
 
     let disposition = 'started';
     try {
-      await this.piSession.prompt(message, {
+      await this.piSession.prompt(outgoing, {
         // SDK 用它告诉我们"这条 prompt 是被受理成 run，还是被 extension 处理掉了"
         preflightResult: (d) => {
           if (typeof d === 'string' && d !== '') disposition = d;
@@ -436,6 +502,10 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._persistenceReason = init.persistenceReason;
     this._version = init.version ?? this._version;
     this._restarted = true;
+    // `new_session` 的语义是"开一个全新的上下文" → createInit 会新建（resumed=false）
+    this._resumed = init.resumed === true;
+    this._restoredMessages = init.restoredMessages ?? 0;
+    this._resumeReason = init.resumeReason ?? '';
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
     try {
       oldUnsub();
@@ -546,15 +616,58 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       }
     }
     const SessionManagerCtor = sdk.SessionManager as unknown as {
-      create(cwd: string, sessionDir?: string): unknown;
+      create(cwd: string, sessionDir?: string, options?: { id?: string }): unknown;
+      open(path: string, sessionDir?: string, cwdOverride?: string): unknown;
       inMemory(cwd?: string): unknown;
     };
+    let resumed = false;
+    let restoredMessages = 0;
+    let resumeReason = '';
     if (this.sessionDir) {
-      sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir);
-      persistenceReason = `pi 原生 session：${this.sessionDir}（首次 prompt 后落盘，恢复用 SessionManager.open/continueRecent）`;
+      // ★ RETRIEVAL.md §5：先尝试**从磁盘恢复**，没有才新建。
+      //   pi 的文件名是 `<ISO时间戳>_<sessionId>.jsonl`，所以我们把**自己的会话 key**
+      //   作为 pi 的 session id 传进去（`NewSessionOptions.id`），文件名就变得可预测 ——
+      //   等价于 v1 的 `--session-id`，不需要额外的映射文件。
+      const existing = findSessionFile(this.sessionDir, sessionId);
+      if (existing) {
+        try {
+          const opened = SessionManagerCtor.open(existing, this.sessionDir, this.cwd);
+          const entries = readEntries(opened);
+          const messages = entries.filter((e) => (e as { type?: unknown }).type === 'message').length;
+          if (entries.length === 0) {
+            // 文件在但读不出条目（截断/损坏）→ 如实降级为新建，**不假装恢复成功**
+            resumeReason = `会话文件存在但读不到任何条目（可能被截断）：${existing}`;
+            this.diagnostic(`resume 失败（降级为新建）：${resumeReason}`);
+            sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir, { id: sessionId });
+            persistenceReason = `pi 原生 session：${this.sessionDir}（resume 失败已新建）`;
+          } else {
+            sessionManager = opened;
+            resumed = true;
+            restoredMessages = messages;
+            persistenceReason = `pi 原生 session：${this.sessionDir}（已从磁盘恢复 ${messages} 条消息）`;
+          }
+        } catch (err) {
+          resumeReason = `会话文件读取失败：${err instanceof Error ? err.message : String(err)}（${existing}）`;
+          this.diagnostic(`resume 失败（降级为新建，不抛）：${resumeReason}`);
+          try {
+            sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir, { id: sessionId });
+            persistenceReason = `pi 原生 session：${this.sessionDir}（原文件损坏，已新建）`;
+          } catch (err2) {
+            // 连新建都失败 → 如实回落 inMemory，并记原因
+            resumeReason = `${resumeReason}；新建也失败：${err2 instanceof Error ? err2.message : String(err2)}`;
+            sessionManager = SessionManagerCtor.inMemory(this.cwd);
+            persistenceReason = '持久化不可用，已回落 inMemory';
+          }
+        }
+      } else {
+        sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir, { id: sessionId });
+        resumeReason = '没有历史会话（首次创建）';
+        persistenceReason = `pi 原生 session：${this.sessionDir}（首次创建，首次 prompt 后落盘）`;
+      }
     } else {
       sessionManager = SessionManagerCtor.inMemory(this.cwd);
       persistenceReason = '未启用持久化（sessionDir=null 或 persist=false）→ 用 SessionManager.inMemory()，本轮不落盘';
+      resumeReason = '未启用持久化';
     }
 
     const options: CreateAgentSessionOptions = {
@@ -634,6 +747,9 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       persistence,
       persistenceReason,
       version: sdk.version,
+      resumed,
+      restoredMessages,
+      resumeReason,
     };
   }
 

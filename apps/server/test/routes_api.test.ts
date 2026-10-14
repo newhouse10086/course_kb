@@ -217,6 +217,36 @@ function fakeWorkerCapability(available = true, reason = ''): WorkerCapability {
 
 let dbCounter = 0;
 
+// ═══════════════════════════════════════════════════════════════════════
+// RBAC：现有接口现在都要身份 → 测试统一以 admin 登录（真登录、真 cookie）
+// ═══════════════════════════════════════════════════════════════════════
+const ADMIN_USER = 'admin';
+const ADMIN_PASS = 'e2e-pass-12345'; // 仅测试；真实部署走 COURSE_KB_BOOTSTRAP_ADMIN（不硬编码口令）
+let authCookie: string | null = null;
+
+const realFetch = globalThis.fetch.bind(globalThis);
+/**
+ * 包装 fetch：自动带上登录拿到的 cookie（等价于浏览器的 cookie jar）。
+ * ⚠️ 形参类型手写（不用 DOM 的 `RequestInfo`/`HeadersInit`）—— Node 类型下**不存在**这两个名字。
+ */
+globalThis.fetch = ((input: string | URL | Request, init: RequestInit = {}) => {
+  const headers = new Headers(init.headers as Record<string, string> | Headers | undefined);
+  if (authCookie && !headers.has('cookie')) headers.set('cookie', authCookie);
+  return realFetch(input as string, { ...init, headers });
+}) as typeof fetch;
+
+async function login(base: string, username = ADMIN_USER, password = ADMIN_PASS): Promise<string> {
+  const res = await realFetch(`${base}/api/v1/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (res.status !== 200) throw new Error(`登录失败(${res.status})：${await res.text()}`);
+  const pair = (res.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+  if (!pair) throw new Error('登录响应没有 set-cookie');
+  return pair;
+}
+
 async function makeApp(opts: { extractor?: Extractor | null; workerAvailable?: boolean } = {}): Promise<BuiltApp> {
   dbCounter += 1;
   const cfg = loadConfig({
@@ -226,6 +256,8 @@ async function makeApp(opts: { extractor?: Extractor | null; workerAvailable?: b
       COURSE_KB_DATA_DIR: path.join(tmpRoot, `data-${dbCounter}`),
       COURSE_KB_DB: path.join(tmpRoot, `test-${dbCounter}.sqlite3`),
       SSE_KEEPALIVE_MS: '300',
+      // RBAC：首个 admin 由 bootstrap 创建（库里零用户时生效）
+      COURSE_KB_BOOTSTRAP_ADMIN: `${ADMIN_USER}:${ADMIN_PASS}`,
     } as Record<string, string>,
   });
   return buildApp({
@@ -245,11 +277,14 @@ interface Live {
   base: string;
 }
 
+/** 起服务 + **以 admin 登录**（此后所有 fetch 自动带 cookie）。 */
 async function listen(built: BuiltApp): Promise<Live> {
   await built.app.listen({ host: '127.0.0.1', port: 0 });
   const addr = built.app.server.address();
   if (!addr || typeof addr === 'string') throw new Error('无法取到监听地址');
-  return { built, base: `http://127.0.0.1:${addr.port}` };
+  const base = `http://127.0.0.1:${addr.port}`;
+  authCookie = await login(base);
+  return { built, base };
 }
 
 async function jget(live: Live, url: string, headers: Record<string, string> = {}): Promise<{ status: number; body: unknown; headers: Headers }> {
@@ -759,6 +794,7 @@ test('★ SSE 实时流：任务还在跑时就能收到 progress，结束后收
       COURSE_KB_DATA_DIR: path.join(tmpRoot, `data-slow`),
       COURSE_KB_DB: path.join(tmpRoot, 'slow.sqlite3'),
       SSE_KEEPALIVE_MS: '300',
+      COURSE_KB_BOOTSTRAP_ADMIN: `${ADMIN_USER}:${ADMIN_PASS}`,
     } as Record<string, string>,
   });
   const built = await buildApp({

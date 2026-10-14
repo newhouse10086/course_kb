@@ -293,15 +293,24 @@ def script(name: str | None) -> str:
 
 
 def load_dataset(db_path: str | Path, name: str | None = None) -> dict[str, Any]:
-    """把数据集**重建**到 ``db_path``（幂等：先 DROP 再 CREATE + INSERT）。
+    """把数据集**重建**到 ``db_path``（幂等 + **真 reset**）。
 
     这是 ``reset`` 的实现：无论学生把库搞成什么样，跑完就回到初始态。
+    ★ 会先 **DROP 掉库里所有用户表**（含学生自己建的表与脏数据），
+      而不是只 DROP 数据集自带的那几张 —— 否则学生建的 ``junk`` 表会一直留到下次实验
+      （"reset 到初始 schema"就名不副实）。
+      DROP 期间临时关外键（否则删父表会被 FK 拦住）。
     """
     ds = get_dataset(name)
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        existing = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for table in existing:
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(ds.sql)
         conn.commit()
@@ -309,6 +318,9 @@ def load_dataset(db_path: str | Path, name: str | None = None) -> dict[str, Any]
             t: int(conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0])
             for t in ds.tables
         }
+        remaining = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name")]
     finally:
         conn.close()
     return {
@@ -316,5 +328,7 @@ def load_dataset(db_path: str | Path, name: str | None = None) -> dict[str, Any]
         "label": ds.label,
         "db_path": str(path),
         "tables": counts,
+        "dropped": [t for t in existing if t not in ds.tables],   # 如实回报清掉了什么
+        "remainingTables": remaining,
         "dbBytes": path.stat().st_size,
     }

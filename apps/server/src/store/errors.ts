@@ -38,6 +38,16 @@ export const ERROR_HTTP = {
   E_QUOTA: 429,
   E_RATELIMIT: 429,
   E_CONFLICT: 409,
+  /**
+   * 请求体字段不合法（400）。
+   *
+   * ⚠️ 为什么不复用 `E_FORMAT`：契约里 `E_FORMAT` **专指"文件格式不支持"→ 415**
+   * （见 API_PROTOCOL 错误表）。RBAC 新增的用户/课程/笔记接口需要"字段校验失败 → 400"，
+   * 复用 415 会给出误导性的状态码（"你上传的格式不对" vs "你少传了 username"）。
+   * 这条与 RBAC §4 的 `E_UNAUTHENTICATED`/`E_FORBIDDEN`、§5 的 `E_QUOTA` 同属
+   * **RBAC 章节引入的新码**（契约错误表尚未收录，已在交付说明里如实上报）。
+   */
+  E_BADREQUEST: 400,
   // ── 内部 ──
   E_INTERNAL: 500,
 } as const;

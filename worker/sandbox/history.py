@@ -126,6 +126,8 @@ def recent_executions(root: SandboxRoots, user_id: str, session_id: str,
     rows = read(root, user_id, session_id, limit=limit)
     out: list[dict[str, Any]] = []
     for row in rows:
+        if row.get("action"):
+            continue        # 非执行记录（如 agent 读日志的审计）不算"最近执行"
         item: dict[str, Any] = {
             "at": row.get("at"),
             "sql": row.get("sql") or "",
@@ -134,10 +136,19 @@ def recent_executions(root: SandboxRoots, user_id: str, session_id: str,
         err = row.get("error")
         if err:
             item["error"] = err
-        if row.get("rowCount") is not None:
-            item["rowCount"] = row.get("rowCount")
-        if row.get("elapsedMs") is not None:
-            item["elapsedMs"] = row.get("elapsedMs")
+        # 写入端用 snake（row_count/elapsed_ms），对外形状是 camelCase（pi-bridge 契约）
+        row_count = row.get("rowCount", row.get("row_count"))
+        if row_count is not None:
+            item["rowCount"] = row_count
+        elapsed = row.get("elapsedMs", row.get("elapsed_ms"))
+        if elapsed is not None:
+            item["elapsedMs"] = elapsed
+        # 超时的补充信息：S4/T-FRONTEND 要能说"是被停掉的，不是语法错"
+        if row.get("code") == "E_SQL_TIMEOUT" or row.get("killed_by"):
+            item["killedBy"] = row.get("killed_by") or row.get("killedBy")
+            item["hardKilled"] = bool(row.get("hard_killed") or row.get("hardKilled"))
+            if row.get("timeout_ms") is not None:
+                item["timeoutMs"] = row.get("timeout_ms")
         if row.get("kind"):
             item["kind"] = row.get("kind")
         out.append(item)

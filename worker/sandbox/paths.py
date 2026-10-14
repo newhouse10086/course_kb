@@ -31,7 +31,16 @@ PROTECTED_NAMES = (
     "settings.json",
 )
 
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: user_id / session_id 允许的字符：字母数字下划线连字符 + **中日韩汉字**
+#: （学生 ID 可能是 `u_张三`；但绝不许出现路径分隔符、`.`、`..`）
+_ID_RE = re.compile(r"^[\w\u4e00-\u9fff-]{1,64}$", re.UNICODE)
+
+#: Windows 保留设备名（`CON`/`NUL`/`COM1`… 当目录名会出各种诡异行为）
+_WINDOWS_RESERVED = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
 _SUFFIX = ".sqlite3"
 
 
@@ -66,10 +75,15 @@ class SandboxRoots:
     def session_path(self, user_id: str, session_id: str) -> Path:
         """``data/sandbox/{user_id}/{session_id}.sqlite3``（结构校验 + 解析校验）。"""
         for label, value in (("user_id", user_id), ("session_id", session_id)):
-            if not _ID_RE.match(str(value or "")):
+            text = str(value or "")
+            if not _ID_RE.match(text):
                 raise SandboxPathError(
-                    f"{label} 只允许 [A-Za-z0-9_-]{{1,64}}，收到 {value!r}"
+                    f"{label} 只允许字母/数字/下划线/连字符/汉字（1–64 字符），收到 {value!r}"
                     "（禁止 . / \\ 与空值，防目录穿越）"
+                )
+            if text.lower() in _WINDOWS_RESERVED or text != text.rstrip(". "):
+                raise SandboxPathError(
+                    f"{label}={value!r} 是保留名/以点或空格结尾，Windows 下会出问题"
                 )
         return self.validate(self.root / str(user_id) / f"{session_id}{_SUFFIX}")
 

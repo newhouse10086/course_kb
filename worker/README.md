@@ -1,4 +1,4 @@
-﻿# Python Worker —— CLI + 严格 JSONL 协议
+# Python Worker —— CLI + 严格 JSONL 协议
 
 > **架构 v2 定位**（`docs/ARCHITECTURE_V2.md` §3）：后端主体是 **TS/Node**，
 > Python 只做「成熟库不可替代」的事：**PDF/PPTX/DOCX 解析**、**本地 ASR**、抽帧。
@@ -93,6 +93,8 @@ stderr: 日志（**不是协议**）
 | `index` | bigram 检索行（坑 15） | T-WORKER |
 | `search` | 查询词 → bigram 词项 + FTS5 `MATCH` 表达式 | T-WORKER |
 | `asr` | 本地 ASR：`op=probe` 真探测 / `op=transcribe` 转写 | T-WORKER（实现 T2） |
+| `rollup.plan` / `rollup.convert` | S2 汇总（与 extract 同构：提示词 / 校验转换） | T-WORKER |
+| `sandbox.*` | 学生 SQL 沙箱（8 个 job，见 §10） | T-WORKER |
 | `video.*` | 视频管线整包转 `worker/video/job.py::run_job` | T2 video-pipeline |
 | `ping` | 自检：返回版本 + job 列表 | T-WORKER |
 
@@ -359,7 +361,74 @@ worker 外壳统一保证协议格式与退出码。
 
 ## 9. 不做什么（边界）
 
-- **不碰存储**：worker 不连 SQLite、不写数据库（TS 负责）
+- **不碰存储**：worker 不连课程知识库的 SQLite、不写数据库（TS 负责）
 - **不读凭据**：LLM/云 ASR 凭据一律从 job 参数来（Node 下发）
 - **不编排**：任务队列/SSE/重试策略在 Node；worker 只做一次"输入 → 输出"
 - **不假装成功**：能力不足一律 `{ok:false, reason}` 或 `error` 帧（铁律 R3）
+
+---
+
+## 10. 学生 SQL 沙箱（`sandbox.*`）
+
+契约：`docs/SETTINGS_AND_SANDBOX.md` §3 + **`docs/LAB_DB_DEPLOY.md`**（引擎抽象 / CRUD / 日志）。
+
+**为什么执行放 worker**：`better-sqlite3` 是**同步**的 —— 学生在浏览器里跑
+`WITH RECURSIVE` 死循环会**卡死 Node 事件循环**（`/health` 不再响应）。
+所以每次执行都在**独立子进程**里，父进程用 `subprocess(timeout=)` + `kill()`
+做**进程级硬超时**（三层：SQLite `progress_handler` → 子进程 deadline → **父进程 kill**）。
+
+### 10.1 job 一览
+
+| job | 入参 | 出参要点 |
+|---|---|---|
+| `sandbox.engines` | `{root?}` | 逐引擎**真探测**上报 + 日志源能力；不可用必给 `reason` + 文档章节 |
+| `sandbox.datasets` | `{with_sql?}` | `sc` / `employees` / `orders`（含教学点与方言说明） |
+| `sandbox.init` | `{user_id, session_id, dataset?, root?}` | 建/取会话；`created` 区分"新建/复用"；带 `schema` + `capabilities` |
+| `sandbox.reset` | 同上 | **真 reset**：先 DROP 掉库里**所有**用户表，再重建数据集 |
+| `sandbox.exec` | `{user_id, session_id, sql, multi?, max_rows?, timeout_ms?}` | `{columns, rows, rowCount, truncated, elapsedMs, affected?, ok, error?}` |
+| `sandbox.schema` | `{user_id, session_id, with_text?}` | `{dialect, tables:[{name, columns:[{name,type,pk,notnull,fk}], rows}]}` |
+| `sandbox.history` | `{user_id, session_id, limit?, request_user_id?}` | `[{at, sql, ok, error?, rowCount?, elapsedMs?}]`（**只读 + 隔离**） |
+| `sandbox.logs` | `{…, limit?, since?, with_text?, request_user_id?}` | `{source, entries:[LogEntry], count, boundary?, text?}`（L1） |
+
+### 10.2 安全（**每条都有负例测试**）
+
+| 手段 | 实现 |
+|---|---|
+| **路径隔离** | 库只能是 `data/sandbox/<user>/<session>.sqlite3`；`resolve()` 后判前缀；id 仅允许字母数字下划线连字符汉字（挡 `..`、`/`、Windows 保留名） |
+| **不信任客户端 `db_path`** | 引擎只用 `user_id`+`session_id` 推导路径；不一致 → `E_SANDBOX_PATH`（exit 2）；自省/日志同样过路径闸 |
+| **单条语句** | 字符串/注释外的第二个 `;` → `E_SQL_MULTI` |
+| **批次（事务实验）** | `multi:true` 时**逐条**过同一个闸（`BEGIN; UPDATE…; ROLLBACK;`） |
+| **禁 `ATTACH`/`DETACH`** | 词法闸 + SQLite `set_authorizer`（两道） |
+| **禁 `load_extension`** | 词法闸 + `enable_load_extension(False)` + authorizer |
+| **PRAGMA 白名单** | 只放只读自省类；`writable_schema`/`temp_store_directory`/`journal_mode` 直接拒 |
+| **其他引擎越权面** | `LOAD DATA`/`INTO OUTFILE`/`pg_read_file`/`COPY…PROGRAM`/`lo_import` 全拒（服务器类引擎接入后同样适用） |
+| **外键固定开启** | 装 authorizer 之前 `PRAGMA foreign_keys=ON`（与 MySQL 对齐；学生不能关） |
+| **行数/大小上限** | `max_rows`（默认 200，上限 5000）+ 库文件上限（超出 `ROLLBACK` + `E_SANDBOX_SIZE`） |
+| **审计** | 每次执行（含**被闸拒绝**的）O_APPEND 到 `<session>.audit.jsonl`（进程被杀也不丢） |
+| **日志隔离 + 脱敏** | `request_user_id` 必须等于会话所有者；所有文本过 `redact()` |
+
+### 10.3 错误语义（Node 侧请注意）
+
+* **学生 SQL 写错** → `sandbox.exec` 仍 **exit 0**，错误在 `data.error`（`ok:false`）。
+  这是"这条 SQL 失败"，不是"job 失败" —— UI 要展示给学生。
+* `data.error = {code, message, raw, hint, localReading, localMatched, killedBy?, hardKilled?}`
+  * **`message` 是引擎原文一字不改**（`near "FROM": syntax error`、`no such table: student`）；
+  * `localReading`/`hint` 是**本地确定性解读**（模型不可用时也能诚实降级）。
+* **超时**：`E_SQL_TIMEOUT`；`killedBy: "progress"`（SQLite 层先中断）或 `"process"`
+  （**父进程硬杀**，`hardKilled:true`）；两种情况都不阻塞后续执行。
+* **入参/路径类** → exit **2**（`E_SANDBOX_PATH` / `E_PAYLOAD`）；
+  **引擎不可用** → exit **1** + `E_ENGINE_UNAVAILABLE`（reason 指向部署文档）。
+
+### 10.4 引擎可插拔 + 日志源
+
+* `DatabaseEngine`（`engine.py`）与 `LogSource`（`logs.py`）是**两个并列契约**，
+  注册方式一致；**加引擎/日志源 = 注册一个对象**，上层不改（测试用"假引擎"证明）。
+* 默认 **SQLite**（`embedded`，永远可用）；MySQL / PostgreSQL / openGauss
+  **只做诚实降级**：`available:false` + 原因 + 指向 `docs/LAB_DB_DEPLOY.md` §4.x。
+  配置读 `scripts/deploy-lab-db.sh` 写的 `.env`
+  （`LAB_DB_ENGINE` / `LAB_DB_HOST` / `LAB_DB_PORT` / `LAB_DB_NAME` / `LAB_DB_USER`
+  + `LAB_PG_PASSWORD` / `LAB_MYSQL_PASSWORD` / `LAB_OG_PASSWORD`）——
+  **密码只判断"在不在"，绝不读取/落盘/进事件流**。
+* 日志层次：SQLite **只有 L1**（引擎原文报错 + 我们的 audit_log）；
+  **没有 L2/L3**（嵌入式引擎无实例视图、无日志文件）→ `boundary` 字段明确要求 agent
+  「读不到引擎日志就如实说，不许假装看过」。

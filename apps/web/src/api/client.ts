@@ -8,7 +8,8 @@
  * · 错误统一成 ApiError（携带契约 §8 的 code/hint），UI 直接渲染而不是抛 "Failed to fetch"。
  */
 import type {
-  Card, CardDetail, DocumentInfo, GraphData, Outline, Paged, SearchResult, Span,
+  Card, CardDetail, DocumentInfo, GraphData, ModelsResponse, Outline, Paged, SandboxDataset,
+  SandboxResult, SandboxSession, SandboxTable, SearchResult, SettingsPayload, Span, SwitchResult,
   TaskInfo, Unit, UploadAccepted, VideoArtifact, VideoSlide, TranscriptChapter, Xref,
 } from './types'
 
@@ -28,13 +29,16 @@ export class ApiError extends Error {
   status: number
   detail: string
   hint: string
-  constructor(code: string, msg: string, status = 0, detail = '', hint = '') {
+  /** 机器可读的附加信息（如 409 里的运行中任务进度、502 回滚后的 activeModel） */
+  data: any
+  constructor(code: string, msg: string, status = 0, detail = '', hint = '', data: any = null) {
     super(msg || code || '请求失败')
     this.name = 'ApiError'
     this.code = code || 'E_UNKNOWN'
     this.status = status
     this.detail = detail
     this.hint = hint
+    this.data = data
   }
 }
 
@@ -69,7 +73,8 @@ export async function req<T>(path: string, params?: Params, init?: RequestInit):
   if (!res.ok) {
     const err = body?.error || {}
     throw new ApiError(err.code || `E_HTTP${res.status}`, err.msg || `HTTP ${res.status}`,
-      res.status, err.detail || '', err.hint || '')
+      res.status, typeof err.detail === 'string' ? err.detail : '', typeof err.hint === 'string' ? err.hint : '',
+      err.data ?? null)
   }
   return body as T
 }
@@ -154,12 +159,43 @@ export const api = {
   cancelTask: (id: string) =>
     req<{ ok?: boolean }>(`/tasks/${encodeURIComponent(id)}/cancel`, undefined, { method: 'POST' }),
 
+  // ---- 身份（RBAC §3：前端只用来决定入口可见性，权限判定永远在服务端） ----
+  me: () => req<{ user?: { id: string; username: string; display_name?: string }; roles?: string[]; permissions?: string[]; authRequired?: boolean }>('/auth/me'),
+
+  // ---- 模型列表与设置（docs/SETTINGS_AND_SANDBOX.md §1/§2） ----
+  models: () => req<ModelsResponse>('/models'),
+  settings: () => req<SettingsPayload>('/settings'),
+  putSettings: (body: unknown) =>
+    req<{ ok?: boolean; settings?: SettingsPayload; ignored?: Array<{ field: string; requested: unknown; applied: unknown; reason: string }> }>(
+      '/settings', undefined, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  /** 模型热切换：mode=now 仅空闲可用；drain 等当前单元；abort 存断点后终止并续推 */
+  switchModel: (model: string, mode: 'now' | 'drain' | 'abort') =>
+    req<SwitchResult>('/settings/llm/switch', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, mode }),
+    }),
+
+  // ---- 学生虚拟数据库沙箱（SETTINGS §3） ----
+  sandboxDatasets: () => req<{ datasets: SandboxDataset[] }>('/sandbox/datasets'),
+  sandboxSession: (dataset: string) =>
+    req<SandboxSession>('/sandbox/session', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dataset }),
+    }),
+  /** 执行 SQL：**失败也返回 200 + error 字段**（SQL 报错要显示给学生看，不是网络错误） */
+  sandboxExecute: (sessionId: string, sql: string) =>
+    req<SandboxResult>('/sandbox/execute', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, sql }),
+    }),
+  sandboxReset: () =>
+    req<{ ok?: boolean; dataset?: string; tables?: SandboxTable[]; resetPolicy?: string }>('/sandbox/reset', undefined, { method: 'POST' }),
+
   // ---- URL 构造（§5.7 / §5.5） ----
   fileUrl: (docId: string, page?: number) =>
     `${API_BASE}/documents/${encodeURIComponent(docId)}/file${page ? `#page=${page}` : ''}`,
   streamUrl: (docId: string) => `${API_BASE}/documents/${encodeURIComponent(docId)}/stream`,
   subtitleUrl: (docId: string, fmt: 'srt' | 'vtt' = 'vtt') =>
     `${API_BASE}/documents/${encodeURIComponent(docId)}/video/subtitle?fmt=${fmt}`,
+  /** §3 沙箱答疑（POST + SSE：先问后引 + 引用知识库卡片） */
+  sandboxAskUrl: () => `${API_BASE}/sandbox/ask`,
   /** §6 SSE 进度流地址 */
   taskEventsUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/events`,
   /** §7.2 对话 WebSocket（同源派生，测试可用 ?ws= 覆盖；参数在 hash query 里也能读到） */
@@ -210,3 +246,6 @@ export function cardSpan(c: Card | null | undefined): Span | null {
   }
   return null
 }
+
+
+

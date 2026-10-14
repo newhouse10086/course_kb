@@ -451,7 +451,6 @@ test('★ `plan` 返回 0 item → 如实记失败（不把"空"当成功）', a
   assert.equal(out.rollup.with_intro, 3);
   assert.equal(out.rollup.deterministic, 3);
   assert.match(String((out.rollup.failures as string[])[0]), /0 个 item/);
-
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -473,14 +472,72 @@ test('★ worker 不可用（rollup.plan 抛错）→ 确定性回退 + worker_o
   const { ctx } = makeCtx(docId);
   const out = (await handler(ctx)) as { rollup: Record<string, unknown> };
   assert.equal(out.rollup.worker_ok, false);
+  assert.equal(out.rollup.worker_failed_batches, 2, '两层各一批，都失败');
   assert.equal(out.rollup.llm_generated, 0);
   assert.equal(out.rollup.deterministic, 3);
-  assert.match(String(out.rollup.reason), /worker job rollup\.plan 失败/);
+  assert.match(String((out.rollup.failures as string[])[0]), /worker job rollup\.plan 失败/);
 
   // 库里仍然是 deterministic，不是模型给的 'x'
   const stored = JSON.parse(repo.getDocumentRow(docId)!.meta_json) as { rollup: Record<string, Record<string, unknown>> };
   const rootId = repo.allUnitRows(docId)[0]!.id;
   assert.equal(stored.rollup[rootId]!.source, 'deterministic');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('★★ 回归：某批 worker 偶发失败**不得中止其余批**（真实 376 节点跑出来的）', async () => {
+  const dir = tmpDir();
+  const { repo } = freshRepo();
+  const docId = seedDoc(repo);
+
+  // 让 depth=1 那一批（最先跑）失败一次，后面的 depth=0 批必须照常跑
+  let planCalls = 0;
+  const runner: WorkerRunner = async (job) => {
+    if (job.job === 'rollup.plan') {
+      planCalls += 1;
+      if (planCalls === 1) throw new Error('worker 异常退出（exit code 1）');
+      const nodes = (job.input.nodes ?? []) as Record<string, unknown>[];
+      return {
+        schema: { type: 'object', properties: { intro: { type: 'string' } } },
+        items: nodes.map((n) => ({
+          key: `${String(n.id)}#node`, node_id: String(n.id), system: 'S',
+          user: `USER|title=${String(n.title)}`,
+        })),
+      };
+    }
+    const payloads = (job.input.payloads ?? []) as { key: string; data: unknown }[];
+    const rollups: Record<string, unknown> = {};
+    for (const p of payloads) {
+      const d = (p.data ?? {}) as Record<string, unknown>;
+      rollups[String(p.key).replace(/#node$/, '')] = {
+        intro: String(d.intro ?? ''), why_important: '', objectives: [], key_takeaways: [],
+      };
+    }
+    return { ok: true, error_count: 0, rollups, converted: Object.keys(rollups).length };
+  };
+
+  const handler = createRollupHandler({
+    repo, db: repo.db, cfg: freshCfg(dir), runner,
+    completeJson: async () => ({ data: { intro: '【LLM】', why_important: '', objectives: [], key_takeaways: [] } }),
+    availability: async () => ({ ok: true, reason: '' }),
+  });
+
+  const out = (await handler(makeCtx(docId).ctx)) as { rollup: Record<string, unknown> };
+
+  // ★ 第一批失败后，**后续批仍然跑**（第二次 plan 被调用 = 没有整篇中止）
+  assert.equal(planCalls, 2, '第一批失败后第二批仍应被调用');
+  assert.equal(out.rollup.llm_generated, 1, '第二批的根节点应该是 LLM 生成');
+  assert.equal(out.rollup.with_intro, 3, '全部 3 个内部节点仍有 intro');
+  assert.equal(out.rollup.intro_coverage, 1);
+  // 如实标注失败批次
+  assert.equal(out.rollup.worker_ok, false);
+  assert.equal(out.rollup.worker_failed_batches, 1);
+
+  const stored = JSON.parse(repo.getDocumentRow(docId)!.meta_json) as { rollup: Record<string, Record<string, unknown>> };
+  const rootId = repo.allUnitRows(docId)[0]!.id;
+  assert.equal(stored.rollup[rootId]!.source, 'llm', '第二批次正常完成');
+  const u11 = repo.allUnitRows(docId)[1]!.id;
+  assert.equal(stored.rollup[u11]!.source, 'deterministic', '第一批退化为确定性');
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -609,8 +666,14 @@ test('★★ 回归：单层超过 worker 参数上限时**自动分批**（Wind
 
   // 造一棵**同层很宽**的树：根 + 300 个中间节点（各带 1 个叶子）。
   // 这对应真实 refman 的形状（实测 depth=2 有 173 个节点、单层 payload 289.5 KB）。
-  const drafts = [
-    { ord: 1, title: '根', level: 1, parent_ord: null, span: { kind: 'page' as const, start: 1, end: 300 }, text: 'r' },
+  // ⚠️ 必须**显式标注元素类型**：否则 TS 由首个元素把 `parent_ord` 推成 `null`，
+  //    后续 push `parent_ord: 1` 会报 TS2322（number 不能赋给 null）。
+  type Draft = {
+    ord: number; title: string; level: number; parent_ord: number | null;
+    span: { kind: 'page'; start: number; end: number }; text: string;
+  };
+  const drafts: Draft[] = [
+    { ord: 1, title: '根', level: 1, parent_ord: null, span: { kind: 'page', start: 1, end: 300 }, text: 'r' },
   ];
   for (let i = 0; i < 300; i += 1) {
     drafts.push({

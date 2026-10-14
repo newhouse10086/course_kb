@@ -167,6 +167,8 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
 
       return reply.send({
         version: SERVER_VERSION,
+        // ⓪ RBAC 自述（docs/RBAC.md §8）：UI 据此决定要不要显示登录页
+        auth: deps.auth,
         // ① 解析能力：**来自 worker 的真探测**（worker 不可用 → 空数组 + worker.reason 说明）
         adapters: adaptersFromWorker(worker.available),
         // ② 契约 §5.1 的四个能力块（缺一个就是"假装可用"）

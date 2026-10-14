@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 契约类型 —— 字段唯一权威：docs/API_PROTOCOL.md §2（数据模型）/ §5（REST）
  * 写域：apps/web/**（T-FRONTEND）
  *
@@ -241,4 +241,122 @@ export interface TaskProgressEvent {
   stage?: string
   done?: number
   total?: number
+}
+
+/* ==========================================================================
+   模型设置与沙箱（docs/SETTINGS_AND_SANDBOX.md）
+   ========================================================================== */
+
+export interface ModelInfo {
+  id: string
+  label: string
+  provider?: string
+  /** 真探测结果（不是"配置了就算可用"） */
+  available: boolean
+  latencyMs: number | null
+  probe?: string
+  contextWindow?: number
+  reason?: string
+}
+
+export interface ModelsResponse {
+  models: ModelInfo[]
+  activeModel: string
+  switchedFrom?: string | null
+  switchedAt?: number | null
+  /** ★ 系统约束：固定 1，前端**只读展示** */
+  concurrency: number
+  concurrencyLocked?: boolean
+  probe?: { at: number; cached: boolean }
+}
+
+export interface SettingsPayload {
+  version: number
+  /** 'file' = 读到了 settings.json；'default' = 文件缺失用了内置默认（如实上报） */
+  source: 'file' | 'default' | string
+  llm: {
+    active: string
+    fallbacks: string[]
+    temperature: number
+    /** 必须含推理预算（推理模型：max_tokens 太小会静默拿到空 content） */
+    maxTokens: number
+    structured: { jsonSchemaStrict: boolean }
+    concurrency: number
+    concurrencyLocked?: boolean
+    concurrencyNote?: string
+  }
+  asr?: Record<string, unknown>
+  tts?: Record<string, unknown>
+  translate?: Record<string, unknown>
+  sandbox?: SandboxState
+  quota?: Record<string, { concurrentLlmTasks: number; dailyLlmCalls: number }>
+  hotReload?: { watch: boolean; debounceMs: number }
+  switchedFrom?: string | null
+  switchedAt?: number | null
+}
+
+export interface SwitchResult {
+  ok?: boolean
+  mode?: 'now' | 'drain' | 'abort'
+  from?: string
+  to?: string
+  checkpoint?: { done: number; total: number; taskId?: string }
+  resume?: { state: 'idle' | 'resuming' | string; from_checkpoint?: number; total?: number }
+  probe?: { model: string; ok: boolean; latencyMs?: number | null; at?: number }
+  activeModel?: string
+  switchedFrom?: string | null
+  switchedAt?: number | null
+}
+
+export interface SandboxEngine {
+  id: string
+  label: string
+  available: boolean
+  dialect?: string
+  reason?: string
+  /** 不可用时指向部署文档章节（用户要求：不能只说"不可用"） */
+  doc?: string
+}
+
+export interface SandboxLimits { maxRows: number; timeoutMs: number; maxDbBytes: number }
+
+export interface SandboxState {
+  enabled: boolean
+  engine: string
+  engines: SandboxEngine[]
+  limits: SandboxLimits
+  allowWrites: boolean
+  resetPolicy: string
+}
+
+export interface SandboxTable { name: string; columns: string[]; rowCount: number }
+
+export interface SandboxDataset { id: string; label: string; note?: string; tables?: string[]; schema?: string; seed?: string }
+
+export interface SandboxSession {
+  sessionId: string
+  dataset: string
+  datasetLabel?: string
+  engine: string
+  dialect: string
+  schema: string
+  seed?: string
+  tables: SandboxTable[]
+  limits: SandboxLimits
+  dialectNotes?: Array<{ sqlite: string; mysql: string; note: string }>
+}
+
+export interface SandboxResult {
+  columns: string[]
+  rows: Array<Array<string | number | null>>
+  rowCount: number
+  elapsedMs: number
+  /** ★ 截断必须明示（maxRows） */
+  truncated: boolean
+  maxRows: number
+  error?: { code: string; msg: string }
+  sessionId?: string
+  engine?: string
+  dialect?: string
+  tables?: SandboxTable[]
 }

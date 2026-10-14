@@ -37,6 +37,21 @@ const noopExtractor = {
   },
 };
 
+const ADMIN_USER = 'admin';
+const ADMIN_PASS = 'chat-pass-12345';
+let authCookie: string | null = null;
+
+/** 起服务 + 登录（WS 也要带 cookie —— 我的鉴权钩子对 WS 握手同样生效）。 */
+async function loginFor(base: string): Promise<string> {
+  const res = await fetch(`${base}/api/v1/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
+  });
+  if (res.status !== 200) throw new Error(`登录失败(${res.status})：${await res.text()}`);
+  return (res.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+}
+
 async function makeApp(chatFactory: ChatConnectionFactory | null): Promise<BuiltApp> {
   counter += 1;
   const cfg = loadConfig({
@@ -45,6 +60,7 @@ async function makeApp(chatFactory: ChatConnectionFactory | null): Promise<Built
       ...process.env,
       COURSE_KB_DATA_DIR: path.join(tmpRoot, `data-${counter}`),
       COURSE_KB_DB: path.join(tmpRoot, `chat-${counter}.sqlite3`),
+      COURSE_KB_BOOTSTRAP_ADMIN: `${ADMIN_USER}:${ADMIN_PASS}`,
     } as Record<string, string>,
   });
   return buildApp({
@@ -73,6 +89,8 @@ async function listen(built: BuiltApp): Promise<string> {
   await built.app.listen({ host: '127.0.0.1', port: 0 });
   const addr = built.app.server.address();
   if (!addr || typeof addr === 'string') throw new Error('无法取到监听地址');
+  // RBAC：登录一次，WS 握手时带上 cookie（/chat 受 401 闸门保护）
+  authCookie = await loginFor(`http://127.0.0.1:${addr.port}`);
   return `ws://127.0.0.1:${addr.port}`;
 }
 
@@ -85,7 +103,7 @@ interface Collected {
 
 /** 连上去、收集帧，直到服务端关闭（带超时，避免测试挂死）。 */
 function connect(url: string, opts: { send?: string; sendSeq?: string[]; timeoutMs?: number } = {}): Collected {
-  const ws = new WebSocket(url);
+  const ws = new WebSocket(url, authCookie ? { headers: { cookie: authCookie } } : undefined);
   const frames: Record<string, unknown>[] = [];
   const raw: string[] = [];
   const closed = new Promise<{ code: number; reason: string }>((resolve, reject) => {
@@ -259,8 +277,13 @@ test('agent 模块缺失（factory=null）→ 不注册 WS 路由，HTTP GET 落
   await built.app.listen({ host: '127.0.0.1', port: 0 });
   const port = (built.app.server.address() as { port: number }).port;
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/v1/chat/sess_x`);
+    // RBAC：先登录 —— 否则会先撞 401 闸门（那是**正确**行为：未登录不该知道路由存在与否）
+    const cookie = await loginFor(`http://127.0.0.1:${port}`);
+    const res = await fetch(`http://127.0.0.1:${port}/api/v1/chat/sess_x`, { headers: { cookie } });
     assert.equal(res.status, 404);
+    // 未登录时同一个路径必须是 401（不是 404 —— 不泄露"该路由是否存在"）
+    const anon = await fetch(`http://127.0.0.1:${port}/api/v1/chat/sess_x`);
+    assert.equal(anon.status, 401);
     const body = (await res.json()) as Record<string, Record<string, string>>;
     assert.equal(body.error?.code, 'E_NOTFOUND');
     // 能力上报也要如实说"聊天不可用"

@@ -271,13 +271,15 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   Object.assign(handlers, extraHandlers);
 
   // ── RBAC：首个管理员引导（**仅当库里零用户**；不硬编码口令）──────────
-  let bootstrapState: 'initialized' | 'not_initialized' | 'just_created' = repo.rbac.countUsers() > 0
+  // 注：`/capabilities` 的 `auth.bootstrap` 按契约只报 **initialized | not_initialized**
+  //     （"刚创建"只是启动瞬间的内部状态，不进对外契约）。
+  let bootstrapState: 'initialized' | 'not_initialized' = repo.rbac.countUsers() > 0
     ? 'initialized'
     : 'not_initialized';
   try {
-    const boot = await bootstrapAdmin(repo, cfg);
+    const boot = await bootstrapAdmin(repo, cfg.auth);
     if (boot?.created) {
-      bootstrapState = 'just_created';
+      bootstrapState = 'initialized';
       process.stderr.write(`[auth] 已按 COURSE_KB_BOOTSTRAP_ADMIN 创建首个管理员：${boot.username}\n`);
     } else if (boot?.skippedReason) {
       process.stderr.write(`[auth] bootstrap 跳过：${boot.skippedReason}\n`);

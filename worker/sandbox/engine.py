@@ -111,20 +111,41 @@ def clear_registry() -> None:
     _REGISTRY.clear()
 
 
-def get_engine(engine_id: str = "sqlite") -> DatabaseEngine:
-    """取引擎；未注册 → ``KeyError``（上层转成可读错误）。"""
+def ensure_default_engines(root: str | Path | None = None) -> list[str]:
+    """惰性注册默认引擎（**进程启动时 registry 是空的** —— CLI 每次都是新进程）。
+
+    第一版只在 ``sandbox.engines`` job 里注册 → 别的 job 调 ``get_engine('sqlite')``
+    直接 ``E_ENGINE_UNKNOWN``（自己踩的坑，写下来防回归）。
+    """
+    if not _REGISTRY:
+        register_default_engines(root)
+    return list(_REGISTRY)
+
+
+def get_engine(engine_id: str = "sqlite", root: str | Path | None = None) -> DatabaseEngine:
+    """取引擎；未注册 → ``KeyError``（上层转成可读错误）。
+
+    ``root`` 给了就**用这个根目录**重建 SQLite 引擎 ——
+    否则 payload 里的 ``root`` 被无声忽略，所有会话都落到仓库默认的 ``data/sandbox``
+    （多租户/测试会互相串库；实测踩过把测试数据写进仓库目录）。
+    """
+    ensure_default_engines()
     key = (engine_id or "sqlite").lower()
     if key not in _REGISTRY:
         raise KeyError(key)
+    if root is not None and key == "sqlite":
+        _REGISTRY["sqlite"] = SQLiteEngine(root)
     return _REGISTRY[key]
 
 
 def registry_ids() -> list[str]:
+    ensure_default_engines()
     return list(_REGISTRY)
 
 
 def engines_report() -> list[dict[str, Any]]:
     """给 ``/capabilities`` 用的逐引擎如实上报（**真探测**，不是"配置了就算"）。"""
+    ensure_default_engines()
     out: list[dict[str, Any]] = []
     for eid in sorted(_REGISTRY):
         engine = _REGISTRY[eid]
@@ -252,6 +273,9 @@ class SQLiteEngine:
             user_id=req.user_id,
             session_id=req.session_id,
             allow_multi=req.allow_multi,
+            # ★ 必须把引擎自己的根目录传下去：否则 driver 会用**默认**根去校验路径
+            #   （payload 指定的 root 被忽略 → E_SANDBOX_PATH，或写到别的地方）
+            root=str(self._roots.root),
         )
 
     def list_datasets(self) -> list[dict[str, Any]]:
@@ -271,46 +295,67 @@ class _ServerEngineStub:
 
     **为什么不假装可用**：本机没有 Docker、也没有这些服务（AGENTS.md §4）。
     契约 §2 要求 ``available`` 是**真探测结果**，所以这里：
-    * 若配置了 ``host`` 且 ``shutil.which(client)`` 找得到客户端 → 真连一次；
-    * 否则 ``available: false`` + reason（含**该看文档哪一节**）。
+
+    * 读 ``.env``（由 ``scripts/deploy-lab-db.sh`` 写入）判断"是否启用 + 是否配置齐全"：
+      ``LAB_DB_ENGINE``（当前启用的引擎）、``LAB_DB_HOST/PORT/NAME/USER``、
+      以及各引擎自己的 ``LAB_PG_PASSWORD`` / ``LAB_MYSQL_PASSWORD`` / ``LAB_OG_PASSWORD``；
+    * 缺任何一项 → ``available: false`` + **可读 reason**（缺哪个变量 + 该看文档哪一节）；
+    * **密码只判断"在不在"，绝不读取/落盘/打日志**（凭据不进事件流）。
+
+    ⚠️ 服务器类引擎的**执行**在 v2 里归 Node（它有 pg/mysql 驱动）；
+    worker 这里的职责是**如实的可用性上报**与把参数形状对齐。
     """
 
     def __init__(self, engine_id: str, label: str, dialect: str, *, client: str,
-                 default_port: int, doc_section: str, procedures: bool = True,
-                 host: str | None = None, port: int | None = None,
-                 database: str | None = None, env_prefix: str = ""):
+                 default_port: int, doc_section: str, password_env: str,
+                 procedures: bool = True):
+        self._id = engine_id
         self._doc_section = doc_section
         self._client = client
-        self._env_prefix = env_prefix
-        configured_host = host or os.environ.get(f"{env_prefix}_HOST") or ""
-        configured_port = port or _int_or_none(os.environ.get(f"{env_prefix}_PORT")) or default_port
-        configured_db = database or os.environ.get(f"{env_prefix}_DB") or ""
-        self._probe_hint = {"host": configured_host, "port": configured_port,
-                            "database": configured_db}
-        reason = self._reason()
+        self._password_env = password_env
+
+        env_engine = (os.environ.get("LAB_DB_ENGINE") or "").strip().lower()
+        host = (os.environ.get("LAB_DB_HOST") or "").strip()
+        port = _int_or_none(os.environ.get("LAB_DB_PORT")) or default_port
+        database = (os.environ.get("LAB_DB_NAME") or "").strip()
+        user = (os.environ.get("LAB_DB_USER") or "").strip()
+        has_password = bool(os.environ.get(password_env))
+        #: "这个引擎是否被部署脚本启用" —— 只看变量**在不在**，不读密码值
+        self._enabled = (env_engine == engine_id)
+        self._configured = bool(host and has_password)
+        self._probe = {"host": host, "port": port, "database": database, "user": user,
+                       "passwordEnv": password_env, "passwordSet": has_password}
         self.info = EngineInfo(
             id=engine_id, label=label, dialect=dialect, runtime="server",
-            available=False, reason=reason,
+            available=False, reason=self._reason(),
             capabilities={"crud": True, "ddl": True, "transactions": True,
                           "procedures": procedures, "maxRowsDefault": 500},
-            target={k: v for k, v in (("host", configured_host or None),
-                                      ("port", configured_port or None),
-                                      ("database", configured_db or None)) if v},
+            # 脱敏：只有 host/port/database（不含密码、不含账号等凭据）
+            target={k: v for k, v in (("host", host or None), ("port", port or None),
+                                      ("database", database or None)) if v},
         )
 
     def _reason(self) -> str:
-        client_path = shutil.which(self._client)
-        if not self._probe_hint.get("host"):
-            return (f"未配置连接（缺 {self._env_prefix}_HOST）→ 未启用；"
-                    f"部署见 docs/LAB_DB_DEPLOY.md {self._doc_section}")
-        if not client_path:
+        doc = f"docs/LAB_DB_DEPLOY.md {self._doc_section}"
+        if not self._enabled:
+            env_engine = (os.environ.get("LAB_DB_ENGINE") or "（未设置）")
+            return (f"未启用：.env 的 LAB_DB_ENGINE={env_engine}；"
+                    f"启用请跑 scripts/deploy-lab-db.sh {self._id}（{doc}）")
+        if not self._probe["host"]:
+            return f"已启用但缺 LAB_DB_HOST；请重跑 scripts/deploy-lab-db.sh（{doc}）"
+        if not self._probe["passwordSet"]:
+            return (f"已启用但缺 {self._password_env}（凭据变量未设置）；"
+                    f"请重跑 scripts/deploy-lab-db.sh（{doc}）")
+        if not shutil.which(self._client):
             return (f"找不到 {self._client} 客户端，无法真探测连通性；"
-                    f"先跑 scripts/deploy-lab-db.sh（docs/LAB_DB_DEPLOY.md {self._doc_section}）")
-        return (f"已配置 {self._probe_hint['host']}:{self._probe_hint['port']}，"
-                f"但本进程未执行连接探测（server 类引擎 adapter 尚未启用）")
+                    f"确认引擎已安装并在 PATH 中（{doc}）")
+        return (f"已配置 {self._probe['host']}:{self._probe['port']}，"
+                f"但本进程未执行连接探测（server 类引擎的执行归 Node 侧驱动）")
 
     def health_check(self) -> dict[str, Any]:
-        # 诚实：没有真正的客户端库就报不可用，而不是"配置了就算可用"
+        """如实：没有真正的客户端连接就不宣称可用（坑 10）。"""
+        if self._enabled and self._configured and not shutil.which(self._client):
+            return {"ok": False, "reason": f"缺少 {self._client} 客户端，无法真连"}
         return {"ok": False, "reason": self.info.reason}
 
     def ensure_session(self, user_id: str, session_id: str,
@@ -351,15 +396,20 @@ def _int_or_none(value: str | None) -> int | None:
 
 
 def register_default_engines(root: str | Path | None = None) -> list[str]:
-    """注册内置引擎（SQLite 永远可用；server 类按配置如实报）。"""
+    """注册内置引擎（SQLite 永远可用；server 类按 ``.env`` 如实报）。
+
+    ``.env`` 的键由 ``scripts/deploy-lab-db.sh`` 写入（**同一份契约**）：
+    ``LAB_DB_ENGINE`` / ``LAB_DB_HOST`` / ``LAB_DB_PORT`` / ``LAB_DB_NAME`` / ``LAB_DB_USER``
+    + 各引擎密码 ``LAB_PG_PASSWORD`` / ``LAB_MYSQL_PASSWORD`` / ``LAB_OG_PASSWORD``。
+    """
     register_engine(SQLiteEngine(root))
     register_engine(_ServerEngineStub(
         "mysql", "MySQL 8.4 LTS", "mysql", client="mysql", default_port=3306,
-        doc_section="§4.3", env_prefix="LAB_MYSQL"))
+        doc_section="§4.3", password_env="LAB_MYSQL_PASSWORD"))
     register_engine(_ServerEngineStub(
         "postgres", "PostgreSQL 17", "postgres", client="psql", default_port=5432,
-        doc_section="§4.2", env_prefix="LAB_PG"))
+        doc_section="§4.2", password_env="LAB_PG_PASSWORD"))
     register_engine(_ServerEngineStub(
         "opengauss", "openGauss 6.0", "postgres", client="gsql", default_port=5432,
-        doc_section="§4.4", env_prefix="LAB_OPENGAUSS"))
+        doc_section="§4.4", password_env="LAB_OG_PASSWORD"))
     return registry_ids()

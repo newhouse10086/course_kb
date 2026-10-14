@@ -70,9 +70,11 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     if not verdict.ok:
         result = {
             "columns": [], "rows": [], "rowCount": 0, "elapsedMs": 0,
-            "engine": "sqlite", "hints": hints,
+            "engine": "sqlite", "hints": hints, "ok": False,
+            "killedBy": None, "hardKilled": False,
             "error": {"code": verdict.code, "message": verdict.msg, "raw": verdict.msg,
-                      "hint": "该语句被沙箱安全策略拒绝（并非 SQL 写错）"},
+                      "hint": "该语句被沙箱安全策略拒绝（并非 SQL 写错）",
+                      "localReading": verdict.msg, "localMatched": False},
         }
         if record_history:
             _record(roots, user_id, session_id, sql=sql, ok=False,
@@ -132,7 +134,10 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
         if record_history:
             _record(roots, user_id, session_id, sql=sql, ok=False,
                     error="E_SQL_TIMEOUT（进程被硬杀）", code="E_SQL_TIMEOUT",
-                    kind=verdict.kind, elapsed_ms=elapsed_ms, row_count=0, hard_killed=True)
+                    kind=verdict.kind, elapsed_ms=elapsed_ms, row_count=0,
+                    # ★ 审计要留下"是被硬杀的" —— S4 答疑靠它说清
+                    #   "你的递归 CTE 是被超时停掉的，不是语法错"（pi-bridge 的 P1）
+                    hard_killed=True, killed_by="process", timeout_ms=timeout_ms)
         return result
 
     parsed: dict[str, Any] | None = None
@@ -172,23 +177,49 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     # ② 错误附带**引擎原文 + 本地解读**（S4 的核心输入）
     err = result.get("error")
     if isinstance(err, dict):
-        raw = str(err.get("raw") or err.get("message") or "")
+        raw = str(err.get("raw") or "")
+        if not raw:
+            raw = str(err.get("msg") or err.get("message") or "")
         interp = interpret_error(raw)
+        child_msg = str(err.get("msg") or err.get("message") or "")
+        is_timeout = err.get("code") == "E_SQL_TIMEOUT"
+        if is_timeout:
+            # 子进程的 progress_handler 先触发 → 干净超时（父进程 kill 仍在待命）
+            err["message"] = (f"执行超过 {timeout_ms}ms 被中断"
+                              f"（SQLite progress_handler；父进程 {KILL_GRACE_S}s 后硬杀）")
+            err["killedBy"] = "progress"
+            err["hardKilled"] = False
+        else:
+            # ★ 原文优先：S4 必须拿到 `near "FROM": syntax error` 这种**一字不改**的文本
+            err["message"] = raw or child_msg
         err["raw"] = raw
-        err["message"] = raw or err.get("message", "")     # ★ 原文优先，不改写
-        err["hint"] = err.get("hint") or interp.hint
+        err.setdefault("hint", interp.hint)
         err["localReading"] = interp.message
         err["localMatched"] = interp.matched
+        err.pop("msg", None)
+        # 顶层也带一份（Node 侧不用深挖 error 就能判断"是不是被硬杀"）
+        result["killedBy"] = err.get("killedBy")
+        result["hardKilled"] = bool(err.get("hardKilled"))
     result["ok"] = not err
 
     if record_history:
+        err_code = (err or {}).get("code") if isinstance(err, dict) else None
+        err_msg = (err or {}).get("message") if isinstance(err, dict) else None
+        if err_code == "E_SQL_TIMEOUT" and err_msg:
+            # 让审计里的 error 文本也带码（两种超时路径格式统一，便于 grep/统计）
+            err_msg = f"E_SQL_TIMEOUT：{err_msg}"
         _record(roots, user_id, session_id, sql=sql, ok=result["ok"],
-                error=(err or {}).get("message") if isinstance(err, dict) else None,
-                code=(err or {}).get("code") if isinstance(err, dict) else None,
+                error=err_msg,
+                code=err_code,
                 kind=verdict.kind, elapsed_ms=result.get("elapsedMs", elapsed_ms),
                 row_count=result.get("rowCount", 0),
                 affected=result.get("affected"),
-                statements=result.get("statements"))
+                statements=result.get("statements"),
+                # ★ 超时信息一并落审计：S4 的 `sandbox.logs`/`sandbox.history` 要能
+                #   告诉学生"是被超时停掉的，不是你语法错"（progress=SQLite 层中断，
+                #   process=父进程硬杀）
+                **({"killed_by": result.get("killedBy"), "hard_killed": True,
+                    "timeout_ms": timeout_ms} if err_code == "E_SQL_TIMEOUT" else {}))
     return result
 
 

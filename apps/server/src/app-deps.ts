@@ -69,8 +69,59 @@ export interface AppDeps {
   agentError: string | null;
   /** T-AGENT 的聊天连接工厂；`null` = 消息通道不可用 */
   chatFactory: ChatConnectionFactory | null;
+  /**
+   * 检索层钩子（`docs/RETRIEVAL.md`；实现由 kg-rag-architect 交付在 `src/retrieval/**`）。
+   *
+   * ⚠️ **可选**：未接入时 chat 按 `retrieval:'none'` 走（**不报错**）。
+   * 用结构类型（不 import 对方文件）→ 对方未交付时服务照常启动。
+   */
+  retrieval?: RetrievalHook | null;
+  /**
+   * 抽取能力真探测（结果有缓存）。`POST /documents/:id/extract` 入队前用它：
+   * 不可用 → **如实 503 + reason**，绝不排一个注定产出 0 张卡片的"成功"任务。
+   */
+  extractAvailability: () => Promise<{ ok: boolean; reason: string }>;
   /** RBAC 自述（`/capabilities` 的 `auth` 段；UI 据此决定是否显示登录页）。 */
-  auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' | 'just_created' };
+  auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' };
+}
+
+/** 检索模式（`docs/RETRIEVAL.md` §2：**四种模式并列、各自独立、默认 none**）。 */
+export type RetrievalMode = 'none' | 'wiki' | 'kg' | 'rag';
+
+/** 检索条目（`evidence` 是**必填锚点**：没有页码/毫秒的回溯锚点不许进上下文）。 */
+export interface RetrievalItem {
+  refKind: string;
+  refId: string;
+  title: string;
+  snippet?: string;
+  evidence?: { kind: string; start: number; end: number };
+  score?: number;
+  /** 可解释性：为什么它被检索到（如 `bigram 命中「索引」`） */
+  why?: string;
+}
+
+export interface RetrievalResult {
+  mode: RetrievalMode | string;
+  available: boolean;
+  reason?: string;
+  items: RetrievalItem[];
+  elapsedMs: number;
+}
+
+/**
+ * 检索入口（由 `src/retrieval/index.ts` 或 registry 实现）。
+ * `userId` 必填 → 检索层必须按用户过滤（RBAC §6；跨用户隔离的负例测试在双方测试里都有）。
+ */
+export interface RetrievalHook {
+  retrieve(input: {
+    mode: RetrievalMode | string;
+    query: string;
+    userId: string | null;
+    docId?: string | null;
+    limit?: number;
+  }): Promise<RetrievalResult>;
+  /** RBAC 自述（`/capabilities` 的 `auth` 段；UI 据此决定是否显示登录页）。 */
+  auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' };
   /**
    * 抽取能力真探测（结果有缓存）。`POST /documents/:id/extract` 入队前用它：
    * 不可用 → **如实 503 + reason**，绝不排一个注定产出 0 张卡片的"成功"任务。

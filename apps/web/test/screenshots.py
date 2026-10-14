@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """5 个视图 × 亮/暗 = 10 张 headless Chrome 截图 + **对比度实测**
 
@@ -37,6 +37,8 @@ VIEWS = [
     ("video", "video?doc={video}", "!!document.getElementById('video-report')"),
     ("chat", "chat", "!!document.getElementById('chat-report')"),
     ("docs", "docs", "!!document.getElementById('docs-report')"),
+    ("settings", "settings", "!!document.getElementById('settings-report')"),
+    ("lab", "lab?load=1", "!!document.getElementById('lab-report') && !!document.querySelector('[data-testid=\"sql-input\"]')"),
 ]
 
 # 空状态的页面截不出设计效果 → 截图前先做一次**真实交互**把内容填上（不是塞假 DOM）
@@ -189,9 +191,10 @@ def main() -> int:
             mock.kill()
 
     bad = measure_contrast()
-    print(f"\n{'✓' if shots == 10 and bad == 0 else '✗'} 截图 {shots}/10 张 → {OUT}")
-    return 0 if shots == 10 and bad == 0 else 1
+    print(f"\n{'✓' if shots == len(VIEWS) * 2 and bad == 0 else '✗'} 截图 {shots}/{len(VIEWS) * 2} 张 → {OUT}")
+    return 0 if shots == len(VIEWS) * 2 and bad == 0 else 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

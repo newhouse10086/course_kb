@@ -20,6 +20,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
+import { DATASETS, SandboxDb, sandboxError } from './sandbox-mock.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const WEB_ROOT = path.resolve(__dirname, '..')
@@ -327,8 +328,73 @@ export function capabilitiesPayload(degraded = false) {
     policy: { asr: 'local-first', tts: 'cloud-first', translate: 'cloud-first' },
     pi: { available: true, version: '1.2.0', mode: 'sdk' },
     ffmpeg: { available: true, version: 'N-124868' },
+    sandbox: {
+      available: true,
+      engines: [
+        { id: 'sqlite', label: 'SQLite（进程内）', available: true, dialect: 'SQLite 3.x' },
+        { id: 'mysql', label: 'MySQL 8.0 容器', available: false, dialect: 'MySQL 8.0', reason: '未安装 Docker（见 docs/LAB_DB_DEPLOY.md §2.1）', doc: 'docs/LAB_DB_DEPLOY.md §2.1' },
+      ],
+      limits: { maxRows: 200, timeoutMs: 3000, maxDbBytes: 20971520 },
+    },
   }
 }
+
+/* ---------------- 模型设置（docs/SETTINGS_AND_SANDBOX.md §2） ---------------- */
+
+/** 端点实测只有 8 个 LLM（见文档 §0）；这里如实列出，并给真探测式的延迟 */
+const MODELS = [
+  { id: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash', provider: 'amr', available: true, latencyMs: 3800, probe: 'live', contextWindow: 131072 },
+  { id: 'deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash (0731)', provider: 'amr', available: true, latencyMs: 4100, probe: 'live', contextWindow: 131072 },
+  { id: 'glm-5.2', label: 'GLM 5.2', provider: 'amr', available: true, latencyMs: 2600, probe: 'live', contextWindow: 131072 },
+  { id: 'glm-5.3', label: 'GLM 5.3', provider: 'amr', available: true, latencyMs: 2400, probe: 'live', contextWindow: 131072 },
+  { id: 'glm-5.3-flash', label: 'GLM 5.3 Flash', provider: 'amr', available: true, latencyMs: 1500, probe: 'live', contextWindow: 131072 },
+  { id: 'kimi-k2.7-code', label: 'Kimi K2.7 Code', provider: 'amr', available: true, latencyMs: 5200, probe: 'live', contextWindow: 262144 },
+  { id: 'kimi-k3', label: 'Kimi K3', provider: 'amr', available: true, latencyMs: 6100, probe: 'live', contextWindow: 262144 },
+  { id: 'minimax-m3', label: 'MiniMax M3', provider: 'amr', available: false, latencyMs: null, probe: 'live', reason: '探测失败：HTTP 503（模型维护中）' },
+]
+
+/** 探测失败模型（用来验证"切到坏模型要回滚"）：切到它 → 502 + 保持原模型 */
+const BROKEN_MODELS = new Set(['minimax-m3'])
+
+export function settingsPayload(state) {
+  return {
+    $schema: './settings.schema.json',
+    version: 1,
+    source: state.settingsSource,               // 'file' | 'default'
+    llm: {
+      active: state.activeModel,
+      fallbacks: ['glm-5.3', 'kimi-k3'],
+      temperature: 0,
+      maxTokens: 16384,                          // ★ 含推理预算（实测 8 字用 54 reasoning token）
+      structured: { jsonSchemaStrict: true },
+      concurrency: 1,                            // ★ 只读：系统约束，配置调高会被忽略
+      concurrencyLocked: true,
+      concurrencyNote: '固定=1（系统约束，用户硬要求）：配置文件里调高会被忽略',
+    },
+    asr: { active: 'local-fw', model: 'tiny', fallbacks: ['aliyun-asr'] },
+    tts: { active: null },
+    translate: { active: 'llm-mt', glossaryMode: 'inject', keepIdentifiers: true },
+    sandbox: state.sandbox,
+    quota: { student: { concurrentLlmTasks: 1, dailyLlmCalls: 200 }, teacher: { concurrentLlmTasks: 2, dailyLlmCalls: 2000 } },
+    hotReload: { watch: true, debounceMs: 500 },
+    switchedFrom: state.switchedFrom,
+    switchedAt: state.switchedAt,
+  }
+}
+
+/** 数据集元信息：从建表脚本抽出表名 */
+function splitTables(schemaSql) {
+  return (String(schemaSql).match(/CREATE\s+TABLE\s+([A-Za-z_][\w]*)/gi) || []).map((s) => s.replace(/CREATE\s+TABLE\s+/i, ''))
+}
+
+/** 方言差异（诚实标注：SQLite ≠ MySQL） */
+const DIALECT_NOTES = [
+  { sqlite: 'AUTOINCREMENT', mysql: 'AUTO_INCREMENT', note: '自增列的写法不同' },
+  { sqlite: 'TEXT / INTEGER', mysql: 'VARCHAR / INT', note: '类型名不同（SQLite 是动态类型）' },
+  { sqlite: 'PRAGMA table_info(t)', mysql: 'DESCRIBE t', note: '看表结构的命令不同' },
+  { sqlite: '无存储过程 / 无权限体系', mysql: 'PROCEDURE / GRANT', note: '这两类实验在 SQLite 上做不了（见 §6 对照表）' },
+  { sqlite: '窗口函数需 ≥3.25', mysql: '8.0 起支持', note: '版本门槛不同' },
+]
 
 /* ---------------- 其它素材 ---------------- */
 
@@ -360,7 +426,44 @@ const MINIMAL_PDF = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>e
 
 export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}) {
   const F = buildFixture()
-  const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [] }
+  const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [], role: 'teacher', running_llm: true }
+  /** 模型/设置/sandbox 的运行期状态（真后端在 settings.json + SQLite 里） */
+  const STATE = {
+    activeModel: 'deepseek-v4.1-flash',
+    switchedFrom: null,
+    switchedAt: null,
+    settingsSource: 'file',
+    runningLlmTask: true,            // 默认"批量推理运行中" → 设置页必须走"终止并切换"
+    running: { taskId: 'tsk_rollup0001', kind: 'rollup', done: 137, total: 368, model: 'deepseek-v4.1-flash' },
+    sandbox: {
+      enabled: !degraded,
+      engine: degrading() ? 'none' : 'sqlite',
+      engines: [
+        {
+          id: 'sqlite', label: 'SQLite（进程内，本机已装）', available: !degraded, dialect: 'SQLite 3.x',
+          reason: degraded ? 'worker/sandbox 未就绪：Python 沙箱执行器未安装（pip install -r worker/requirements.txt 后重试）' : '',
+          doc: 'docs/LAB_DB_DEPLOY.md §6',
+        },
+        {
+          id: 'mysql', label: 'MySQL 8.0 容器', available: false, dialect: 'MySQL 8.0',
+          reason: '未安装 Docker：本机无法起 MySQL 容器（见 docs/LAB_DB_DEPLOY.md §2.1）',
+          doc: 'docs/LAB_DB_DEPLOY.md §2.1',
+        },
+        {
+          id: 'postgres', label: 'PostgreSQL 16 容器', available: false, dialect: 'PostgreSQL 16',
+          reason: '未安装 Docker', doc: 'docs/LAB_DB_DEPLOY.md §2.2',
+        },
+      ],
+      limits: { maxRows: 200, timeoutMs: 3000, maxDbBytes: 20971520 },
+      allowWrites: true, resetPolicy: 'per_session',
+    },
+    session: null,
+    lastSql: [],
+    audit: [],
+  }
+  function degrading() { return degraded }
+
+  const DATASET = DATASETS[0]
   let release = null
   const holdWaiters = []
 
@@ -425,6 +528,9 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       }
       if (api === '/_fixture/config') {
         for (const k of Object.keys(CFG)) if (q.has(k) && typeof CFG[k] === 'boolean') CFG[k] = ['1', 'true', 'yes'].includes(q.get(k))
+        if (q.has('role')) CFG.role = q.get('role')
+        if (q.has('maxrows')) { STATE.sandbox.limits.maxRows = Math.max(1, Number(q.get('maxrows')) || 200); if (STATE.db) STATE.db.maxRows = STATE.sandbox.limits.maxRows }
+        if (q.has('running_llm')) { CFG.running_llm = ['1', 'true', 'yes'].includes(q.get('running_llm')); STATE.runningLlmTask = CFG.running_llm }
         return json({ config: { ...CFG, uploads: CFG.uploads.length } })
       }
       if (api === '/_fixture/meta') return json({ degraded, meta: F.meta, config: CFG })
@@ -432,6 +538,202 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       // ---------- §5.1 ----------
       if (api === '/health') return json({ ok: true, version: '2.0.0-mock' })
       if (api === '/capabilities') return json(capabilitiesPayload(degraded))
+
+      // ---------- 身份（RBAC §3；前端用它决定"设置"入口是否可见） ----------
+      if (api === '/auth/me') {
+        const role = q.get('role') || CFG.role || 'teacher'
+        return json({
+          user: { id: 'usr_0001', username: role === 'student' ? 'student01' : 'teacher01', display_name: role === 'student' ? '学生账号' : '王老师' },
+          roles: [role], authRequired: true,
+          permissions: role === 'student'
+            ? ['documents:read', 'sandbox:use', 'notes:own']
+            : ['documents:read', 'documents:write', 'settings:read', 'settings:write', 'sandbox:use', 'users:manage'],
+        })
+      }
+
+      // ---------- 模型列表（SETTINGS §2：每个模型要给 available + 真探测延迟） ----------
+      if (api === '/models') {
+        return json({
+          models: MODELS.map((m) => (degraded ? { ...m, available: false, latencyMs: null, reason: 'LLM 端点不可达（mock degraded）' } : m)),
+          activeModel: STATE.activeModel,
+          switchedFrom: STATE.switchedFrom,
+          switchedAt: STATE.switchedAt,
+          concurrency: 1,
+          concurrencyLocked: true,
+          probe: { at: Date.now(), cached: false },
+        })
+      }
+
+      // ---------- 设置（只读脱敏；PUT 需要 admin） ----------
+      if (api === '/settings' && req.method === 'GET') return json(settingsPayload(STATE))
+      if (api === '/settings' && req.method === 'PUT') {
+        const chunks = []
+        req.on('data', (c) => chunks.push(c))
+        return req.on('end', () => {
+          let body = {}
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* ignore */ }
+          // ★ concurrency 只读：调高一律忽略并如实说明（不许静默生效）
+          const ignored = []
+          if (body?.llm?.concurrency != null && Number(body.llm.concurrency) !== 1) {
+            ignored.push({ field: 'llm.concurrency', requested: body.llm.concurrency, applied: 1, reason: '固定=1（系统约束）' })
+          }
+          if (body?.llm?.active) {
+            const m = MODELS.find((x) => x.id === body.llm.active)
+            if (!m) return err(400, 'E_SETTINGS_INVALID', `未知模型：${body.llm.active}`, '用 /api/v1/models 的 id')
+            if (!m.available) return err(400, 'E_MODEL_UNAVAILABLE', `模型 ${m.id} 探测不可用：${m.reason || ''}`, '先修端点或换模型')
+            STATE.activeModel = m.id
+          }
+          if (body?.sandbox?.limits?.maxRows) STATE.sandbox.limits.maxRows = Math.min(2000, Number(body.sandbox.limits.maxRows))
+          STATE.audit.push({ at: Date.now(), action: 'settings_update', ignored })
+          json({ ok: true, settings: settingsPayload(STATE), ignored, source: STATE.settingsSource })
+        })
+      }
+
+      // ---------- 模型热切换（SETTINGS §2 状态机） ----------
+      if (api === '/settings/llm/switch' && req.method === 'POST') {
+        const chunks = []
+        req.on('data', (c) => chunks.push(c))
+        return req.on('end', () => {
+          let body = {}
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* ignore */ }
+          const target = MODELS.find((m) => m.id === body.model)
+          const mode = String(body.mode || 'drain')
+          if (!target) return err(400, 'E_SETTINGS_INVALID', `未知模型：${body.model}`)
+          if (mode === 'now' && STATE.runningLlmTask) {
+            return err(409, 'E_MODEL_BUSY', `有批量推理在跑（${STATE.running.kind} ${STATE.running.done}/${STATE.running.total}），不能直接热切`,
+              '用 mode:"drain" 等当前单元跑完，或 mode:"abort" 保存断点后终止并续推',
+              { running: STATE.running, activeModel: STATE.activeModel })
+          }
+          // 真探测：切到坏模型 → 502 + 回滚（绝不把系统留在"配了个坏模型"的状态）
+          if (BROKEN_MODELS.has(target.id) || !target.available) {
+            const from = STATE.activeModel
+            STATE.audit.push({ at: Date.now(), action: 'model_switch', from, to: target.id, result: 'probe_failed' })
+            return err(502, 'E_MODEL_PROBE', `新模型 ${target.id} 健康探测失败：${target.reason || 'HTTP 503'}`,
+              `已回滚到 ${from}（activeModel 未变）`,
+              { activeModel: from, rolledBack: true, probe: { model: target.id, ok: false } })
+          }
+          const from = STATE.activeModel
+          const checkpoint = { done: STATE.running.done, total: STATE.running.total, taskId: STATE.running.taskId }
+          if (mode === 'abort') {
+            STATE.runningLlmTask = false
+            STATE.running = { ...STATE.running, done: checkpoint.done, total: checkpoint.total }
+          } else if (mode === 'drain') {
+            STATE.runningLlmTask = false
+          }
+          STATE.activeModel = target.id
+          STATE.switchedFrom = from
+          STATE.switchedAt = Date.now()
+          STATE.audit.push({ at: Date.now(), action: 'model_switch', from, to: target.id, mode, result: 'ok' })
+          json({
+            ok: true, mode, from, to: target.id,
+            checkpoint,
+            resume: { state: mode === 'now' ? 'idle' : 'resuming', from_checkpoint: checkpoint.done, total: checkpoint.total },
+            probe: { model: target.id, ok: true, latencyMs: target.latencyMs, at: Date.now() },
+            activeModel: STATE.activeModel, switchedFrom: STATE.switchedFrom, switchedAt: STATE.switchedAt,
+          })
+        })
+      }
+
+      // ---------- 学生虚拟数据库沙箱（SETTINGS §3） ----------
+      if (api === '/sandbox/datasets') return json({ datasets: DATASETS.map(({ id, label, note, schema, seed }) => ({ id, label, note, tables: splitTables(schema), schema, seed })) })
+
+      if (api === '/sandbox/session' && req.method === 'POST') {
+        if (degraded) return err(503, 'E_SANDBOX_UNAVAILABLE', STATE.sandbox.engines[0].reason, '见 docs/LAB_DB_DEPLOY.md')
+        const chunks = []
+        req.on('data', (c) => chunks.push(c))
+        return req.on('end', () => {
+          let body = {}
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* ignore */ }
+          const ds = DATASETS.find((d) => d.id === body.dataset) || DATASET
+          const db = new SandboxDb(ds.schema, ds.seed)
+          STATE.db = db
+          STATE.dataset = ds.id
+          STATE.session = { sessionId: `sbx_${ds.id}_${Math.random().toString(36).slice(2, 8)}`, user: 'student01', engine: 'sqlite', dialect: 'SQLite 3.x' }
+          const tables = db.snapshot()
+          json({ ...STATE.session, dataset: ds.id, datasetLabel: ds.label, schema: ds.schema, seed: ds.seed, tables,
+            limits: STATE.sandbox.limits, dialectNotes: DIALECT_NOTES })
+        })
+      }
+
+      if (api === '/sandbox/execute' && req.method === 'POST') {
+        if (degraded) return err(503, 'E_SANDBOX_UNAVAILABLE', STATE.sandbox.engines[0].reason)
+        const chunks = []
+        req.on('data', (c) => chunks.push(c))
+        return req.on('end', () => {
+          let body = {}
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* ignore */ }
+          if (!STATE.db) return err(409, 'E_SANDBOX_NO_SESSION', '还没有沙箱会话：先 POST /sandbox/session')
+          const sql = String(body.sql || '')
+          try {
+            const r = STATE.db.execute(sql, { maxRows: STATE.sandbox.limits.maxRows })
+            STATE.lastSql.unshift({ sql, at: Date.now(), ok: true, rowCount: r.rowCount, elapsedMs: r.elapsedMs })
+            STATE.audit.push({ at: Date.now(), action: 'sandbox_execute', sql: sql.slice(0, 200), ok: true })
+            json({ ...r, sessionId: STATE.session.sessionId, engine: 'sqlite', dialect: 'SQLite 3.x',
+              limits: STATE.sandbox.limits, tables: STATE.db.snapshot() })
+          } catch (e) {
+            STATE.lastSql.unshift({ sql, at: Date.now(), ok: false, error: e.message })
+            STATE.audit.push({ at: Date.now(), action: 'sandbox_execute', sql: sql.slice(0, 200), ok: false, code: e.code })
+            // 执行失败用 200 + error 字段（前端要显示 SQL 报错，不是把它当网络错误）
+            json({ columns: [], rows: [], rowCount: 0, elapsedMs: 0, truncated: false,
+              maxRows: STATE.sandbox.limits.maxRows, error: { code: e.code || 'E_SANDBOX_SQL', msg: e.message },
+              sessionId: STATE.session.sessionId, engine: 'sqlite', dialect: 'SQLite 3.x', tables: STATE.db.snapshot() })
+          }
+        })
+      }
+
+      if (api === '/sandbox/reset' && req.method === 'POST') {
+        if (degraded) return err(503, 'E_SANDBOX_UNAVAILABLE', STATE.sandbox.engines[0].reason)
+        const ds = DATASETS.find((d) => d.id === STATE.dataset) || DATASET
+        STATE.db = new SandboxDb(ds.schema, ds.seed)
+        return json({ ok: true, dataset: ds.id, tables: STATE.db.snapshot(), resetPolicy: STATE.sandbox.resetPolicy })
+      }
+
+      // ---------- ★ AI 答疑（SETTINGS §3：先问后引 + 必须引用知识库卡片） ----------
+      if (api === '/sandbox/ask' && req.method === 'POST') {
+        const chunks = []
+        req.on('data', (c) => chunks.push(c))
+        return req.on('end', () => {
+          let body = {}
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* ignore */ }
+          const sql = String(body.sql || '')
+          const errMsg = String(body.error || '')
+          const question = String(body.question || '')
+          // 引用：把 SQL 里出现的标识符去知识库里捞（用 mock 的卡片名做真实检索）
+          const tokens = (sql.match(/[A-Za-z_][\w]{2,}/g) || []).map((s) => s.toLowerCase())
+          const cited = F.cards.filter((c) => tokens.some((t) => (c.name || '').toLowerCase().includes(t))).slice(0, 3)
+          const hits = cited.length ? cited : F.cards.slice(0, 2)
+          res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Transfer-Encoding': 'chunked' })
+          const send = (event, data) => {
+            const buf = Buffer.from(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`, 'utf8')
+            res.write(`${buf.length.toString(16)}\r\n`)
+            res.write(buf)
+            res.write('\r\n')
+          }
+          send('progress', { stage: '组装上下文', detail: { sql: sql.slice(0, 120), error: errMsg.slice(0, 120), schema: true, recent: STATE.lastSql.length, question } })
+          const answer = [
+            '先别急着要答案 —— 按"先问后引"来：\n',
+            errMsg
+              ? `① 你这句的报错是 \`${errMsg}\`。它属于**"对象不存在"**这一类（不是语法错），先确认表名/列名拼写。\n`
+              : '① 这句能跑通，但结果可能不是你要的：先确认 WHERE 的过滤条件对应的是哪一列。\n',
+            '② 再想一步：你要的是"哪些行？"还是"每组的汇总？"—— 后者要 GROUP BY，漏了它就会得到逐行的重复值。\n',
+            '③ 提示（不给完整答案）：`FROM` 后面的表名要和你 reset 出来的 schema 完全一致；查一列前先用 `PRAGMA table_info(表名)` 看看列名。\n',
+            `④ 依据：${hits.map((c) => `[[card:${c.id}]]`).join('')}`,
+          ].join('')
+          let i = 0
+          const step = () => {
+            if (i >= answer.length) {
+              send('citation', { citations: hits.map((c) => ({ card_id: c.id, name: c.name, unit_id: c.unit_id, href: `#/wiki?doc=doc_refman00001&unit=${c.unit_id}&card=${c.id}` })) })
+              send('done', { ok: true, cited: hits.length, hint_style: 'ask-then-cite' })
+              res.end('0\r\n\r\n')
+              return
+            }
+            send('text', { delta: answer.slice(i, i + 10) })
+            i += 10
+            setTimeout(step, 25)
+          }
+          step()
+        })
+      }
 
       // ---------- §5.2 documents ----------
       if (api === '/documents' && req.method === 'GET') {
@@ -459,6 +761,11 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         const taskId = m[1]
         const rest = m[2] || ''
         if (rest === '') {
+          if (taskId === 'tsk_rollup0001') {
+            // 设置页要显示 done/total（切换时也要拿它当断点）→ detail 必须给真实数字
+            return json({ id: taskId, kind: 'rollup', status: 'running', progress: 0.372, stage: '汇总单元引言',
+              detail: { kind: 'rollup', done: STATE.running.done, total: STATE.running.total, model: STATE.activeModel }, error: null })
+          }
           return json({ id: taskId, doc_id: DOC_VIDEO, kind: 'asr', status: 'running', progress: 0.42, stage: '转写音频', detail: {}, error: null })
         }
         if (rest === 'events') {
@@ -694,3 +1001,7 @@ if (isMain) {
   process.on('SIGINT', stop)
   setInterval(() => {}, 1 << 30)
 }
+
+
+
+

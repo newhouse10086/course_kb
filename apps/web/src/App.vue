@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * App 外壳：顶栏导航 + 能力横幅 + 路由出口 + 文档选择器
  *
@@ -18,12 +18,23 @@ const { caps, error: capsError, reload } = useCaps()
 const docsApi = useDocuments()
 const apiBase = ref('')
 
+/** 角色（RBAC §3）：只用来控制入口可见性；**权限判定永远在服务端** */
+const roles = ref<string[]>([])
+const perms = ref<string[]>([])
+const isStaff = computed(() =>
+  roles.value.includes('teacher') || roles.value.includes('admin')
+  || perms.value.includes('settings:write') || perms.value.includes('settings:read'))
+const roleLabel = computed(() => roles.value.join(', ') || '未上报')
+
 const navItems = computed(() => [
   { to: '/wiki', label: '知识库', enabled: true, reason: '' },
   { to: '/graph', label: '知识图谱', enabled: true, reason: '' },
   { to: '/video', label: '视频课堂', enabled: true, reason: '' },
   { to: '/chat', label: 'AI 助教', enabled: !!caps.value?.isAvailable('pi'), reason: caps.value?.reasonFor('pi') || '' },
+  { to: '/lab', label: 'SQL 练习台', enabled: true, reason: '' },
   { to: '/docs', label: '文档', enabled: true, reason: '' },
+  // 设置页只对教师/管理员开放（学生进去也只会看到"需要教师角色"的说明）
+  { to: '/settings', label: '模型设置', enabled: isStaff.value, reason: `需要教师/管理员角色（当前：${roleLabel.value}）` },
 ])
 
 const activeDoc = computed(() => String(route.query.doc || ''))
@@ -34,6 +45,13 @@ async function boot() {
     const m = await import('./api/client')
     apiBase.value = m.API_BASE
   } catch { /* ignore */ }
+  // 角色（读不到就如实视为"未上报"—— 不默认给教师权限）
+  try {
+    const m = await import('./api/client')
+    const meInfo = await m.api.me()
+    roles.value = meInfo.roles || []
+    perms.value = meInfo.permissions || []
+  } catch { /* 未登录 / 后端没这个接口 → 角色为空，设置入口不显示 */ }
   await docsApi.load()
   if (!activeDoc.value && docsApi.docs.value.length) {
     const first = docsApi.docs.value.find((d) => d.kind !== 'video' && d.status === 'ready') || docsApi.docs.value[0]

@@ -62,13 +62,13 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       const password = typeof body.password === 'string' ? body.password : '';
       const roles = Array.isArray(body.roles) ? body.roles.filter((r) => typeof r === 'string') : [];
       if (!/^[A-Za-z0-9._-]{3,32}$/.test(username)) {
-        throw new ApiError('E_FORMAT', '用户名需 3–32 位，只含字母/数字/._-');
+        throw new ApiError('E_BADREQUEST', '用户名需 3–32 位，只含字母/数字/._-');
       }
       const problem = passwordProblem(password);
-      if (problem) throw new ApiError('E_FORMAT', problem);
+      if (problem) throw new ApiError('E_BADREQUEST', problem);
       const bad = roles.filter((r) => !isRole(r));
-      if (bad.length > 0) throw new ApiError('E_FORMAT', `非法角色：${bad.join(',')}`, { detail: '允许 admin|teacher|student' });
-      if (roles.length === 0) throw new ApiError('E_FORMAT', '至少指定一个角色');
+      if (bad.length > 0) throw new ApiError('E_BADREQUEST', `非法角色：${bad.join(',')}`, { detail: '允许 admin|teacher|student' });
+      if (roles.length === 0) throw new ApiError('E_BADREQUEST', '至少指定一个角色');
       if (repo.rbac.getUserRowByName(username)) {
         throw new ApiError('E_CONFLICT', `用户名已存在：${username}`);
       }
@@ -96,8 +96,8 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       if (Array.isArray(body.roles)) {
         const roles = body.roles.filter((r) => typeof r === 'string');
         const bad = roles.filter((r) => !isRole(r));
-        if (bad.length > 0) throw new ApiError('E_FORMAT', `非法角色：${bad.join(',')}`);
-        if (roles.length === 0) throw new ApiError('E_FORMAT', '角色不能为空');
+        if (bad.length > 0) throw new ApiError('E_BADREQUEST', `非法角色：${bad.join(',')}`);
+        if (roles.length === 0) throw new ApiError('E_BADREQUEST', '角色不能为空');
         repo.rbac.setRoles(id, roles as string[]);
         repo.rbac.audit({ userId: req.user?.id ?? null, action: 'user_roles', target: id, detail: { roles } });
       }
@@ -108,7 +108,7 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       }
       if (typeof body.password === 'string' && body.password) {
         const problem = passwordProblem(body.password);
-        if (problem) throw new ApiError('E_FORMAT', problem);
+        if (problem) throw new ApiError('E_BADREQUEST', problem);
         repo.rbac.setPassword(id, await hashPassword(body.password));
         repo.rbac.deleteUserSessions(id);
         repo.rbac.audit({ userId: req.user?.id ?? null, action: 'user_password_reset', target: id });
@@ -149,7 +149,7 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       const user = requireUser(req);
       const body = (req.body ?? {}) as Record<string, unknown>;
       const name = typeof body.name === 'string' ? body.name.trim() : '';
-      if (!name) throw new ApiError('E_FORMAT', '缺少课程名 name');
+      if (!name) throw new ApiError('E_BADREQUEST', '缺少课程名 name');
       const id = repo.rbac.createCourse({
         name,
         term: typeof body.term === 'string' ? body.term : '',
@@ -184,7 +184,7 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       const username = typeof body.username === 'string' ? body.username.trim() : '';
       const role = typeof body.role === 'string' ? body.role : '';
       if (role !== 'teacher' && role !== 'student') {
-        throw new ApiError('E_FORMAT', 'role 必须是 teacher 或 student');
+        throw new ApiError('E_BADREQUEST', 'role 必须是 teacher 或 student');
       }
       const target = repo.rbac.getUserRowByName(username);
       if (!target) throw notFound('用户', username);
@@ -237,7 +237,7 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       ensure(req, 'note', { kind: 'note', ownerId: user.id }, deps);
       const body = (req.body ?? {}) as Record<string, unknown>;
       const text = typeof body.body === 'string' ? body.body.trim() : '';
-      if (!text) throw new ApiError('E_FORMAT', '笔记内容 body 不能为空');
+      if (!text) throw new ApiError('E_BADREQUEST', '笔记内容 body 不能为空');
       const id = repo.rbac.createNote(user.id, {
         body: text,
         ...(strParam(body.card_id) ? { cardId: strParam(body.card_id) as string } : {}),

@@ -151,7 +151,8 @@ test('queue：成功路径 —— 任务 done、progress=1、detail=返回值、
     assert.equal(task?.finished_at !== null, true, '完成必须写 finished_at');
     assert.equal(closed, true, '任务结束必须关流（契约 §6）');
     assert.deepEqual(frames.map((f) => f.event), ['progress', 'progress', 'log', 'progress', 'done']);
-    assert.deepEqual(frames[0]?.data, { task_id: taskId, progress: 0, stage: '排队中', kind: 'ok' });
+    // 首帧带 `priority`（RBAC §5：调度优先级对前端可见，便于解释"为什么我的排在后面"）
+    assert.deepEqual(frames[0]?.data, { task_id: taskId, progress: 0, stage: '排队中', kind: 'ok', priority: 0 });
     assert.deepEqual(frames[1]?.data, { task_id: taskId, progress: 0.5, stage: '半程', done: 1, total: 2 });
     assert.deepEqual(frames[2]?.data, { task_id: taskId, level: 'info', msg: '一条日志' });
     assert.equal(frames[4]?.data.status, 'done');

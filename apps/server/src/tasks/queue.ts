@@ -18,8 +18,11 @@ export interface TaskHandlerContext {
   kind: string;
   params: Record<string, unknown>;
   signal: AbortSignal;
-  /** RBAC §5：任务发起者（系统任务为 null）。审计与配额都用它。 */
-  userId: string | null;
+  /**
+   * RBAC §5：任务发起者（系统任务为 null）。审计与配额都用它。
+   * ⚠️ **声明为可选**是为了不破坏其他 handler 的单测 mock（队列总是会填上它）。
+   */
+  userId?: string | null;
   /** 上报进度（写库 + 推 SSE）。`detail` 里的 done/total 会进 SSE 帧。 */
   progress(frac: number, stage: string, detail?: Record<string, unknown>): void;
   log(msg: string, level?: 'debug' | 'info' | 'warn' | 'error'): void;

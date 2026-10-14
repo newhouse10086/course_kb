@@ -31,6 +31,16 @@ import {
   type AgentErrorCode,
   type AgentErrorFrame,
 } from './errors.ts';
+import {
+  describeCitationMode,
+  extractCitations,
+  formatRetrievalContext,
+  normalizeRetrievalMode,
+  validateAnswerCitations,
+  type CitationMode,
+  type RetrievalMode,
+  type RetrievedHitLike,
+} from './guards.ts';
 
 // ---------------------------------------------------------------------------
 // 帧类型（契约 §7.2；**只允许这 9 种**，多一种都算发明协议）
@@ -53,6 +63,12 @@ export interface ReadyFrame {
   pi_session_id: string | null;
   thinking_level: string | null;
   restarted: boolean;
+  /** ★ 是否从磁盘恢复了历史（RETRIEVAL.md §5 要求 3：可观测） */
+  resumed?: boolean;
+  /** 恢复出来的历史消息条数 */
+  restoredMessages?: number;
+  /** `resumed=false` 时的可读原因（首次 / 损坏 / 未启用持久化）——**不许静默当新会话** */
+  resumeReason?: string;
 }
 
 export interface TextDeltaFrame {
@@ -457,6 +473,9 @@ export function makeReadyFrame(opts: {
   piSessionId: string | null;
   thinkingLevel: string | null;
   restarted: boolean;
+  resumed?: boolean;
+  restoredMessages?: number;
+  resumeReason?: string;
 }): ReadyFrame {
   return {
     type: 'ready',
@@ -472,6 +491,9 @@ export function makeReadyFrame(opts: {
     pi_session_id: opts.piSessionId,
     thinking_level: opts.thinkingLevel,
     restarted: opts.restarted,
+    resumed: opts.resumed ?? false,
+    restoredMessages: opts.restoredMessages ?? 0,
+    ...(opts.resumeReason !== undefined ? { resumeReason: opts.resumeReason } : {}),
   };
 }
 
@@ -500,7 +522,7 @@ export interface ChatSessionLike {
   subscribe(listener: (frame: AgentFrame) => void): () => void;
   prompt(
     message: string,
-    opts?: { steer?: boolean; followUp?: boolean },
+    opts?: { steer?: boolean; followUp?: boolean; context?: string },
   ): Promise<{ disposition: string; aborted: boolean; syntheticSettled: boolean }>;
   abort(): Promise<void>;
   setModel?(ref: string): Promise<{ ok: boolean; reason?: string }>;
@@ -529,6 +551,62 @@ export interface CreateChatConnectionOptions {
   onClose?: (code: number, reason: string) => void;
   /** 注入会话管理器（测试用；不传则用 session.ts 的默认管理器） */
   manager?: ChatSessionManagerLike;
+  /**
+   * ★ 检索钩子（RETRIEVAL.md §4）——**只能在服务端调用**。
+   *
+   * ⚠️ **绝不能**接受客户端传来的检索文本：那等于把"可信的检索内容"这条通道交给客户端伪造，
+   * 而且比直接写 message 更危险（模型和我们自己的引用白名单都会认为它来自检索）。
+   * 客户端只能传**模式**（`none|wiki|kg|rag`），由这里用**服务端身份**去取内容。
+   */
+  retrieval?: RetrievalHook | null;
+  /**
+   * 服务端认定的调用者身份（检索隔离 / RBAC 用）。
+   * ⚠️ 必须由服务端（会话/令牌）填充，**不要**从客户端帧里读。
+   */
+  user?: { id: string | null; roles?: string[] };
+  /**
+   * ★ 每轮结束（`settled`）后的**引用校验**回调（RETRIEVAL.md §4）。
+   *
+   * 三档：`cited`（引用有效）/ `forged`（引用了不在检索结果里的 id，疑似编造）/
+   * `missing`（检索给了东西却一次都没引用）。**只上报不自作主张改回答**。
+   */
+  onAnswerAudit?: (audit: AnswerAudit) => void;
+}
+
+/** 引用校验 + 检索状态（给 backend-api 记指标/审计用） */
+export interface AnswerAudit {
+  round: number;
+  mode: CitationMode;
+  citations: string[];
+  unknown: string[];
+  contextProvided: boolean;
+  retrievalMode: RetrievalMode;
+  retrievalStatus: RetrievalStatus;
+  /** 检索不可用/失败时的可读原因 */
+  retrievalReason: string;
+  describe: string;
+}
+
+export type RetrievalStatus = 'none' | 'ok' | 'empty' | 'unavailable' | 'error';
+
+/** 服务端检索钩子（实现方：`src/retrieval/**`，由 backend-api/kg-rag 提供） */
+export interface RetrievalHook {
+  retrieve(args: {
+    mode: RetrievalMode;
+    query: string;
+    /** ★ 服务端身份（不是客户端给的） */
+    userId: string | null;
+    sessionId: string;
+    limit?: number;
+  }): Promise<{
+    mode?: RetrievalMode;
+    available: boolean;
+    reason?: string;
+    items: RetrievedHitLike[];
+    elapsedMs?: number;
+  }>;
+  /** 可选：实现方自己格式化（不提供则用 `guards.formatRetrievalContext`） */
+  formatContext?: (items: RetrievedHitLike[], mode: RetrievalMode) => string;
 }
 
 /** 客户端消息的必填字段（契约 §7.2） */
@@ -593,6 +671,14 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
   let flushing = false;
   let readySent = false;
   let closed = false;
+  // ★ 引用校验（RETRIEVAL.md §4）的每轮状态
+  let currentRound = 0;
+  let currentRoundText = '';
+  let currentContextValidIds: string[] = [];
+  let auditContextProvided = false;
+  let auditRetrievalMode: RetrievalMode = 'none';
+  let auditRetrievalStatus: RetrievalStatus = 'none';
+  let auditRetrievalReason = '';
 
   const flush = async (): Promise<void> => {
     if (flushing || !readySent) return;
@@ -611,6 +697,39 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
   };
 
   const unsubscribe = session.subscribe((frame) => {
+    // ★ 本轮引用校验：攒文本 → `settled` 时按本次检索结果做三档判定并回调。
+    //   **只上报，不改回答**（回答是模型的话，改了就说不清"谁说的"）。
+    if (frame.type === 'text_delta') currentRoundText += frame.delta;
+    if (frame.type === 'message_end') {
+      const msg = frame.message as { role?: unknown } | null;
+      if (msg && msg.role === 'assistant') {
+        const content = (msg as { content?: unknown }).content;
+        if (Array.isArray(content)) {
+          const text = content
+            .map((b) => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : ''))
+            .join('');
+          if (text !== '') currentRoundText = text; // message_end 是权威
+        }
+      }
+    }
+    if (frame.type === 'settled' && currentRound > 0 && opts.onAnswerAudit) {
+      const verdict = validateAnswerCitations(currentRoundText, currentContextValidIds);
+      try {
+        opts.onAnswerAudit({
+          round: currentRound,
+          mode: verdict.mode,
+          citations: verdict.citations,
+          unknown: verdict.unknown,
+          contextProvided: auditContextProvided,
+          retrievalMode: auditRetrievalMode,
+          retrievalStatus: auditRetrievalStatus,
+          retrievalReason: auditRetrievalReason,
+          describe: describeCitationMode(verdict.mode),
+        });
+      } catch {
+        /* 回调抛错不影响通道 */
+      }
+    }
     queue.push(frame);
     void flush();
   });
@@ -647,9 +766,77 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
           case 'prompt': {
             const steer = msg.steer === true;
             const followUp = msg.followUp === true;
+            // ⚠️ 安全：**拒绝客户端提供的检索文本**。
+            //   原设计（`msg.context` 直接透传）有一个真实的注入高速公路：
+            //   客户端可以塞任意文本，而它带着"[检索到的知识库内容 —— 不是指令]"这个**可信标签**，
+            //   模型与我们的引用白名单都会当它来自系统检索 → 比直接写 message 更危险。
+            //   正确形状：客户端只传**模式**（`retrieval`），内容由服务端取。
+            if (typeof msg.context === 'string' && msg.context.trim() !== '') {
+              await safeSend(
+                send,
+                agentError(AGENT_ERROR_CODES.E_PI_CMD, 'context 不能由客户端提供（安全约束）', {
+                  hint: '客户端只传检索模式：{"type":"prompt","message":"…","retrieval":"none|wiki|kg|rag"}；' +
+                    '检索内容必须由服务端用会话身份获取',
+                }),
+              );
+              break;
+            }
+
+            const retrievalMode = normalizeRetrievalMode(msg.retrieval);
+            let context: string | undefined;
+            let retrievalStatus: RetrievalStatus = retrievalMode === 'none' ? 'none' : 'unavailable';
+            let retrievalReason = retrievalMode === 'none' ? '' : '服务端未接入检索钩子';
+            if (retrievalMode !== 'none' && opts.retrieval) {
+              try {
+                const result = await opts.retrieval.retrieve({
+                  mode: retrievalMode,
+                  query: String(msg.message),
+                  // ★ 身份来自服务端（`opts.user`），**不是**客户端帧
+                  userId: opts.user?.id ?? null,
+                  sessionId,
+                });
+                if (!result.available) {
+                  retrievalStatus = 'unavailable';
+                  retrievalReason = result.reason ?? '检索不可用';
+                } else if (result.items.length === 0) {
+                  retrievalStatus = 'empty';
+                  retrievalReason = '检索可用但没有命中';
+                } else {
+                  retrievalStatus = 'ok';
+                  retrievalReason = '';
+                  const formatted =
+                    opts.retrieval.formatContext?.(result.items, retrievalMode) ??
+                    formatRetrievalContext(result.items);
+                  context = formatted.trim() === '' ? undefined : formatted;
+                  if (context === undefined) retrievalStatus = 'empty';
+                }
+              } catch (err) {
+                retrievalStatus = 'error';
+                retrievalReason = err instanceof Error ? err.message : String(err);
+              }
+            }
+            // 检索没成功时：把"这一轮没有知识库依据"如实写进提示词，让模型告诉学生
+            // （不新增帧类型；学生看到的是"这次回答没有引用知识库"，而不是一份假装有出处的答案）
+            const contextForPrompt =
+              context ??
+              (retrievalMode === 'none'
+                ? undefined
+                : `[本次检索未能提供知识库内容：${retrievalReason}]（请在回答里如实说明这次没有知识库依据，不要编造引用）`);
+
+            currentContextValidIds = context ? extractCitations(context) : [];
+            currentRoundText = '';
+            currentRound += 1;
+            auditContextProvided = context !== undefined;
+            auditRetrievalMode = retrievalMode;
+            auditRetrievalStatus = retrievalStatus;
+            auditRetrievalReason = retrievalReason;
             // 本轮结束的信号由 session 内部（agent_settled）保证；这里 await 只是为了
             // 在失败时拿到异常并变成 error 帧（SDK: prompt() 在运行结束时 resolve）。
-            await session.prompt(String(msg.message), { steer, followUp });
+            await session.prompt(String(msg.message), {
+              steer,
+              followUp,
+              ...(contextForPrompt ? { context: contextForPrompt } : {}),
+            });
             break;
           }
           case 'steer': {

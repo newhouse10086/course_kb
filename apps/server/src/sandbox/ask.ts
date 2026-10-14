@@ -39,6 +39,8 @@
  * 两次 ask 不会同时占用模型。可用 `deps.gate` 换成 providers 的 `LLM_QUEUE`。
  */
 
+import { join } from 'node:path';
+
 import {
   AGENT_ERROR_CODES,
   HINT_SDK_OK,
@@ -46,11 +48,31 @@ import {
   scrubSecrets,
 } from '../agent/errors.ts';
 import {
+  CITATION_MODES,
+  auditCitations,
+  extractCitations,
+  redactSensitive,
+  sanitizeUntrusted,
+  validateAnswerCitations,
+  type CitationMode,
+} from '../agent/guards.ts';
+import {
   formatSse,
+  sanitizeOutgoingFrame,
   type AgentFrame,
   type ChatSessionManagerLike,
   type ChatSessionLike,
 } from '../agent/stream.ts';
+
+// 这些原语已移到 `agent/guards.ts`（chat 与 ask 共用**单一实现**）；
+// 这里 **re-export** 保持既有调用方（含测试）的 import 路径不变。
+export {
+  auditCitations,
+  extractCitations,
+  redactSensitive,
+  sanitizeUntrusted,
+  type SanitizedText,
+} from '../agent/guards.ts';
 
 // ===========================================================================
 // 消费侧接口（生产方：backend-core 的 `worker/sandbox/`；字段照 `LAB_DB_DEPLOY.md` §8.2/§8.4 抄）
@@ -59,10 +81,19 @@ import {
 /** 沙箱当前库结构（让模型知道"没有这张表"是为什么） */
 export interface SandboxSchemaInfo {
   dialect: string; // 'sqlite' | 'mysql' | 'postgres' | 'opengauss'
+  /** 引擎（backend-core 的 `sandbox.schema` 会带，用于在回答里标注"当前跑在 SQLite 上"） */
+  engine?: string;
   tables: {
     name: string;
+    /** 行数（可用于"他没插进去"这类判断） */
+    rows?: number;
     columns: { name: string; type: string; pk?: boolean; notnull?: boolean; fk?: string }[];
   }[];
+  /**
+   * backend-core 已压好的提示词摘要（多表自动截断并注明）。
+   * **有就优先用**（他们的实现里含行数等细节，且与他们的 hint 文案同源）。
+   */
+  text?: string;
 }
 
 /** 该会话最近执行记录（来自 audit_log，**只含本人**） */
@@ -73,6 +104,8 @@ export interface ExecutionRecord {
   error?: string;
   rowCount?: number;
   elapsedMs?: number;
+  /** 语句类型（SELECT/INSERT/…；backend-core 额外给的） */
+  kind?: string;
 }
 
 /** 知识库检索命中（`/search` 的 hits） */
@@ -217,8 +250,10 @@ export interface AskOutcome {
   ok: boolean;
   /** 完整回答文本（拼接流式 delta；含系统补的说明） */
   text: string;
-  /** 引用到的卡片 id（按出现顺序去重） */
+  /** 引用到的卡片 id（按出现顺序去重；含系统补的检索卡片） */
   citations: string[];
+  /** ★ 三档引用校验：真实引用 / 伪造引用 / 完全没引用（与 chat 共用同一实现） */
+  citationMode: CitationMode;
   /** 模型引用了**检索结果之外**的卡片 id（可能是编的） */
   unknownCitations: string[];
   /** 完全没引用知识库 */
@@ -233,6 +268,8 @@ export interface AskOutcome {
   logAccess: LogAccess;
   contextWarnings: string[];
   injectionSignals: string[];
+  /** 出口拦截掉的帧数（疑似系统提示词泄漏）；>0 说明确实有东西想下发给浏览器，已挡下 */
+  leakedFramesBlocked: number;
   errorFrame: AgentFrame | null;
   elapsedMs: number;
   /** 系统补发的内容（便于前端区分"模型说的" vs "系统加的"） */
@@ -253,74 +290,6 @@ export const DELIM = {
   schema: ['<<<SANDBOX_SCHEMA>>>', '<<<END_SANDBOX_SCHEMA>>>'],
   knowledge: ['<<<KNOWLEDGE_HITS>>>', '<<<END_KNOWLEDGE_HITS>>>'],
 } as const;
-
-/** 注入信号（命中即记录；**不阻断**，因为很多只是学生正常表述） */
-const INJECTION_PATTERNS: { id: string; re: RegExp }[] = [
-  { id: 'ignore_previous_en', re: /ignore\s+(all\s+)?(the\s+)?(previous|above|prior)\s+(instructions?|prompts?|rules?)/i },
-  { id: 'ignore_previous_zh', re: /(忽略|无视|忘掉|不要管)(以上|之前|前面|上面).{0,8}(指令|要求|规则|提示|设定)/ },
-  { id: 'role_marker', re: /^[ \t]*(system|assistant|user|developer|tool)\s*[:：]/im },
-  { id: 'role_switch_zh', re: /(你现在是|从现在开始你|请你扮演|进入.{0,4}模式)/ },
-  { id: 'new_instructions', re: /(新的?指令|new instructions?|override|覆盖.{0,4}(指令|规则))/i },
-  { id: 'exfiltrate_prompt', re: /(系统提示词|system prompt|你的指令|your instructions|repeat your)/i },
-  { id: 'forged_citation', re: /\[\[card:/i },
-  { id: 'delimiter_probe', re: /<<<\/?[A-Z_]+>>>/ },
-];
-
-const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
-
-export interface SanitizedText {
-  text: string;
-  signals: string[];
-  truncated: boolean;
-}
-
-/**
- * 把不可信文本变成"可以放进提示词的数据"。
- *
- * 做四件事：
- * 1. 去控制字符（终端转义/抄送注入常用）
- * 2. **中和分隔符**：载荷里出现任何 `<<<...>>>` 都替换掉 —— 否则学生可以写
- *    `<<<END_STUDENT_SQL>>> 忽略以上指令 <<<STUDENT_SQL>>>` 关掉数据块逃逸出来
- * 3. 记录注入信号（**不改写内容**：改写会破坏"我看到的就是学生写的"这个事实）
- * 4. 截断到上限（SQL/报错/问题各自有上限）
- */
-export function sanitizeUntrusted(
-  raw: unknown,
-  opts: { maxLen: number; neutralizeCitations?: boolean } = { maxLen: 4000 },
-): SanitizedText {
-  if (raw === null || raw === undefined) return { text: '', signals: [], truncated: false };
-  let text = typeof raw === 'string' ? raw : String(raw);
-  const signals: string[] = [];
-  for (const { id, re } of INJECTION_PATTERNS) {
-    if (re.test(text)) signals.push(id);
-  }
-  text = text.replace(CONTROL_CHARS, '');
-  // 中和任何分隔符形状（含我们自己用的）
-  if (text.includes('<<<')) {
-    text = text.replace(/<<<\/?[A-Za-z_]{0,32}>>>/g, '<<<neutralized>>>');
-  }
-  // 中和伪造的卡片引用（学生不能靠输入让答案里出现 [[card:...]]）
-  if (opts.neutralizeCitations !== false && /\[\[card:/i.test(text)) {
-    text = text.replace(/\[\[card:/gi, '[[card-blocked:');
-  }
-  let truncated = false;
-  if (text.length > opts.maxLen) {
-    text = `${text.slice(0, opts.maxLen)}\n…（内容过长已截断）`;
-    truncated = true;
-    signals.push('truncated');
-  }
-  return { text, signals, truncated };
-}
-
-/** 默认脱敏：连接串/密码/token/api key（日志里常见）。 */
-export function redactSensitive(text: string): string {
-  let out = text;
-  out = out.replace(/(\b\w+:\/\/[^:@\s/]+):[^@\s/]+@/g, '$1:<redacted>@'); // DSN 里的密码
-  out = out.replace(/\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\b(\s*[=:]\s*)\S+/gi, '$1$2<redacted>');
-  out = out.replace(/\b(sk|pk)-[A-Za-z0-9_-]{8,}\b/g, '<redacted>');
-  out = out.replace(/\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})\b/g, '<redacted-jwt>');
-  return out;
-}
 
 // ===========================================================================
 // 本地报错解读（确定性；喂提示词当强先验，模型不可用时也能给人看）
@@ -403,13 +372,16 @@ export function applyBudget(
 }
 
 function formatSchema(schema: SandboxSchemaInfo | null): string {
-  if (!schema || !Array.isArray(schema.tables) || schema.tables.length === 0) return '';
+  if (!schema) return '';
+  // backend-core 的 `sandbox.schema` 会直接给压好的摘要（含行数、已截断标注）→ 优先用它
+  if (typeof schema.text === 'string' && schema.text.trim() !== '') return schema.text.trim();
+  if (!Array.isArray(schema.tables) || schema.tables.length === 0) return '';
   const lines = [`方言：${schema.dialect}（注意与 MySQL 的语法差异）`];
   for (const table of schema.tables) {
     const cols = table.columns
       .map((c) => `${c.name} ${c.type}${c.pk ? ' PK' : ''}${c.notnull ? ' NOT NULL' : ''}${c.fk ? ` -> ${c.fk}` : ''}`)
       .join(', ');
-    lines.push(`${table.name}(${cols})`);
+    lines.push(`${table.name}(${cols})${table.rows !== undefined ? ` — ${table.rows} 行` : ''}`);
   }
   return lines.join('\n');
 }
@@ -421,6 +393,10 @@ function formatLogs(entries: DbLogEntry[], redact: (s: string) => string): strin
       if (e.code) parts.push(`code=${e.code}`);
       parts.push(redact(e.message));
       if (e.hint) parts.push(`hint=${redact(e.hint)}`);
+      // backend-core 在 context.localReading 里给了**确定性中文解读**（18 类 SQLite 报错）——
+      // 这是"看懂报错"最有用的一行，别丢。
+      const localReading = e.context?.localReading;
+      if (typeof localReading === 'string' && localReading !== '') parts.push(`本地解读=${redact(localReading)}`);
       if (e.sql) parts.push(`sql=${e.sql}`);
       return parts.join(' ');
     })
@@ -455,6 +431,19 @@ export function filterLogsForSession(
     kept.push(entry);
   }
   return { kept, crossSessionDropped, unverifiableL3Dropped };
+}
+
+/**
+ * 消费侧**层级策略**自查：L2 只在报错疑似超时/锁冲突时才允许进提示词。
+ *
+ * ⚠️ 为什么消费侧还要再查一遍：`fetch({layers})` 是"请求"而不是"保证"。
+ * 上游若因实现/版本差异多返回了 L2，我们不查就会把慢查询/锁等待塞进**每一次**答疑的上下文
+ * —— 既偏离 §8.4 的优先级策略，也白吃上下文预算。
+ * （原实现只依赖上游遵守 `layers`，被单测用一个"不守规矩的假日志源"抓出。）
+ */
+export function enforceLayerPolicy(entries: DbLogEntry[], wantL2: boolean): DbLogEntry[] {
+  if (wantL2) return entries;
+  return entries.filter((e) => e?.source !== 'L2');
 }
 
 /**
@@ -531,9 +520,11 @@ export async function assembleAskContext(req: AskRequest, deps: AskDeps = {}): P
       const san = sanitizeUntrusted(r.sql, { maxLen: 500 });
       injectionSignals.push(...san.signals);
       const when = r.at ? new Date(r.at).toISOString() : `#${i + 1}`;
-      return `[${when}] ${r.ok ? 'OK' : '失败'}${r.rowCount !== undefined ? ` rows=${r.rowCount}` : ''}${
-        r.elapsedMs !== undefined ? ` ${r.elapsedMs}ms` : ''
-      }${r.error ? ` error=${sanitizeUntrusted(r.error, { maxLen: 200 }).text}` : ''}\n  SQL: ${san.text}`;
+      return `[${when}] ${r.kind ? `${r.kind} ` : ''}${r.ok ? 'OK' : '失败'}${
+        r.rowCount !== undefined ? ` rows=${r.rowCount}` : ''
+      }${r.elapsedMs !== undefined ? ` ${r.elapsedMs}ms` : ''}${
+        r.error ? ` error=${sanitizeUntrusted(r.error, { maxLen: 200 }).text}` : ''
+      }\n  SQL: ${san.text}`;
     });
     sections.push({
       id: 'recent_sql',
@@ -615,11 +606,15 @@ export async function assembleAskContext(req: AskRequest, deps: AskDeps = {}): P
           limit: 200,
           layers: wantedLayers,
         })) ?? [];
-        const filtered = filterLogsForSession(fetched, req.sessionId, {
-          ...(deps.requireVerifiableL3Owner !== undefined
-            ? { requireVerifiableL3Owner: deps.requireVerifiableL3Owner }
-            : {}),
-        });
+        const filtered = filterLogsForSession(
+          enforceLayerPolicy(fetched, wantL2), // ★ 消费侧再查一次层级策略
+          req.sessionId,
+          {
+            ...(deps.requireVerifiableL3Owner !== undefined
+              ? { requireVerifiableL3Owner: deps.requireVerifiableL3Owner }
+              : {}),
+          },
+        );
         logs = filtered.kept;
         logAccess.crossSessionDropped = filtered.crossSessionDropped;
         logAccess.unverifiableL3Dropped = filtered.unverifiableL3Dropped;
@@ -838,27 +833,6 @@ function buildUserMessage(input: {
 // 输出侧守卫（观测 + 兜底）
 // ===========================================================================
 
-/** 抽取回答里的卡片引用（按出现顺序去重）。 */
-export function extractCitations(text: string): string[] {
-  const out: string[] = [];
-  const re = /\[\[card:([A-Za-z0-9._-]+)\]\]/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    if (m[1] && !out.includes(m[1])) out.push(m[1]);
-  }
-  return out;
-}
-
-/** 引用审计：哪些不在检索结果里（可能是编的）。 */
-export function auditCitations(
-  text: string,
-  validIds: Iterable<string>,
-): { citations: string[]; unknown: string[] } {
-  const valid = new Set(validIds);
-  const citations = extractCitations(text);
-  return { citations, unknown: citations.filter((id) => !valid.has(id)) };
-}
-
 /** 教学守卫：是否疑似直接给了答案（**只观测**，不改写模型输出）。 */
 export function detectDirectAnswer(
   answer: string,
@@ -960,14 +934,16 @@ export function askSessionKey(sessionId: string, prefix = 'ask-'): string {
 
 let askManager: ChatSessionManagerLike | null = null;
 
-/** 答疑专用会话管理器：助教系统提示词 + **无工具** + **不落盘** + 不读项目 AGENTS.md。 */
+/** 答疑专用会话管理器：助教系统提示词 + **无工具** + **落盘可恢复** + 不读项目 AGENTS.md。 */
 async function getAskManager(): Promise<ChatSessionManagerLike> {
   if (askManager) return askManager;
   const mod = await import('../agent/session.ts');
   const manager = new mod.AgentSessionManager({
     systemPrompt: ASK_SYSTEM_PROMPT,
     tools: [], // 教学答疑不需要任何文件/命令工具（安全 + 快）
-    sessionDir: null, // 学生的提问不落盘（隐私）
+    // ★ RETRIEVAL.md §5 + lead 点名的 resume 缺口修复：答疑上下文必须能**跨进程重启恢复**。
+    //   放在 data/chat/ask 子目录，便于运维单独清理（学生提问会落盘，这是换来"重启不丢上下文"的权衡）。
+    sessionDir: join(process.env.COURSE_KB_ROOT ?? process.cwd(), 'data', 'chat', 'ask'),
     noContextFiles: true, // 不把项目 AGENTS.md 塞进系统提示词
     onDiagnostic: () => {
       /* 由 deps.onDiagnostic 在 handler 层转发；这里静默避免噪音 */
@@ -1026,6 +1002,7 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
         ok: false,
         text: '',
         citations: [],
+        citationMode: CITATION_MODES.missing,
         unknownCitations: [],
         missingCitation: false,
         directAnswerSuspected: false,
@@ -1043,6 +1020,7 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
         },
         contextWarnings: [],
         injectionSignals: [],
+        leakedFramesBlocked: 0,
         errorFrame: null,
         elapsedMs: now() - started,
         systemAppended: [],
@@ -1104,6 +1082,27 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
       let answerText = '';
       let deferredSettled: AgentFrame | null = null;
       let errorFrame: AgentFrame | null = null;
+      let leakedFramesBlocked = 0;
+      /**
+       * 出口统一走 `sanitizeOutgoingFrame`（agent 层已测的 3 层防泄漏）。
+       *
+       * ⚠️ 为什么不信任上游：`ask` 是**教学**界面，一旦把 pi 的系统提示词
+       * （实测 9642 字符，含本项目 AGENTS.md 全文）推给学生，观感与安全都很糟。
+       * 上游 `ManagedAgentSession` 已经过滤了一次，这里**再过滤一次**（纵深防御，
+       * 也让本模块在被注入别的 `manager` 实现时仍然安全）。
+       */
+      const forward = async (frame: AgentFrame): Promise<void> => {
+        const safe = sanitizeOutgoingFrame(frame);
+        if (safe === null) {
+          // ⚠️ 不写进 contextWarnings：那是"上下文缺哪块"的清单，
+          // 出口拦截是**输出侧**的安全事件，混在一起会让调用方误读（有测试盯这个语义）
+          leakedFramesBlocked += 1;
+          deps.onDiagnostic?.('ask: 出口拦截了一帧（疑似系统提示词泄漏，已丢弃）');
+          return;
+        }
+        await safeSink(sink, safe);
+      };
+
       const unsubscribe = session.subscribe((frame) => {
         if (frame.type === 'settled') {
           deferredSettled = frame; // 延后：后面可能还要补系统说明
@@ -1118,7 +1117,7 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
           }
         }
         if (frame.type === 'error' && errorFrame === null) errorFrame = frame;
-        void safeSink(sink, frame);
+        void forward(frame);
       });
 
       let promptError: unknown = null;
@@ -1134,7 +1133,11 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
       const validIds = ctx.sections
         .filter((s) => s.id === 'knowledge')
         .flatMap((s) => extractCitations(s.text));
-      const { citations, unknown } = auditCitations(answerText, validIds);
+      const { citations, unknown, mode: citationMode } = validateAnswerCitations(answerText, validIds);
+      // ⚠️ 必须**在系统补引用之前**记住"模型自己引了几张卡片"：
+      //    原写法在补发之后用 `citations.length === 0` 判定 → 我们补过之后永远为 false，
+      //    `missingCitation` 就再也报不出"模型没引用知识库"这个事实（被单测抓出）。
+      const modelCitedCount = citations.length;
       const direct = detectDirectAnswer(answerText, req.sql);
       const logUnavailable = ctx.logAccess.status === 'unavailable';
       const disclaimerPresent = mentionsLogUnavailable(answerText);
@@ -1147,7 +1150,7 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
         answerText += note;
         systemAppended.push(note);
         logDisclaimerAppended = true;
-        await safeSink(sink, { type: 'text_delta', delta: note });
+        await forward({ type: 'text_delta', delta: note });
       }
       if (citations.length === 0 && validIds.length > 0) {
         const note = `\n\n> 知识库检索到的相关卡片（由系统附上，非模型生成）：${validIds
@@ -1157,7 +1160,7 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
         answerText += note;
         systemAppended.push(note);
         citations.push(...validIds.slice(0, 5));
-        await safeSink(sink, { type: 'text_delta', delta: note });
+        await forward({ type: 'text_delta', delta: note });
       }
       if (promptError && errorFrame === null) {
         // 会话层理论上已发 error 帧；万一没有，补一帧，别让用户面对空白
@@ -1169,10 +1172,10 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
           hint: classified.hint,
           detail: classified.detail,
         };
-        await safeSink(sink, errorFrame);
+        await forward(errorFrame);
       }
-      if (deferredSettled) await safeSink(sink, deferredSettled);
-      else await safeSink(sink, { type: 'settled', aborted: false, synthetic: true, disposition: 'unknown' });
+      if (deferredSettled) await forward(deferredSettled);
+      else await forward({ type: 'settled', aborted: false, synthetic: true, disposition: 'unknown' });
       unsubscribe();
 
       const ok = promptError === null && errorFrame === null;
@@ -1180,8 +1183,9 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
         ok,
         text: answerText,
         citations,
+        citationMode,
         unknownCitations: unknown,
-        missingCitation: citations.length === 0,
+        missingCitation: modelCitedCount === 0,
         directAnswerSuspected: direct.suspected,
         directAnswerReasons: direct.reasons,
         logDisclaimerPresent: disclaimerPresent,
@@ -1189,6 +1193,7 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
         logAccess: ctx.logAccess,
         contextWarnings: ctx.contextWarnings,
         injectionSignals: ctx.injectionSignals,
+        leakedFramesBlocked,
         errorFrame,
         elapsedMs: now() - started,
         systemAppended,

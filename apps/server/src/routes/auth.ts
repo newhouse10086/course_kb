@@ -50,7 +50,7 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
     const ip = req.ip ?? 'unknown';
 
     if (!username || !password) {
-      throw new ApiError('E_NOFILE', '缺少 username 或 password', {
+      throw new ApiError('E_BADREQUEST', '缺少 username 或 password', {
         detail: 'body 形如 {"username":"teacher1","password":"..."}',
       });
     }
@@ -153,7 +153,7 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
       throw new ApiError('E_UNAUTHENTICATED', '当前口令不正确');
     }
     const problem = passwordProblem(next);
-    if (problem) throw new ApiError('E_FORMAT', problem, { hint: '换一个更长的口令' });
+    if (problem) throw new ApiError('E_BADREQUEST', problem, { hint: '换一个更长的口令' });
 
     repo.rbac.setPassword(user.id, await hashPassword(next));
     // 改口令 → **失效所有旧会话**（含本会话），再发一个新会话；这是安全默认

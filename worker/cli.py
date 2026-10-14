@@ -734,6 +734,217 @@ def _filter_nodes_by_title(
     return kept, unique_titles, dropped
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 学生 SQL 沙箱（docs/SETTINGS_AND_SANDBOX.md §3 + docs/LAB_DB_DEPLOY.md）
+# ═══════════════════════════════════════════════════════════════════════
+def _sandbox_engine(payload: dict[str, Any]) -> Any:
+    """取引擎（默认 sqlite）；未注册/不可用 → 可读错误 + 文档章节。"""
+    from worker.sandbox import engine as engine_mod
+
+    engine_id = str(opt(payload, "engine", "sqlite") or "sqlite").lower()
+    try:
+        # ★ 带上 root：payload 指定的沙箱根必须生效（否则测试/多租户会串到默认目录）
+        eng = engine_mod.get_engine(engine_id, opt(payload, "root"))
+    except KeyError:
+        raise _Fail("E_ENGINE_UNKNOWN", f"未知引擎 {engine_id!r}",
+                    f"已注册：{', '.join(engine_mod.registry_ids())}")
+    if not eng.info.available:
+        raise _Fail("E_ENGINE_UNAVAILABLE",
+                    f"引擎 {engine_id} 不可用：{eng.info.reason}",
+                    "见 docs/LAB_DB_DEPLOY.md §4（部署）/ §5（如何发现引擎）")
+    return eng
+
+
+def _sandbox_ids(payload: dict[str, Any]) -> tuple[str, str]:
+    """解析 (user_id, session_id)：优先显式字段，其次从 db_path 推断。"""
+    user_id = str(opt(payload, "user_id", "") or "")
+    session_id = str(opt(payload, "session_id", "") or "")
+    if user_id and session_id:
+        return user_id, session_id
+    db_path = opt(payload, "db_path")
+    if db_path:
+        p = Path(str(db_path))
+        user_id = user_id or p.parent.name
+        session_id = session_id or p.stem
+    if not user_id or not session_id:
+        raise PayloadError("需要 user_id + session_id（或 db_path，从其路径推断）")
+    return user_id, session_id
+
+
+def job_sandbox_init(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """建/取学生沙箱会话（不存在则按数据集初始化）→ ``{db_path, schema, ...}``。"""
+    eng = _sandbox_engine(payload)
+    user_id, session_id = _sandbox_ids(payload)
+    emit.progress("sandbox.init", 0.2, {"engine": eng.info.id, "session": session_id})
+    out = eng.ensure_session(user_id, session_id, opt(payload, "dataset"))
+    emit.progress("sandbox.init", 1.0, {"db_path": out.get("db_path")})
+    out["engine"] = eng.info.id
+    out["dialect"] = eng.info.dialect
+    out["capabilities"] = dict(eng.info.capabilities)
+    return out
+
+
+def job_sandbox_reset(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """重置到初始 schema（学生把库搞坏了可恢复）。"""
+    eng = _sandbox_engine(payload)
+    user_id, session_id = _sandbox_ids(payload)
+    emit.progress("sandbox.reset", 0.3, {"dataset": opt(payload, "dataset")})
+    out = eng.reset_session(user_id, session_id, opt(payload, "dataset"))
+    emit.progress("sandbox.reset", 1.0, {"db_path": out.get("db_path")})
+    out["engine"] = eng.info.id
+    out["dialect"] = eng.info.dialect
+    return out
+
+
+def job_sandbox_exec(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """执行一条 SQL（独立进程 + 硬超时）→ ``{columns, rows, rowCount, elapsedMs, error?}``。
+
+    ``multi: true`` 允许"显式分隔 + 逐条校验"的批次（事务实验：
+    ``BEGIN; UPDATE …; ROLLBACK;``）。
+
+    ⚠️ **路径由服务端推导**：sqlite 引擎只用 ``user_id`` + ``session_id`` 定位库文件，
+    **不信任** payload 里的 ``db_path``；如果传了且与实际位置不一致 → 直接拒（不静默分歧）。
+    """
+    from worker.sandbox.engine import ExecRequest
+    from worker.sandbox.paths import SandboxPathError
+
+    eng = _sandbox_engine(payload)
+    user_id, session_id = _sandbox_ids(payload)
+    if payload.get("db_path") and getattr(eng.info, "id", "") == "sqlite":
+        expected = eng.db_path_for(user_id, session_id)
+        given = Path(str(payload["db_path"]))
+        if os.path.abspath(str(given)) != os.path.abspath(str(expected)):
+            raise SandboxPathError(
+                f"db_path 与 (user_id, session_id) 推导出的沙箱库不一致："
+                f"{given} ≠ {expected}（沙箱库只能落在 data/sandbox/<user>/<session>.sqlite3）"
+            )
+    sql = str(need(payload, "sql", str) or "")
+    emit.progress("sandbox.exec", 0.1, {"engine": eng.info.id, "chars": len(sql)})
+    req = ExecRequest(
+        session_id=session_id, user_id=user_id, sql=sql,
+        max_rows=int(opt(payload, "max_rows",
+                         eng.info.capabilities.get("maxRowsDefault", 200)) or 200),
+        timeout_ms=int(opt(payload, "timeout_ms", 5_000) or 5_000),
+        allow_multi=bool(opt(payload, "multi", False)),
+    )
+    out = eng.exec(req)
+    emit.progress("sandbox.exec", 1.0, {"rows": out.get("rowCount", 0),
+                                        "ok": out.get("ok", not out.get("error"))})
+    return out
+
+
+def job_sandbox_datasets(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """可选数据集（课程预置）：``{datasets:[...], default}``。"""
+    from worker.sandbox import datasets as ds_mod
+
+    with_sql = bool(opt(payload, "with_sql", False))
+    emit.progress("sandbox.datasets", 1.0, {})
+    return {"datasets": ds_mod.list_datasets(with_sql=with_sql),
+            "default": ds_mod.DEFAULT_DATASET}
+
+
+def job_sandbox_schema(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """库结构自省（S4 答疑要用）→ ``{dialect, tables:[{name, columns:[...]}]}``。"""
+    from worker.sandbox.schema import describe_text, introspect
+
+    eng = _sandbox_engine(payload)
+    user_id, session_id = _sandbox_ids(payload)
+    if payload.get("db_path"):
+        # ★ 自省也要过路径闸：否则学生能借 schema 读取**任意** sqlite 文件
+        #   （包括主知识库 —— 只读也是信息泄露）
+        db_path = eng.roots.validate(str(payload["db_path"]))
+    else:
+        db_path = eng.db_path_for(user_id, session_id)
+    out = introspect(db_path, dialect=eng.info.dialect,
+                     row_counts=bool(opt(payload, "row_counts", True)))
+    out["engine"] = eng.info.id
+    if opt(payload, "with_text"):
+        out["text"] = describe_text(out)
+    emit.progress("sandbox.schema", 1.0, {"tables": len(out["tables"])})
+    return out
+
+
+def job_sandbox_history(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """最近执行记录（S4 要看"他刚才试了几次、错在哪"）。**只读 + 隔离**。"""
+    from worker.sandbox.history import recent_executions
+    from worker.sandbox.paths import SandboxRoots
+
+    user_id, session_id = _sandbox_ids(payload)
+    roots = SandboxRoots.resolve(opt(payload, "root"))
+    limit = int(opt(payload, "limit", 20) or 20)
+    request_user_id = opt(payload, "request_user_id")
+    if request_user_id is not None and str(request_user_id) != user_id:
+        raise _Fail("E_LOG_ISOLATION",
+                    f"拒绝跨用户读历史：{request_user_id!r} ≠ {user_id!r}",
+                    "日志隔离是硬要求（LAB_DB_DEPLOY §8.5.2）")
+    records = recent_executions(roots, user_id, session_id, limit=limit)
+    emit.progress("sandbox.history", 1.0, {"records": len(records)})
+    return {"records": records, "count": len(records)}
+
+
+def job_sandbox_logs(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """数据库日志（L1 会话诊断）→ ``{source, entries:[LogEntry]}``。
+
+    SQLite 只有 L1（无 L2/L3）→ **如实声明**；拉取**只读 + 隔离 + 脱敏**。
+    """
+    from worker.sandbox import logs as logs_mod
+    from worker.sandbox.paths import SandboxRoots
+
+    engine_id = str(opt(payload, "engine", "sqlite") or "sqlite").lower()
+    roots = SandboxRoots.resolve(opt(payload, "root"))
+    # ★ 必须把 root 传进去：否则读到的是仓库默认目录的历史（payload 的 root 被忽略）
+    source = logs_mod.get_log_source(engine_id, roots)
+    if source is None:
+        raise _Fail("E_LOG_NO_SOURCE", f"引擎 {engine_id} 没有注册日志源",
+                    "见 docs/LAB_DB_DEPLOY.md §8")
+    user_id, session_id = _sandbox_ids(payload)
+    req = {
+        "session_id": session_id, "user_id": user_id,
+        "since": opt(payload, "since"), "limit": opt(payload, "limit", 50),
+        "layers": opt(payload, "layers"),
+        "request_user_id": opt(payload, "request_user_id"),
+    }
+    try:
+        entries = source.fetch(req)
+    except PermissionError as exc:
+        raise _Fail("E_LOG_ISOLATION", str(exc), "A 学生不能看 B 学生的 SQL 日志") from exc
+    except ValueError as exc:
+        raise PayloadError(str(exc)) from exc
+    out: dict[str, Any] = {
+        "source": source.info.to_dict(),
+        "entries": entries,
+        "count": len(entries),
+    }
+    if engine_id == "sqlite":
+        out["boundary"] = ("SQLite 无 L2/L3（嵌入式引擎没有实例视图与日志文件）—— "
+                           "agent 必须如实说明「读不到引擎日志」，不许假装看过")
+    if opt(payload, "with_text"):
+        out["text"] = logs_mod.summarize_for_prompt(entries)
+    emit.progress("sandbox.logs", 1.0, {"entries": len(entries)})
+    return out
+
+
+def job_sandbox_engines(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
+    """逐引擎**真探测**上报（给 ``/capabilities``），外加日志源能力。"""
+    from worker.sandbox import engine as engine_mod
+    from worker.sandbox import logs as logs_mod
+    from worker.sandbox.paths import SandboxRoots
+
+    root = opt(payload, "root")
+    engine_mod.clear_registry()
+    engine_mod.register_default_engines(root)
+    logs_mod.clear_log_sources()
+    logs_mod.register_default_log_sources(SandboxRoots.resolve(root))
+    engines = engine_mod.engines_report()
+    emit.progress("sandbox.engines", 1.0, {"engines": len(engines)})
+    return {
+        "defaultEngine": "sqlite",
+        "engines": engines,
+        "logSources": logs_mod.log_sources_report(),
+        "sandboxRoot": str(SandboxRoots.resolve(root).root),
+    }
+
+
 def job_xref(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
     """交叉引用（四路来源 + mention 假阳性过滤，坑 6/7）。"""
     from worker.pipeline import xref as xref_mod
@@ -928,6 +1139,15 @@ JOBS: dict[str, JobSpec] = {
     "extract.convert": JobSpec(job_extract_convert, "模型输出 → 校验/转成卡片 + 图谱"),
     "rollup.plan": JobSpec(job_rollup_plan, "S2 汇总：node 树 → 提示词 + 裸 schema"),
     "rollup.convert": JobSpec(job_rollup_convert, "S2 汇总：模型输出 → 校验/转成 node 富化"),
+    # ── 学生 SQL 沙箱（默认引擎 sqlite；引擎可插拔，见 docs/LAB_DB_DEPLOY.md）──
+    "sandbox.engines": JobSpec(job_sandbox_engines, "逐引擎真探测上报 + 日志源能力"),
+    "sandbox.init": JobSpec(job_sandbox_init, "建/取学生沙箱会话（按数据集初始化）"),
+    "sandbox.reset": JobSpec(job_sandbox_reset, "重置到初始 schema（学生搞坏了可恢复）"),
+    "sandbox.exec": JobSpec(job_sandbox_exec, "执行 SQL（独立进程 + 硬超时；CRUD/事务可用）"),
+    "sandbox.datasets": JobSpec(job_sandbox_datasets, "课程预置数据集（sc/employees/orders）"),
+    "sandbox.schema": JobSpec(job_sandbox_schema, "库结构自省（给 AI 答疑看表/列）"),
+    "sandbox.history": JobSpec(job_sandbox_history, "最近执行记录（只读 + 会话隔离）"),
+    "sandbox.logs": JobSpec(job_sandbox_logs, "数据库日志 L1 会话诊断（只读+隔离+脱敏）"),
     "xref": JobSpec(job_xref, "交叉引用（mention 假阳性过滤，坑 6）"),
     "index": JobSpec(job_index, "bigram 检索行（坑 15）"),
     "search": JobSpec(job_search, "查询词 → bigram 词项 + FTS5 MATCH 表达式"),
@@ -1071,10 +1291,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         emit.error(E_INTERNAL, "被中断（SIGINT）")
         return EXIT_INTERRUPT
     except Exception as exc:  # noqa: BLE001 - 任何异常都要变成 error 事件
-        code = getattr(exc, "code", E_INTERNAL)
+        code = str(getattr(exc, "code", E_INTERNAL))
         msg = getattr(exc, "msg", None) or str(exc) or type(exc).__name__
         detail = getattr(exc, "detail", "") or traceback.format_exc(limit=6)
-        emit.error(str(code), str(msg), str(detail)[:2000])
+        emit.error(code, str(msg), str(detail)[:2000])
+        # 入参/路径类错误（如 E_SANDBOX_PATH）→ 退出码 2：调用方该改参数，重试没用
+        if isinstance(exc, ValueError) and code.startswith(("E_SANDBOX", "E_PAYLOAD", "E_SQL")):
+            return EXIT_USAGE
         return EXIT_FAILED
 
 

@@ -71,6 +71,8 @@ export type Resource =
     }
   | { kind: 'course'; ownerId: string | null; courseId: string }
   | { kind: 'user'; userId: string }
+  /** 私有资源（笔记/会话）：**只有 owner 本人**可见可改。 */
+  | { kind: 'note'; ownerId: string }
   | { kind: 'global' };
 
 export type DecisionCode = 'E_UNAUTHENTICATED' | 'E_ACCOUNT_DISABLED' | 'E_FORBIDDEN' | 'E_QUOTA';

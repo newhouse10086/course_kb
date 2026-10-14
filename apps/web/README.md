@@ -1,7 +1,8 @@
 # apps/web —— Vue3 + Vite 前端
 
-> 五个视图：**知识库（Wiki）/ 知识图谱 / 视频课堂 / pi 助教 / 文档管理**
+> **七个视图**：知识库（Wiki）/ 知识图谱 / 视频课堂 / pi 助教 / 文档管理 / **SQL 练习台** / **模型设置**
 > 契约：`docs/API_PROTOCOL.md`（REST §5 / SSE §6 / WebSocket §7.2）
+> 新增两页的依据：`docs/SETTINGS_AND_SANDBOX.md`（模型热切换 §2、学生虚拟数据库 §3）、`docs/LAB_DB_DEPLOY.md`（§6 完整 CRUD / §7 安全红线）
 > 设计：`docs/DESIGN_SYSTEM.md`（美学方向 =「数据库内部 / 工业技术手册」）
 
 ---
@@ -57,6 +58,32 @@ npm test               # unit + e2e
 
 ---
 
+## 3B. 模型设置（教师 / admin）—— `docs/SETTINGS_AND_SANDBOX.md` §2
+
+| 要求 | 实现 |
+|---|---|
+| 模型下拉（`/models`） | 8 个模型逐项显示 **`available` + 真探测延迟**；不可用的带 `reason`（如 `HTTP 503`） |
+| 运行中 → 「终止并切换」 | 有在跑的任务时按钮文案变化 + 显示 `done/total` 进度条（实测 `rollup 137/368`） |
+| 断点续推 | 切换响应带 `checkpoint{done,total}` 与 `resume{state:'resuming', from_checkpoint}` —— **从第 137 个单元继续，不重复计费** |
+| 二次确认 | 点按钮先弹确认框；运行中默认选中 `mode=abort`（终止并切换） |
+| 直接热切被拒 | `mode=now` + 运行中 → 后端 **409 `E_MODEL_BUSY`**，页面把「拒绝直接热切」如实显示（含进度），**不做假热切** |
+| 坏模型回滚 | 切到探测失败的模型 → **502 `E_MODEL_PROBE`**，后端回滚，页面显示「已回滚」且 `activeModel` 不变 |
+| 可观测 | 显示 `activeModel` / `switchedFrom` / `switchedAt`（本地时间）与切换结果表 |
+| `concurrency` | **只读**输入框（disabled）+ 文案「固定=1（系统约束）」；保存时若传大数，后端**忽略并如实回报** `ignored[]` |
+| 角色 | 读 `/auth/me`：学生进来看到「需要教师或管理员角色」的门控说明，**不渲染模型表**；权限判定仍由服务端负责 |
+
+## 3C. SQL 练习台（学生）—— `LAB_DB_DEPLOY.md` §6/§7
+
+- **引擎选择器**读 `/capabilities.sandbox.engines`：`sqlite` 可用；`mysql` **禁用 + 原因「未安装 Docker」+ 指向 `docs/LAB_DB_DEPLOY.md §2.1`**（只说"不可用"不合格）。
+- **方言显著标注**：`SQLite 3.x` 徽标 + 可折叠对照表（`AUTOINCREMENT` vs `AUTO_INCREMENT`、存储过程/权限体系在 SQLite 上做不了）。
+- **完整 CRUD**（e2e 用真按钮点出来）：`CREATE TABLE` → `INSERT` → `SELECT`（读到）→ `UPDATE`（再查可见新值）→ `DELETE`（再查 0 行）→ `BEGIN/COMMIT`；另有三表 JOIN 与 `GROUP BY` 聚合。
+- **安全红线**：`ATTACH` / `load_extension` / 白名单外 `PRAGMA` → `E_SANDBOX_FORBIDDEN`；多语句拼接 → `E_SANDBOX_MULTI`；递归死循环 → `E_SANDBOX_TIMEOUT`（真实现靠 worker 硬超时，**不阻塞服务**）。
+- **`maxRows` 截断明示**：超过上限时表格上方写明「结果被截断：仅显示前 N 行（共 M 行）」。
+- **`reset`** 回到数据集初始 schema（先 `DROP TABLE` 再 reset → 断言 `student(5)` 恢复）；数据集：学生-课程-成绩 / 员工-经理 / 订单-明细。
+- **答疑面板**：把 `SQL + 原生报错 + schema + 最近 N 条执行` 交给 `POST /sandbox/ask`（**POST + SSE 流式**），回答是**先问后引**（先定位问题类别再给提示，不直接给答案），并给**引用卡片**（`[[card:crd_xxxx]]`）→ 可点跳 `#/wiki?...&card=...` 原文；上下文拿不到时如实显示「AI 可能没看到你的报错」。
+
+---
+
 ## 4. 测试与验证
 
 ### 4.0 一条命令的自证
@@ -64,9 +91,9 @@ npm test               # unit + e2e
 ```powershell
 npm run typecheck   # vue-tsc：0 错
 npm run build       # vite：✓ built
-npm test            # Vitest 56/56 + headless Chrome DOM 断言 111/111
+npm test            # Vitest 63/63 + headless Chrome DOM 断言 180/180
 npm run test:perf   # 真实体量性能数字
-python test/screenshots.py   # 10 张截图 + 对比度实测
+python test/screenshots.py   # 14 张截图 + 对比度实测
 ```
 
 ### 4.1 为什么 e2e 驱动是 Python（**本机实测，不是偏好**）
@@ -90,7 +117,8 @@ python test/screenshots.py   # 10 张截图 + 对比度实测
 
 ## 5. 实测数字（本机）
 
-**测试**：`npm test` = Vitest 单测 **56/56** + headless Chrome DOM 断言 **111/111**（`npm run test:e2e`）。
+**测试**：`npm test` = Vitest 单测 **63/63** + headless Chrome DOM 断言 **180/180**（`npm run test:e2e`）。
+新增页贡献：模型设置页 30 条（热切换状态机：409 拒绝 / 502 回滚 / 断点续推）、SQL 练习台 26 条（完整 CRUD / SQL 红线 / 答疑引用 / 截断明示 / 降级门控）、文档页真 multipart 上传 6 条。
 
 **图谱性能**（真实上游数据 1644 节点 / 481 边 / 66 flagged，headless Chromium，亮色）：
 
@@ -110,8 +138,8 @@ python test/screenshots.py   # 10 张截图 + 对比度实测
 | 亮 | 15.81:1 | 8.65:1 | 5.08:1 | 7.80:1 |
 | 暗 | 14.27:1 | 8.48:1 | 5.13:1 | 6.65:1 |
 
-**截图**：`test/screenshots/{wiki,graph,video,chat,docs}-{light,dark}.png`（10 张）。
-截图前会做一次**真实交互**把空状态填满（对话页发一句真话走 WebSocket、视频页点一条字幕跳时间点），
+**截图**：`test/screenshots/{wiki,graph,video,chat,docs,settings,lab}-{light,dark}.png`（**14 张**）。
+截图前会做一次**真实交互**把空状态填满（对话页发一句真话走 WebSocket、视频页点一条字幕跳时间点、练习台先建沙箱会话），
 不是往 DOM 里塞假数据。
 
 ---
@@ -143,3 +171,6 @@ apps/web/
 - 合成时钟模式（`?simclock=1`）下 `media_check` 标 `skipped(simclock)` —— **N/A 不冒充通过**。
 - 图谱页"可见边"过滤是**排他**语义：只看 flagged 时可见边全部为 flagged（e2e 断言 `flagged_not_ok === 0`）。
 - 对话页 `set_model` 后端会回 `E_PI_CMD`（pi SDK 需要 Model 对象）→ 前端**不做模型下拉框**，只提供「新会话」。
+
+
+

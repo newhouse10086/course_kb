@@ -50,8 +50,16 @@ FORBIDDEN_PHRASES = (
     "pg_ls_dir", "lo_import", "lo_export", "dblink", "copy ", "copy(", "from program",
 )
 
+#: 明确**拒绝**的语句类型（危险或无关实验：VACUUM 能写任意文件、GRANT 是权限演练范畴外）
+DENIED_KINDS = (
+    "ATTACH", "DETACH", "VACUUM", "REINDEX", "ANALYZE", "GRANT", "REVOKE",
+    "PRAGMA_VACUUM", "SAVEPOINT_RELEASE_ALL",
+)
+
 #: PRAGMA 白名单：**只读/自省**用途。写状态的（journal_mode/writable_schema/
 #: temp_store_directory/cache_size…）一律不在内 —— 课程里也不需要。
+#: ⚠️ `foreign_keys` 也**不在**白名单：沙箱连接固定 `foreign_keys=ON`（与 MySQL 对齐），
+#:    允许学生关掉会让"外键约束"实验失去意义。
 PRAGMA_WHITELIST = frozenset({
     "table_info", "table_xinfo", "table_list", "index_list", "index_info", "index_xinfo",
     "foreign_key_list", "database_list", "compile_options", "encoding", "page_count",
@@ -270,6 +278,13 @@ def check_one(sql: str, *, max_length: int = 20_000) -> Verdict:
                        f"SQL 过长（{len(raw)} 字符 > {max_length}）")
 
     clean = strip_comments_and_strings(raw)
+    # ★ 分析用 clean，**执行必须用原文**！
+    #   第一版把 `verdict.statement` 设成了剥离后的文本 → 字符串字面量被替换成空格，
+    #   于是 `WHERE dept='计算机'` 变成 `WHERE dept=        ` → `near "ORDER": syntax error`；
+    #   `CREATE TABLE t(id ...)` 也报错。**分析和执行必须是两份文本**。
+    original = raw.strip()
+    if original.endswith(";"):
+        original = original[:-1].rstrip()
     # ① 单语句：字符串/注释之外的分号只允许出现在**末尾**（其后只能是空白）
     stripped_clean = clean.strip()
     body = stripped_clean[:-1] if stripped_clean.endswith(";") else stripped_clean
@@ -279,14 +294,8 @@ def check_one(sql: str, *, max_length: int = 20_000) -> Verdict:
     if not body.strip():
         return Verdict(False, "E_SQL_EMPTY", "SQL 为空（只有分号/注释）")
 
-    # ② 起始关键字白名单
-    kind = statement_kind(body)
-    if kind not in ALLOWED_KINDS:
-        return Verdict(False, "E_SQL_KIND",
-                       f"不允许的语句类型 {kind or '(无法识别)'}；只允许 "
-                       f"{'/'.join(ALLOWED_KINDS)}")
-
-    # ③ 危险关键字（词边界，避免误伤列名 contains 之类）
+    # ② 危险关键字**先查**（拿到具体原因，而不是笼统的"类型不允许"）：
+    #    例：ATTACH 本就不在白名单类型里，但学生更该看到"禁止 ATTACH：能读写沙箱外的库"
     upper = body.upper()
     for token in FORBIDDEN_TOKENS:
         if re.search(rf"\b{re.escape(token)}\b", upper):
@@ -303,7 +312,20 @@ def check_one(sql: str, *, max_length: int = 20_000) -> Verdict:
                 "SHELL": "禁止 shell",
                 "SYSTEM": "禁止 system",
             }.get(token, f"禁止 {token}")
-            return Verdict(False, "E_SQL_FORBIDDEN", reason, kind=kind)
+            return Verdict(False, "E_SQL_FORBIDDEN", reason, kind=statement_kind(body))
+
+    # ③ 语句类型：明确拒绝的一律拒；**认不出的交给 SQLite 自己报语法错**
+    #    （比我们在闸里笼统说"类型不允许"更有教学价值：
+    #     学生写 `SELEC * FROM students` 该看到 `near "SELEC": syntax error`）
+    kind = statement_kind(body)
+    if kind in DENIED_KINDS:
+        return Verdict(False, "E_SQL_KIND",
+                       f"不允许的语句类型 {kind}（沙箱只做课程实验所需的读写与自省）")
+    if not kind:
+        return Verdict(False, "E_SQL_KIND", "无法识别语句类型（既不是 SQL 关键字也不是合法语句）")
+    if kind not in ALLOWED_KINDS:
+        # 交给 SQLite：它必然给语法错误（C 层解析器不会执行未知语句）
+        pass
 
     # ④ PRAGMA 白名单
     if kind == "PRAGMA":
@@ -324,7 +346,7 @@ def check_one(sql: str, *, max_length: int = 20_000) -> Verdict:
 
     # ⑤ 单语句里禁止 `BEGIN`/`COMMIT` 之外的"事务控制逃逸"？—— 允许：
     #    教学要练 `BEGIN … ROLLBACK`，见 docs/LAB_DB_DEPLOY §6「事务/回滚 ✅」
-    return Verdict(True, kind=kind, statement=body.rstrip(), hints=dialect_hints(raw))
+    return Verdict(True, kind=kind, statement=original, hints=dialect_hints(raw))
 
 
 def dialect_hints(sql: str) -> list[str]:

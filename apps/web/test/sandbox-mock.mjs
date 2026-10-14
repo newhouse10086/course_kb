@@ -181,7 +181,10 @@ export class SandboxDb {
     while ((jm = jre.exec(fromClause))) {
       joins.push({ right: jm[1], rightAlias: jm[2] || jm[1], on: jm[3].trim() })
     }
-    const first = fromClause.match(/^([A-Za-z_][\w]*)(?:\s+(?:AS\s+)?([a-z][\w]*))?/i)
+    // ⚠️ 别名位置必须排除 SQL 关键字：`^(\w+)(?:\s+(?:AS\s+)?(\w+))?` 会把 `sc JOIN student` 里的
+    //    **JOIN 当成别名**（实测 baseAlias="JOIN" → `sc.sno` 查不到 → JOIN 永远 0 行）
+    const KEYWORD = 'JOIN|INNER|LEFT|RIGHT|CROSS|ON|WHERE|GROUP|ORDER|LIMIT|HAVING|UNION|SET|VALUES'
+    const first = fromClause.match(new RegExp(`^([A-Za-z_][\\w]*)(?:\\s+(?:AS\\s+)?(?!${KEYWORD}\\b)([a-z][\\w]*))?`, 'i'))
     if (!first) throw sandboxError('E_SANDBOX_SQL', 'FROM 解析失败')
     const baseAlias = first[2] || first[1]
     const sources = new Map([[baseAlias.toLowerCase(), this.requireTable(first[1])]])
@@ -202,6 +205,7 @@ export class SandboxDb {
       }
       rows = out
     }
+    this.lastDebug = { fromClause, joins, rowsAfterJoin: rows.length, baseAlias }
     const where = text.match(/\bWHERE\s+([\s\S]+?)(?:\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s+LIMIT\b|$)/i)
     if (where) rows = rows.filter((r) => truthy(evalExpr(where[1], r)))
 
@@ -282,7 +286,7 @@ export class SandboxDb {
   }
 }
 
-function rowObj(table, row, alias) {
+export function rowObj(table, row, alias) {
   const o = {}
   table.columns.forEach((c, i) => {
     o[`${alias}.${c.name}`.toLowerCase()] = row[i]
@@ -294,7 +298,7 @@ function rowObj(table, row, alias) {
 function truthy(v) { return v === true || v === 1 || (typeof v === 'string' && v.length > 0) || (typeof v === 'number' && v !== 0) }
 
 /** 极简表达式求值：只支持列引用、字面量、= != <> > < >= <=、AND/OR/NOT、IS NULL、LIKE */
-function evalExpr(expr, row) {
+export function evalExpr(expr, row) {
   const e = String(expr).trim().replace(/^\(([\s\S]*)\)$/, '$1')
   const orParts = e.split(/\s+OR\s+/i)
   if (orParts.length > 1) return orParts.some((p) => truthy(evalExpr(p, row)))
@@ -440,3 +444,5 @@ export const DATASETS = [
     ].join(';\n'),
   },
 ]
+
+

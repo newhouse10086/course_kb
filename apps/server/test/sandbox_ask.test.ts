@@ -183,9 +183,12 @@ const RECENT: ExecutionRecord[] = [
 function makeLogSource(over: Partial<{ info: LogSourceLike['info']; entries: DbLogEntry[]; throws: boolean }> = {}): LogSourceLike {
   return {
     info: over.info ?? (() => ({ id: 'sqlite', layers: ['L1'], available: true })),
-    async fetch() {
+    async fetch(req) {
       if (over.throws) throw new Error('日志文件读不到：EACCES');
-      return over.entries ?? [];
+      const all = over.entries ?? [];
+      // 真实日志源会**遵守 layers 参数**；这里也照做（否则测不出消费侧的层级策略）
+      const wanted = req.layers;
+      return wanted && wanted.length > 0 ? all.filter((e) => wanted.includes(e.source)) : all;
     },
   };
 }
@@ -322,7 +325,7 @@ test('★ 日志：模型没说 → 系统补一句如实说明（代码兜底�
 
 test('★ 日志：模型自己如实说了 → 不再重复补（不啰嗦）', async () => {
   const session = new FakeAskSession();
-  session.answer = '我暂时读不到该实例的引擎日志（原因：未配置日志路径），下面的分析仅基于你的报错与 SQL。\n\n**提示**：…';
+  session.answer = '我暂时读不到该实例的引擎日志（原因：未配置日志路径），下面的分析仅基于你的报错与 SQL。\n\n**相关知识点**：[[card:crd_0001]]';
   const handler = createAskHandler(
     baseDeps({
       manager: fakeManager(session),
@@ -330,7 +333,7 @@ test('★ 日志：模型自己如实说了 → 不再重复补（不啰嗦）',
     }),
   );
   const { sink } = collectFrames();
-  const out = await handler.handle({ sessionId: 's1', error: 'no such table: x' }, sink);
+  const out = await handler.handle({ sessionId: 's1', userId: 'u1', error: 'no such table: x' }, sink);
   assert.equal(out.logDisclaimerPresent, true);
   assert.equal(out.logDisclaimerAppended, false);
   assert.equal(out.systemAppended.length, 0);
@@ -354,7 +357,7 @@ test('★ 日志：可读但为空 ≠ 读不到（状态 empty，不补"读不�
     baseDeps({ manager: fakeManager(session), logSource: makeLogSource({ entries: [] }) }),
   );
   const { sink } = collectFrames();
-  const out = await handler.handle({ sessionId: 's1', error: 'no such table: x' }, sink);
+  const out = await handler.handle({ sessionId: 's1', userId: 'u1', error: 'no such table: x' }, sink);
   assert.equal(out.logAccess.status, 'empty');
   assert.match(out.logAccess.reason, /没有匹配的日志记录/);
   assert.equal(out.logDisclaimerAppended, false, 'empty 不是 unavailable，不许说"读不到"');
@@ -367,7 +370,7 @@ test('★ 日志：拉取抛异常 → unavailable + 异常原因（如实降级
     baseDeps({ manager: fakeManager(session), logSource: makeLogSource({ throws: true }) }),
   );
   const { sink } = collectFrames();
-  const out = await handler.handle({ sessionId: 's1', error: 'x' }, sink);
+  const out = await handler.handle({ sessionId: 's1', userId: 'u1', error: 'x' }, sink);
   assert.equal(out.logAccess.status, 'unavailable');
   assert.match(out.logAccess.reason, /日志拉取失败/);
   assert.match(out.logAccess.reason, /EACCES/);
@@ -398,9 +401,9 @@ test('★ 越权：别的 sessionId 的日志条目被丢弃，且**绝不进提
   const entries: DbLogEntry[] = [
     { source: 'L1', level: 'error', message: 'no such table: student', sessionId: 's1', sql: 'SELECT * FROM student' },
     {
-      source: 'L2',
+      source: 'L1',
       level: 'warning',
-      message: '别人的慢查询',
+      message: '别人的报错',
       sessionId: 's2',
       sql: 'SELECT * FROM secret_payroll WHERE salary > 99999',
     },
@@ -422,7 +425,7 @@ test('★ 越权：别的 sessionId 的日志条目被丢弃，且**绝不进提
 
   const message = session.promptCalls[0] ?? '';
   assert.ok(!message.includes('secret_payroll'), '★ 别人的 SQL 泄漏进提示词了');
-  assert.ok(!message.includes('别人的慢查询'));
+  assert.ok(!message.includes('别人的报错'));
   assert.equal(out.logAccess.crossSessionDropped, 1);
   assert.ok(out.contextWarnings.some((w) => w.includes('其它会话')));
 });
@@ -451,9 +454,11 @@ test('★ 越权：L3 无法确认归属的行一律丢弃（文件日志是别�
 
 test('★ 上下文按 §8.4 的优先级排列，L1 报错在最前', async () => {
   const ctx = await assembleAskContext(
-    { sessionId: 's1', sql: 'SELECT * FROM student', error: 'no such table: student' },
+    { sessionId: 's1', userId: 'u1', sql: 'SELECT * FROM student', error: 'no such table: student' },
     baseDeps({
       logSource: makeLogSource({
+        // L1 + L3 都声明可用（假日志源会按 layers 过滤，声明了才拿得到 L3）
+        info: () => ({ id: 'sqlite', layers: ['L1', 'L3'], available: true }),
         entries: [
           { source: 'L1', level: 'error', message: 'no such table: student', code: 'SQLITE_ERROR', sessionId: 's1' },
           { source: 'L3', level: 'error', message: 'error.log: table missing', sessionId: 's1' },
@@ -475,13 +480,13 @@ test('★ 上下文按 §8.4 的优先级排列，L1 报错在最前', async () 
 test('★ L2 只在报错疑似锁/超时时才带（§8.4 第 4 项）', async () => {
   const l2Entries: DbLogEntry[] = [{ source: 'L2', level: 'warning', message: '慢查询 1.2s', sessionId: 's1' }];
   const withLockErr = await assembleAskContext(
-    { sessionId: 's1', error: 'database is locked' },
+    { sessionId: 's1', userId: 'u1', error: 'database is locked' },
     baseDeps({ logSource: makeLogSource({ info: () => ({ id: 'sqlite', layers: ['L1', 'L2'], available: true }), entries: l2Entries }) }),
   );
   assert.ok(withLockErr.sections.some((s) => s.id === 'l2_summary'), '锁错误应带 L2');
 
   const withSyntaxErr = await assembleAskContext(
-    { sessionId: 's1', error: 'near "FROM": syntax error' },
+    { sessionId: 's1', userId: 'u1', error: 'near "FROM": syntax error' },
     baseDeps({ logSource: makeLogSource({ info: () => ({ id: 'sqlite', layers: ['L1', 'L2'], available: true }), entries: l2Entries }) }),
   );
   assert.ok(!withSyntaxErr.sections.some((s) => s.id === 'l2_summary'), '语法错不该带 L2');
@@ -589,6 +594,9 @@ test('依赖失败不阻断答疑：记 contextWarnings，仍能回答', async (
   assert.equal(out.contextWarnings.length, 3, `应记 3 条告警，实际 ${JSON.stringify(out.contextWarnings)}`);
   assert.ok(out.contextWarnings.some((w) => w.includes('schema 服务挂了')));
   assert.ok(out.contextWarnings.some((w) => w.includes('检索挂了')));
+  // 出口拦截是**输出侧安全事件**，单独计数（不混进"上下文缺哪块"的清单）
+  assert.equal(out.leakedFramesBlocked, 1, '假会话发了 system 的 message_end，应被出口拦下');
+  assert.ok(!out.contextWarnings.some((w) => w.includes('出口拦截')), '语义不能混');
   assert.ok(frames.some((f) => f.type === 'settled'), '仍然要正常结束');
 });
 
