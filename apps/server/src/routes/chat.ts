@@ -13,6 +13,7 @@ import type { FastifyInstance } from 'fastify';
 
 import type { AppDeps, ChatConnectionLike } from '../app-deps.ts';
 import { redact } from '../config.ts';
+import { safeJsonStringify } from '../tasks/bus.ts';
 
 interface WsLike {
   send(data: string): void;
@@ -47,7 +48,12 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
         send: (frame) => {
           if (closed) return;
           try {
-            socket.send(JSON.stringify(frame));
+            // ⚠️ WS 帧**有长度前缀**，本不会像 SSE 那样被 U+2028/U+2029 错切 ——
+            //    这里统一走 `safeJsonStringify` 是为了**不依赖协议特性**：
+            //    全仓的 JSON→线协议出口（任务 SSE / 沙箱答疑 SSE / 聊天 WS）都用同一个函数，
+            //    哪天有人把这段改成 SSE、写日志或转发，就不会悄悄退化成"单行保证被打破"。
+            //    （坑 17：`JSON.stringify` 不转义 U+2028/U+2029，Node 24 实测。）
+            socket.send(safeJsonStringify(frame));
           } catch {
             closed = true;
           }

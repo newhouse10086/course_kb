@@ -251,6 +251,11 @@ export class SettingsStore {
         this.scheduleReload();
       });
       this.watcher.on('error', (e) => this.log(`settings watcher 错误：${e.message}`, 'warn'));
+      // ★ **必须 unref**：`fs.FSWatcher` 是活动句柄，会**让事件循环一直活着**。
+      //    后果实测过：每个测试都 build 一次 app（于是挂一个 watcher）→ 测试全跑完了
+      //    进程却**不退出**，`npm test` 挂死十几分钟。配置监听是后台附属品，
+      //    该由 HTTP listener/其它业务句柄决定进程寿命。`close()` 里仍会正常释放。
+      this.watcher.unref?.();
       this.log(`settings 热重载已启用：${this.current.path}（防抖 ${this.debounceMs()}ms，兜底轮询 ${pollMs}ms）`);
       return true;
     } catch (e) {
