@@ -104,7 +104,9 @@ export const api = {
   health: () => req<{ ok: boolean; version?: string }>('/health'),
 
   /** §5.1 能力接口（诚实接口）：UI 必须按 available 渲染 */
-  capabilities: () => req<Record<string, unknown>>('/capabilities'),
+  /** §5.1 能力接口（诚实接口）：UI 必须按 available 渲染。
+   *  `refresh=true` → 加 `?refresh=1` 强制重探（真后端默认 15s TTL 缓存，实测 17s → 7ms） */
+  capabilities: (refresh = false) => req<Record<string, unknown>>(`/capabilities${refresh ? '?refresh=1' : ''}`),
 
   // ---- §5.2 文档 ----
   documents: (p?: Params) => req<Paged<DocumentInfo>>('/documents', p),

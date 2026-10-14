@@ -47,7 +47,7 @@ type WhoKind = 'student' | 'student_logic' | 'rules' | 'system' | 'config' | 'ca
 const runError = ref<{
   code: string; msg: string; hint?: string; localReading?: string
   who?: string; whoLabel?: string; kind?: WhoKind
-  killedBy?: string; hardKilled?: boolean; interim?: boolean
+  killedBy?: string; hardKilled?: boolean; interim?: boolean; defenseInDepth?: boolean
 } | null>(null)
 
 /**
@@ -233,6 +233,8 @@ async function run() {
         who, whoLabel: r.error.who_label || '', kind,
         killedBy: r.killedBy, hardKilled: r.hardKilled,
         interim: (r.error as any).interim === true,
+        // backend-api 2026-10-15：改用 defense_in_depth（长期纵深防御，不是过渡期）
+        defenseInDepth: (r.error as any).defense_in_depth === true,
       }
       history.value = [{ sql: text, ok: false, at: Date.now() }, ...history.value].slice(0, 30)
       note.value = `${r.error.code}：${r.error.message || r.error.raw || ''}`
@@ -481,9 +483,11 @@ async function runSelftest() {
   rec('single_tx_who_kind', singleTxKind?.dataset.whoKind)
   need('single_tx_who_kind', singleTxKind?.dataset.whoKind === 'rules')
   // backend-api 文档写 interim:true，**实测真后端给 false** → 条件断言（true 才要求提示条），差异已上报
-  const txInterim = (singleTx.error as any)?.interim === true
-  rec('single_tx_interim_flag', txInterim)
-  need('single_tx_interim_noted', txInterim === !!document.querySelector('[data-testid="interim-note"]'))
+  const txDefense = (singleTx.error as any)?.defense_in_depth === true
+  rec('single_tx_defense_in_depth', txDefense)
+  rec('single_tx_interim_flag', (singleTx.error as any)?.interim === true)
+  // backend-api 口径：interim 恒 false、defense_in_depth=true → 提示条按后者出现
+  need('single_tx_defense_noted', txDefense === !!document.querySelector('[data-testid="defense-note"]'))
 
   // 整批执行：开关 → 请求带 multi:true → BEGIN/INSERT/ROLLBACK 全 ok 且行数不变
   await exec('DROP TABLE IF EXISTS tx_probe')
@@ -748,8 +752,9 @@ async function runSelftest() {
             {{ runError.hardKilled ? '（进程被硬杀，可能已留下半成品数据）' : '（进程正常退出，数据未受影响）' }}
           </div>
           <div class="small" style="margin-top: 4px">{{ whoText.note }}</div>
-          <div v-if="runError.interim" class="small" style="margin-top: 4px" data-testid="interim-note">
-            后端标记 <code>interim=true</code>：这是<b>当前实现的有意约束</b>（不是永久缺失），会随版本演进。
+          <div v-if="runError.defenseInDepth" class="small" style="margin-top: 4px" data-testid="defense-note">
+            后端标记 <code>defense_in_depth=true</code>：**worker 侧也拒绝**这类语句 —— 这是长期的安全属性，不是"过渡期限制"。
+            事务请按提示用<b>整批执行</b>（同一次进程内）完成。
           </div>
           <div class="small" style="margin-top: 4px">
             <span v-if="runError.kind === 'student'">看不懂报错？点上面的<b>答疑</b>，让 AI 先帮你定位是哪一类问题。</span>

@@ -342,6 +342,8 @@ export function capabilitiesPayload(degraded = false) {
     policy: { asr: 'local-first', tts: 'cloud-first', translate: 'cloud-first' },
     pi: { available: true, version: '1.2.0', mode: 'sdk' },
     ffmpeg: { available: true, version: 'N-124868' },
+    // 真后端 15s TTL 缓存（backend-api 2026-10-15 实测 17079ms → 7ms）：如实标注，不假装实时
+    cached: true, cached_age_ms: 6, cache_ttl_ms: 15000,
     sandbox: {
       available: true,
       defaultEngine: 'sqlite',
@@ -444,7 +446,9 @@ const MINIMAL_PDF = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>e
 
 export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}) {
   const F = buildFixture()
-  const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [], role: 'teacher', running_llm: true }
+  const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [], role: 'teacher', running_llm: true,
+    /** 检索帧用哪种模式（none/wiki/kg/rag）；kg_hit=1 时 kg 才有命中（默认 kg = 查了 0 命中） */
+    retrieval: 'wiki', kg_hit: false }
   /** 模型/设置/sandbox 的运行期状态（真后端在 settings.json + SQLite 里） */
   const STATE = {
     activeModel: 'deepseek-v4.1-flash',
@@ -548,6 +552,8 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         for (const k of Object.keys(CFG)) if (q.has(k) && typeof CFG[k] === 'boolean') CFG[k] = ['1', 'true', 'yes'].includes(q.get(k))
         if (q.has('role')) CFG.role = q.get('role')
         if (q.has('maxrows')) { STATE.sandbox.limits.maxRows = Math.max(1, Number(q.get('maxrows')) || 200); if (STATE.db) STATE.db.maxRows = STATE.sandbox.limits.maxRows }
+        if (q.has('retrieval')) CFG.retrieval = q.get('retrieval')
+        if (q.has('kg_hit')) CFG.kg_hit = ['1', 'true'].includes(q.get('kg_hit'))
         if (q.has('running_llm')) { CFG.running_llm = ['1', 'true', 'yes'].includes(q.get('running_llm')); STATE.runningLlmTask = CFG.running_llm }
         return json({ config: { ...CFG, uploads: CFG.uploads.length } })
       }
@@ -794,7 +800,11 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
             res.write(buf)
             res.write('\r\n')
           }
-          send('progress', { stage: '组装上下文', detail: { sql: sql.slice(0, 120), error: errMsg.slice(0, 120), schema: true, recent: STATE.lastSql.length, question } })
+          // ★ 真后端帧名：open / frame / done（frame 里是 pi 消息信封；backend-api 2026-10-15 实测）
+          send('open', { sessionId: String(body.sessionId || ''), user: 'student01' })
+          send('frame', { type: 'message_end', message: { role: 'user', content: [{ type: 'text',
+            text: ['【日志可用性】', '日志情况：**读不到**该实例的引擎日志（原因：服务端未配置数据库日志源（logSource 未接入））。', '',
+              '【学生的 SQL】' + sql, '【报错】' + errMsg, '【问题】' + question].join('\n') }] } })
           const answer = [
             '先别急着要答案 —— 按"先问后引"来：\n',
             errMsg
@@ -807,12 +817,14 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
           let i = 0
           const step = () => {
             if (i >= answer.length) {
-              send('citation', { citations: hits.map((c) => ({ card_id: c.id, name: c.name, unit_id: c.unit_id, href: `#/wiki?doc=doc_refman00001&unit=${c.unit_id}&card=${c.id}` })) })
-              send('done', { ok: true, cited: hits.length, hint_style: 'ask-then-cite' })
+              send('frame', { type: 'settled', aborted: false })
+              // done 带**全文 + citations**；citationMode 如实说明引用为何缺失（真后端同名字段）
+              send('done', { ok: true, text: answer, citationMode: hits.length ? 'cited' : 'missing',
+                citations: hits.map((c) => ({ card_id: c.id, name: c.name, unit_id: c.unit_id })) })
               res.end('0\r\n\r\n')
               return
             }
-            send('text', { delta: answer.slice(i, i + 10) })
+            send('frame', { type: 'text_delta', delta: answer.slice(i, i + 10) })
             i += 10
             setTimeout(step, 25)
           }
@@ -1027,6 +1039,29 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
           // 否则"思考过程可见"这条永远测不到
           send({ type: 'thinking_delta', delta: '先确认问题指向的机制：' })
           send({ type: 'thinking_delta', delta: '聚簇索引的叶子节点存整行。' })
+          /**
+           * ★ 检索模式帧（契约 §4）—— 字段与 pi-bridge 真机实测**逐字段一致**：
+           *   {type,mode,status,available,hits,elapsedMs,why[],reason,sources[{kind,ref_id,title,score}]}
+           * status ∈ none|ok|empty|unavailable|error（**判色以 status 为准**）
+           */
+          const rmode = String(CFG.retrieval || 'wiki')
+          const RFRAMES = {
+            none: { status: 'none', available: true, hits: 0, elapsedMs: null,
+              why: ['用户选择了不使用知识库检索（none）'], reason: '', sources: [] },
+            wiki: { status: 'ok', available: true, hits: 2, elapsedMs: 1240,
+              why: ['bigram 命中「聚簇索引」', 'DEPENDS_ON 1 跳：索引 → B+树'], reason: '',
+              sources: [{ kind: 'unit', ref_id: 'unt_0001', title: '3.1 聚簇索引', score: 27.8 },
+                { kind: 'card', ref_id: 'crd_0042', title: 'B+ 树与索引', score: 12.1 }] },
+            kg: CFG.kg_hit
+              ? { status: 'ok', available: true, hits: 1, elapsedMs: 6200, why: ['DEPENDS_ON 1 跳：索引 → B+树'],
+                  reason: '', sources: [{ kind: 'entity', ref_id: 'ent_index', title: '索引', score: 1 }] }
+              : { status: 'empty', available: true, hits: 0, elapsedMs: 6200,
+                  why: ['图谱可用，但没有可遍历的边类型（edges 为空）'], reason: '', sources: [] },
+            rag: { status: 'unavailable', available: false, hits: 0, elapsedMs: 0,
+              why: ['rag 检索不可用：未配置 embedding provider（providers.embedding 为空）'],
+              reason: '未配置 embedding provider（providers.embedding 为空）', sources: [] },
+          }
+          send({ type: 'retrieval', mode: rmode, ...(RFRAMES[rmode] || RFRAMES.wiki) })
           const step = () => {
             if (i < chunks.length) {
               send({ type: 'text_delta', delta: chunks[i++] })

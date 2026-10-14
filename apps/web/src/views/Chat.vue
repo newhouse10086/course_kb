@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * Chat —— pi AI 助教（契约 §7.2 WebSocket；PROVIDERS §7 能力门控）
  *
@@ -30,6 +30,87 @@ const busy = ref(false)
 const settledCount = ref(0)
 const eventCount = ref(0)
 let socket: ChatSocket | null = null
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * 检索模式徽标（契约 §4 / docs/RETRIEVAL.md §2；字段名已与 pi-bridge 逐条对齐）
+ *   ① 本次用了哪种检索（none/wiki/kg/rag）+ 命中几条 + 耗时
+ *   ② available=false → "未使用知识库" + 可读原因
+ *   ③ why（字符串数组）可展开；sources 给标题 + 跳转
+ *   ④ ★ none（没查库）与 empty（查了 0 命中）**判色/文案都不同** —— 用户能一眼看出
+ *   ⑤ tool 调用是**同轮独立帧**（retrieval → tool_* → text_delta → settled）→ 按轮归组展示
+ * ───────────────────────────────────────────────────────────────────────── */
+export type RetrievalStatus = 'none' | 'ok' | 'empty' | 'unavailable' | 'error'
+export interface RetrievalSource { kind?: string; ref_id?: string; title?: string; score?: number }
+export interface RetrievalState {
+  mode: 'none' | 'wiki' | 'kg' | 'rag' | string
+  /** ★ 权威判据（pi-bridge 契约）：不要用 available/hits 猜 */
+  status: RetrievalStatus
+  available: boolean
+  hits: number
+  elapsedMs: number | null
+  why: string[]
+  reason: string
+  sources: RetrievalSource[]
+}
+
+/**
+ * ⚠️ pi-bridge 实测：模型会把**原始 tool 调用标记**写进正文（`<｜｜DSML｜｜invoke name="bash">`），
+ *    因为 chat/答疑会话的 `tools: []` → 工具调用退化成文本。后端**不过滤**（怕误伤正常文本）→
+ *    前端兜底：折叠成可读提示，别把标记当 Markdown 渲染成乱码。
+ */
+const TOOL_MARKER = /<\uFF5C[^>]*\uFF5C[^>]*>|<\uFF5C[\s\S]{0,80}?\uFF5C>/g
+function foldToolMarkers(text: string): { text: string; folded: number } {
+  let folded = 0
+  const out = String(text || '').replace(/<\uFF5C[^>]{0,200}>/g, () => { folded++; return '' })
+  return { text: out.replace(/\n{3,}/g, '\n\n').trim(), folded }
+}
+const retrieval = ref<RetrievalState | null>(null)
+const whyOpen = ref(false)
+/** 同轮的工具调用（retrieval → settled 之间） */
+const roundTools = ref<Array<{ id: string; tool: string; args?: unknown; done: boolean; ok?: boolean }>>([])
+
+const STATUS_FALLBACK: Record<string, RetrievalStatus> = {}
+/** 兼容：有 status 就用 status；没有就按 available/hits 推（老后端/别的实现） */
+function deriveStatus(raw: any, mode: string, available: boolean, hits: number): RetrievalStatus {
+  const s = String(raw?.status || '')
+  if (['none', 'ok', 'empty', 'unavailable', 'error'].includes(s)) return s as RetrievalStatus
+  if (!available) return 'unavailable'
+  if (mode === 'none') return 'none'
+  return hits > 0 ? 'ok' : 'empty'
+}
+
+function normalizeRetrieval(e: any): RetrievalState {
+  const r = e?.retrieval && typeof e.retrieval === 'object' ? e.retrieval : e
+  const mode = String(r?.mode || 'none')
+  const available = r?.available !== false
+  const sources: RetrievalSource[] = Array.isArray(r?.sources) ? r.sources : (Array.isArray(r?.items) ? r.items : [])
+  const hits = Number.isFinite(Number(r?.hits)) ? Number(r.hits) : sources.length
+  const status = deriveStatus(r, mode, available, hits)
+  const whyRaw = r?.why
+  const why = Array.isArray(whyRaw) ? whyRaw.map((x: unknown) => String(x)) : (whyRaw ? [String(whyRaw)] : [])
+  return {
+    mode, status, available, hits,
+    elapsedMs: Number.isFinite(Number(r?.elapsedMs)) ? Number(r.elapsedMs) : null,
+    why, reason: String(r?.reason || ''), sources,
+  }
+}
+
+const MODE_LABEL: Record<string, string> = {
+  none: 'none（不检索）', wiki: 'wiki（词法/bigram）', kg: 'kg（图谱遍历）', rag: 'rag（向量）',
+}
+const retrievalLabel = computed(() => {
+  const r = retrieval.value
+  if (!r) return ''
+  const mode = MODE_LABEL[r.mode] || r.mode
+  switch (r.status) {
+    case 'none': return `${mode}：本次没查库`
+    case 'empty': return `${mode}：查了但 0 命中`
+    case 'unavailable': return `${mode}：不可用，未使用知识库`
+    case 'error': return `${mode}：检索出错`
+    default: return `${mode}：命中 ${r.hits} 条`
+  }
+})
+const retrievalTime = computed(() => (retrieval.value?.elapsedMs != null ? `${(retrieval.value.elapsedMs / 1000).toFixed(1)}s` : ''))
 
 const piOk = computed(() => !!caps.value?.isAvailable('pi'))
 const piReason = computed(() => caps.value?.reasonFor('pi') || 'pi 能力未上报')
@@ -89,6 +170,8 @@ function onEvent(e: ChatServerEvent) {
       break
     case 'tool_start':
       updateLast((m) => m.tools.push({ id: String((e as any).id), tool: String((e as any).tool), args: (e as any).args, done: false }))
+      // ★ 同轮归组：wiki 那次"去查 sqlite"就是这条，不显示用户就不知道它做了额外工作
+      roundTools.value = [...roundTools.value, { id: String((e as any).id), tool: String((e as any).tool), args: (e as any).args, done: false }]
       break
     case 'tool_update':
       updateLast((m) => {
@@ -101,6 +184,20 @@ function onEvent(e: ChatServerEvent) {
         const t = m.tools.find((x) => x.id === (e as any).id)
         if (t) { t.done = true; t.ok = (e as any).ok !== false; t.duration_ms = (e as any).duration_ms }
       })
+      roundTools.value = roundTools.value.map((x) => (x.id === String((e as any).id)
+        ? { ...x, done: true, ok: (e as any).ok !== false } : x))
+      break
+    /**
+     * ★ 检索模式帧（契约 §4 / docs/RETRIEVAL.md §2）—— 用户裁决的一部分：
+     *   "让 UI 能展示这次用的是哪种检索、命中了什么"。
+     *   形状按 `Retrieved`：`{mode, items[], elapsedMs, available, reason?}`；
+     *   帧可能把整块放在 `retrieval` 字段里（我两种都吃，等 pi-bridge 确认后收敛成一种）。
+     */
+    case 'retrieval':
+      // 每轮恰好一帧（pi-bridge 保证）→ 开新的一轮，工具帧归到这一轮
+      retrieval.value = normalizeRetrieval(e)
+      roundTools.value = []
+      whyOpen.value = false
       break
     case 'error':
       updateLast((m) => { m.error = { code: (e as any).code, msg: (e as any).msg } })
@@ -269,6 +366,48 @@ void _esc
         </ul>
         <div class="small" style="margin-top: 4px">按 PROVIDERS §7：能力不可用时禁用入口并显示原因，不允许点了才报错。</div>
       </div>
+
+      <!-- ★ 检索模式徽标：本次用了哪种检索 / 命中几条 / 耗时；none 与"查了没命中"必须一眼可分 -->
+      <div
+        v-if="retrieval"
+        class="retr-bar"
+        data-testid="retrieval-badge"
+        :data-mode="retrieval.mode"
+        :data-status="retrieval.status"
+        :data-searched="retrieval.status !== 'none' && retrieval.available ? '1' : '0'"
+        :data-available="retrieval.available ? '1' : '0'"
+        :data-hits="retrieval.hits"
+      >
+        <span class="retr-badge" :data-status="retrieval.status">{{ retrievalLabel }}</span>
+        <span v-if="retrievalTime" class="small faint">耗时 {{ retrievalTime }}</span>
+        <span v-if="(retrieval.status === 'unavailable' || retrieval.status === 'error') && retrieval.reason"
+              class="small" data-testid="retrieval-reason">原因：{{ retrieval.reason }}</span>
+        <span v-else-if="retrieval.status === 'none'" class="small faint" data-testid="retrieval-none-note">
+          （没查知识库 → 与「查了但没命中」不是一回事）
+        </span>
+        <span v-else-if="retrieval.status === 'empty'" class="small" data-testid="retrieval-empty-note">
+          （查了、可用，但没命中 → 不是「没查库」）
+        </span>
+        <!-- 同轮工具调用：wiki 那次真的去查了 sqlite —— 不显示用户就不知道它做了额外工作 -->
+        <span v-for="t in roundTools" :key="t.id" class="pill" :class="{ ok: t.done && t.ok !== false, bad: t.done && t.ok === false }"
+              data-testid="retrieval-tool" :data-tool="t.tool">
+          tool: {{ t.tool }}{{ t.done ? (t.ok === false ? ' ✗' : ' ✓') : ' …' }}
+        </span>
+        <button v-if="retrieval.why.length || retrieval.sources.length" type="button" class="small"
+                data-testid="retrieval-why-toggle" @click="whyOpen = !whyOpen">
+          {{ whyOpen ? '收起依据 ▾' : `看依据（${retrieval.sources.length || retrieval.why.length}） ▸` }}
+        </button>
+        <div v-if="whyOpen" class="retr-why" data-testid="retrieval-why">
+          <div v-for="(w, i) in retrieval.why" :key="`w${i}`" class="small" data-testid="retrieval-why-line">· {{ w }}</div>
+          <div v-for="(s, i) in retrieval.sources" :key="`s${i}`" class="retr-item">
+            <span class="pill" :class="{ blue: s.kind === 'card' }">{{ s.kind || 'unit' }}</span>
+            <b>{{ s.title || s.ref_id }}</b>
+            <span v-if="s.score != null" class="faint mono tiny">score {{ s.score }}</span>
+            <span v-if="s.ref_id" class="faint mono tiny">{{ s.ref_id }}</span>
+          </div>
+          <div v-if="!retrieval.sources.length" class="small faint">（后端只给了 why，没给 sources —— 正文不下发是设计如此）</div>
+        </div>
+      </div>
     </div>
 
     <div class="chat-log panel" data-testid="chat-log">
@@ -285,7 +424,12 @@ void _esc
             <span v-else class="pill" :class="t.ok ? 'ok' : 'bad'">{{ t.ok ? '成功' : '失败' }} {{ t.duration_ms ?? '—' }}ms</span>
             <div v-if="t.partial" class="evidence">{{ t.partial.slice(0, 160) }}</div>
           </div>
-          <div v-if="m.text" class="text" :data-testid="m.role === 'assistant' ? 'assistant-text' : ''">{{ m.text }}</div>
+          <div v-if="m.text" class="text" :data-testid="m.role === 'assistant' ? 'assistant-text' : ''">{{ foldToolMarkers(m.text).text }}</div>
+          <!-- ⚠️ 模型把原始 tool 标记写进正文（pi-bridge 实测：tools:[] 时工具调用退化成文本）→ 折叠并如实告知 -->
+          <div v-if="m.role === 'assistant' && foldToolMarkers(m.text).folded > 0" class="small faint"
+               data-testid="tool-marker-folded" :data-count="foldToolMarkers(m.text).folded">
+            （已折叠 {{ foldToolMarkers(m.text).folded }} 处模型输出的原始工具调用标记 —— 本轮会话未启用工具，后端未过滤，前端按原样告知）
+          </div>
           <div v-if="m.error" class="note bad" :data-error-code="m.error.code" data-testid="chat-error">
             <b>错误</b> <span class="mono">{{ m.error.code }}</span>：{{ m.error.msg }}
           </div>
@@ -315,6 +459,19 @@ void _esc
 </template>
 
 <style scoped>
+/* 检索徽标：四种模式颜色不同；none（没查库）=灰虚线，empty（查了没命中）=橙，hit=绿，unavailable=灰 */
+.retr-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px;
+  padding-top: 7px; border-top: var(--hair) dashed var(--rule); }
+.retr-badge { display: inline-block; padding: 1px 8px; font-size: 12px; font-weight: 600;
+  border: var(--hair) solid currentColor; border-radius: var(--r-sm); }
+/* ★ 判色以 status 为准（pi-bridge 契约）：none 灰虚线 / ok 绿 / empty 橙 / unavailable+error 红 */
+.retr-badge[data-status="none"] { color: var(--muted); border-style: dashed; background: transparent; }
+.retr-badge[data-status="empty"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.retr-badge[data-status="ok"] { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.retr-badge[data-status="unavailable"], .retr-badge[data-status="error"] { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.retr-why { flex-basis: 100%; margin-top: 5px; border-left: 3px solid var(--rule-strong); padding-left: 8px; }
+.retr-item { padding: 3px 0; border-bottom: var(--hair) dotted var(--rule); }
+
 /* 对话 = 誊抄稿（transcript）：mono 角色栏 + 细线分隔 + 工具调用当"旁注" */
 .chat-layout { display: flex; flex-direction: column; gap: 12px; padding: 14px 22px 40px; max-width: 1020px; margin: 0 auto; }
 .chat-log { min-height: 300px; max-height: 56vh; overflow: auto; border: var(--hair) solid var(--rule); border-top: 2px solid var(--rule-strong); border-radius: var(--r-sm); background: var(--panel); padding: 4px 14px; }
@@ -343,6 +500,7 @@ void _esc
 .thinking { border-left: 3px solid var(--rule-strong); padding-left: 8px; margin: 4px 0; }
 .thinking pre { white-space: pre-wrap; margin: 4px 0 0; background: transparent; border: none; padding: 0; color: var(--ink-2); }
 </style>
+
 
 
 

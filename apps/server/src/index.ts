@@ -253,6 +253,12 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     else agentError = capsMod.error ?? 'agent/capabilities.ts 未导出 capabilities()';
   }
 
+  /**
+   * 物化后的 pi 会话管理器（`agentDir` = `data/pi-agent/`）。
+   * **chat 与 /sandbox/ask 必须共用同一个** —— 否则答疑走 pi 的默认会话 → 全局默认模型 + 失效 key → 403。
+   */
+  let agentManager: unknown = null;
+
   if (opts.chatFactory !== undefined) {
     chatFactory = opts.chatFactory;
     if (opts.chatFactory === null) agentError = agentError ?? '聊天通道被显式禁用（测试注入）';
@@ -282,6 +288,7 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
             agentDir: piModels.agentDir,
             model: piModels.modelRef,
           });
+          agentManager = manager;
           chatFactory = (connOpts) => createConn({ ...connOpts, manager } as never);
           process.stderr.write(
             `[agent] 模型与凭据已绑定项目配置：${piModels.modelRef}` +
@@ -402,6 +409,14 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
         return r.ok && r.result ? r.result : {};
       };
       sandboxAsk = askMod.mod.createAskHandler({
+        /**
+         * ★ 答疑必须用**同一个**物化会话管理器（`data/pi-agent/`）。
+         *
+         * 不传的后果（web-ui 实测到的 `E_LLM 403`）：`ask.ts` 会用它模块内的默认管理器 →
+         * pi 的**全局默认模型**（`~/.pi/agent`，key 已失效）→ 上游 401/403，
+         * 而 `/capabilities` 里 `providers.llm=amr(available=True)` 仍然正常（那是 providers 层，另一条路径）。
+         */
+        manager: agentManager ?? undefined,
         // schema 与最近执行都走 **worker job**（与 /sandbox/schema、/sandbox/history 同源 → 不会有两套真相）
         getSchema: async (sessionId: string) => {
           const owner = ownerOf(sessionId);

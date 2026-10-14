@@ -114,6 +114,40 @@ export interface MessageEndFrame {
   /** 权威完整消息；**只会是非 system 角色** */
   message: unknown;
 }
+/**
+ * ★ 检索元信息帧（契约 `RETRIEVAL.md` §4/§6）。
+ *
+ * 为什么必须有：模型自己在回答里说"这次没命中"只是**转述**；UI 需要**可验证的元信息**
+ * 才能渲染模式徽标、才能让学生区分 `none`（没查库）与 `empty`（查了没命中）——
+ * 后者正是"三种检索各自独立、可对比"的核心。
+ *
+ * `status` 是**关键区分字段**（`available` 不足以表达）：
+ * ```
+ * none        没查库（用户选了 none）        available=true  hits=0
+ * ok          查到并注入了                   available=true  hits>0
+ * empty       查了、可用，但 0 命中           available=true  hits=0   ← 与 none 视觉上必须不同
+ * unavailable 该模式不可用（未配置/缺数据）    available=false + reason
+ * error       检索过程抛错                    available=false + reason
+ * ```
+ * 每轮**恰好一帧**，在 `ready` 之后、`text_delta` 之前。
+ */
+export interface RetrievalFrame {
+  type: 'retrieval';
+  mode: RetrievalMode;
+  status: RetrievalStatus;
+  available: boolean;
+  /** 命中条数（`none` 与 `unavailable` 时恒为 0） */
+  hits: number;
+  /** 检索耗时（`none` 时为 null） */
+  elapsedMs: number | null;
+  /** 可解释性（字符串数组，UI 可展开）：为什么命中/为什么没命中 */
+  why: string[];
+  /** `available=false` 或 `empty` 时的可读原因（正常命中时为空串） */
+  reason: string;
+  /** 命中明细（最多 5 条，**不含正文片段**，只给跳转与展示需要的最小信息） */
+  sources: { kind: string; ref_id: string; title: string; score: number | null }[];
+}
+
 export interface SettledFrame {
   type: 'settled';
   aborted: boolean;
@@ -126,6 +160,7 @@ export interface SettledFrame {
 
 export type AgentFrame =
   | ReadyFrame
+  | RetrievalFrame
   | TextDeltaFrame
   | ThinkingDeltaFrame
   | ToolStartFrame
@@ -138,6 +173,7 @@ export type AgentFrame =
 /** 契约 §7.2 允许的帧类型（测试断言用） */
 export const AGENT_FRAME_TYPES = [
   'ready',
+  'retrieval',
   'text_delta',
   'thinking_delta',
   'tool_start',
@@ -470,8 +506,53 @@ function flushPendingError(state: MapperState, attempts: number): AgentFrame[] {
   ];
 }
 
-/** 构造 `ready` 帧（把 ⚠️9 的可观测字段一次给全）。 */
-export function makeReadyFrame(opts: {
+/**
+ * 构造 `retrieval` 帧（契约 §4："UI 要能展示这次用的是哪种检索、命中了什么"）。
+ *
+ * - `none` / `unavailable` / `error` **也要发帧**（否则"没发帧"与"没检索"分不清）
+ * - `why` 由命中项的 `why` 汇总；拿不到就给出**确定性的**说明（不编造）
+ * - `sources` 只带跳转/展示需要的最小信息（**不带正文片段**，别把知识库正文推给浏览器）
+ */
+export function makeRetrievalFrame(opts: {
+  mode: RetrievalMode;
+  status: RetrievalStatus;
+  hits: number;
+  elapsedMs: number | null;
+  reason: string;
+  items: RetrievedHitLike[];
+}): RetrievalFrame {
+  const why: string[] = [];
+  if (opts.status === 'ok') {
+    const explained = opts.items
+      .map((it) => (typeof it.why === 'string' && it.why.trim() !== '' ? it.why.trim() : null))
+      .filter((w): w is string => w !== null);
+    if (explained.length > 0) why.push(...explained.slice(0, 5));
+    else why.push(`${opts.mode} 检索命中 ${opts.hits} 条（检索器未提供 why）`);
+  } else if (opts.status === 'empty') why.push(`已执行 ${opts.mode} 检索，0 命中`);
+  else if (opts.status === 'none') why.push('用户选择了不使用知识库检索（none）');
+  else if (opts.status === 'unavailable') why.push(`${opts.mode} 检索不可用：${opts.reason}`);
+  else if (opts.status === 'error') why.push(`${opts.mode} 检索出错：${opts.reason}`);
+
+  return {
+    type: 'retrieval',
+    mode: opts.mode,
+    status: opts.status,
+    // `none` 不是"不可用"（用户主动不检索）→ available=true；`empty` 是"可用但没命中"→ true
+    available: opts.status === 'ok' || opts.status === 'empty' || opts.status === 'none',
+    hits: opts.hits,
+    elapsedMs: opts.elapsedMs,
+    why,
+    reason: opts.reason,
+    sources: opts.items.slice(0, 5).map((it) => ({
+      kind: typeof it.kind === 'string' ? it.kind : 'unknown',
+      ref_id: it.ref_id,
+      title: typeof it.title === 'string' ? it.title.slice(0, 120) : '',
+      score: typeof it.score === 'number' ? it.score : null,
+    })),
+  };
+}
+
+/** 构造 `ready` 帧（把 ⚠️9 的可观测字段一次给全）。 */export function makeReadyFrame(opts: {
   sessionId: string;
   model: string | null;
   tools: string[];
@@ -603,6 +684,10 @@ export interface AnswerAudit {
   contextProvided: boolean;
   retrievalMode: RetrievalMode;
   retrievalStatus: RetrievalStatus;
+  /** 检索耗时（`none` 时 null） */
+  retrievalElapsedMs?: number | null;
+  /** 命中条数 */
+  retrievalHits?: number;
   /** 检索不可用/失败时的可读原因 */
   retrievalReason: string;
   describe: string;
@@ -675,8 +760,16 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
     session = await manager.getOrCreate(sessionId);
   } catch (err) {
     const classified = classifyFailure(err, { where: '创建会话' });
-    const frame =
-      classified.kind === 'unknown' && String(err).includes('pi SDK')
+    // ★ 凭据文件**形状**错（就是让 pi 静默挂死的那种）：给可读原因 + 修法，
+    //   而且**不要**说成"pi 不可用"（SDK 好好的，是部署配置的形状问题）。
+    const isAuthShape = (err as Error)?.name === 'PiAuthShapeInvalid';
+    const isSdkMissing = classified.kind === 'unknown' && String(err).includes('pi SDK');
+    const frame = isAuthShape
+      ? agentError(AGENT_ERROR_CODES.E_PI_CMD, String((err as Error).message), {
+          hint: '这是**部署配置**问题（不是模型、也不是学生的操作）：按消息里的形状修正 pi 凭据文件后重试',
+          detail: 'PiAuthShapeInvalid（形状错的凭据会让 pi 静默挂死 → 所以在建会话前就拦下）',
+        })
+      : isSdkMissing
         ? sdkUnavailableError(String((err as Error)?.message ?? err))
         : agentError(classified.code, classified.msg, { hint: classified.hint, detail: classified.detail });
     await safeSend(send, frame);
@@ -700,6 +793,8 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
   let auditRetrievalMode: RetrievalMode = 'none';
   let auditRetrievalStatus: RetrievalStatus = 'none';
   let auditRetrievalReason = '';
+  let auditRetrievalElapsedMs: number | null = null;
+  let auditRetrievalHits = 0;
 
   const flush = async (): Promise<void> => {
     if (flushing || !readySent) return;
@@ -745,6 +840,8 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
           retrievalMode: auditRetrievalMode,
           retrievalStatus: auditRetrievalStatus,
           retrievalReason: auditRetrievalReason,
+          retrievalElapsedMs: auditRetrievalElapsedMs,
+          retrievalHits: auditRetrievalHits,
           describe: describeCitationMode(verdict.mode),
         });
       } catch {
@@ -807,7 +904,10 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
             let context: string | undefined;
             let retrievalStatus: RetrievalStatus = retrievalMode === 'none' ? 'none' : 'unavailable';
             let retrievalReason = retrievalMode === 'none' ? '' : '服务端未接入检索钩子';
+            let retrievalItems: RetrievedHitLike[] = [];
+            let retrievalElapsedMs: number | null = null;
             if (retrievalMode !== 'none' && opts.retrieval) {
+              const rStarted = Date.now();
               try {
                 const result = await opts.retrieval.retrieve({
                   mode: retrievalMode,
@@ -816,6 +916,7 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                   userId: opts.user?.id ?? null,
                   sessionId,
                 });
+                retrievalElapsedMs = typeof result.elapsedMs === 'number' ? result.elapsedMs : Date.now() - rStarted;
                 if (!result.available) {
                   retrievalStatus = 'unavailable';
                   retrievalReason = result.reason ?? '检索不可用';
@@ -825,6 +926,7 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                 } else {
                   retrievalStatus = 'ok';
                   retrievalReason = '';
+                  retrievalItems = result.items;
                   const formatted =
                     opts.retrieval.formatContext?.(result.items, retrievalMode) ??
                     formatRetrievalContext(result.items);
@@ -832,10 +934,29 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                   if (context === undefined) retrievalStatus = 'empty';
                 }
               } catch (err) {
+                retrievalElapsedMs = Date.now() - rStarted;
                 retrievalStatus = 'error';
                 retrievalReason = err instanceof Error ? err.message : String(err);
               }
             }
+            // ★ 契约 §4/§6：把**检索元信息**发给客户端（数据本来就算出来了，只是以前没发）。
+            //   让 UI 能显示"这次用了哪种检索 / 命中什么 / 为什么没查到"，
+            //   也让学生能区分 `none`（没查库）与 `empty`（查了没命中）—— 这正是"三种检索各自独立"的核心。
+            //   ① 不可用时**也要发**（否则"没发帧"与"没检索"分不清）；
+            //   ② 每轮**恰好一帧**，在 `ready` 之后、`text_delta` 之前。
+            await safeSend(
+              send,
+              makeRetrievalFrame({
+                mode: retrievalMode,
+                status: retrievalStatus,
+                hits: retrievalItems.length,
+                elapsedMs: retrievalElapsedMs,
+                reason: retrievalReason,
+                items: retrievalItems,
+              }),
+            );
+            auditRetrievalElapsedMs = retrievalElapsedMs;
+            auditRetrievalHits = retrievalItems.length;
             // 检索没成功时：把"这一轮没有知识库依据"如实写进提示词，让模型告诉学生
             // （不新增帧类型；学生看到的是"这次回答没有引用知识库"，而不是一份假装有出处的答案）
             const contextForPrompt =

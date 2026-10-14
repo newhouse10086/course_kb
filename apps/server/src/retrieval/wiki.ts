@@ -111,18 +111,44 @@ export class WikiRetriever implements Retriever {
   }
 
   /**
-   * 真探测：查一次**空串**。
+   * 真探测：查一次**空串** + 读索引行数。
    * `search()` 对空查询返回 `{total:0}` 且**不抛** —— 能返回就说明
    * `search_docs` / `search_fts` 存在（迁移跑过、表建好了）。
+   *
+   * ★ `dataReady` 用**索引行数**（`search_docs`）判定，**不是**"空串查询的命中数"——
+   * 空串查询本来就恒为 0，拿它当 dataReady 会**永远 false**（典型的探测写错）。
    */
   async healthCheck(): Promise<RetrieverHealth> {
     try {
       const r = search(this.deps.db, this.deps.repo, '', { limit: 1 });
-      if (r.mode !== 'bigram') return { ok: false, reason: 'search() 未返回 bigram 模式（实现漂移？）' };
+      if (r.mode !== 'bigram') {
+        return { ok: false, dataReady: false, dataCount: 0, reason: 'search() 未返回 bigram 模式（实现漂移？）' };
+      }
       const counts = this.deps.db.ftsCounts();
-      return { ok: true, reason: `bigram FTS5 就绪：索引行 ${counts.search_docs}，FTS 行 ${counts.search_fts}` };
+      const rows = Number(counts.search_docs ?? 0);
+      if (rows <= 0) {
+        return {
+          ok: true,
+          dataReady: false,
+          dataCount: 0,
+          reason:
+            'bigram FTS5 就绪（表与分词器可用）；但**当前检索索引为空（索引行 0）→ 检索必然 0 命中**。' +
+            '需先上传资料并跑抽取/建索引。',
+        };
+      }
+      return {
+        ok: true,
+        dataReady: true,
+        dataCount: rows,
+        reason: `bigram FTS5 就绪：索引行 ${rows}，FTS 行 ${Number(counts.search_fts ?? 0)}`,
+      };
     } catch (err) {
-      return { ok: false, reason: `词法检索不可用：${err instanceof Error ? err.message : String(err)}` };
+      return {
+        ok: false,
+        dataReady: false,
+        dataCount: 0,
+        reason: `词法检索不可用：${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 

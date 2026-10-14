@@ -473,6 +473,73 @@ def main() -> int:
                'data-testid="chat-gate"' in deg_chat and ("pi SDK" in deg_chat or "AMR_KEY" in deg_chat))
             ok("导航入口标记不可用", 'data-nav="/chat"' in deg_chat and "不可用" in deg_chat)
 
+        # ============ 9b. 检索模式徽标（契约 §4）：none / wiki / kg(0命中) / rag(不可用) ============
+        def chat_retrieval(mode: str, kg_hit: bool = False):
+            api(f"/api/v1/_fixture/config?retrieval={mode}" + ("&kg_hit=1" if kg_hit else ""))
+            dom = dump_dom(driver, url(normal, "chat?selftest=1"), READY_VIEW)
+            # 发一句 → 等检索帧与一轮结束
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"retrieval-badge\"]')", timeout=60, interval=0.2)
+            return dom
+
+        def check_retrieval_wiki() -> None:
+            dom = chat_retrieval("wiki")
+            ok("wiki：徽标出现", 'data-testid="retrieval-badge"' in dom)
+            ok("wiki：标注模式与命中数（status=ok）",
+               'data-mode="wiki"' in dom and 'data-hits="2"' in dom and 'data-status="ok"' in dom,
+               "缺 data-mode/hits/status")
+            ok("wiki：显示耗时（教学对比用）", "耗时" in dom and "s" in dom)
+            ok("wiki：可展开依据（why）", 'data-testid="retrieval-why-toggle"' in dom)
+            # 展开 → 看到 why 与路径
+            driver.ch.evaluate("document.querySelector('[data-testid=\"retrieval-why-toggle\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"retrieval-why\"]')", timeout=20, interval=0.2)
+            why_dom = driver.ch.outer_html()
+            ok("wiki：why 里是可读的命中原因（bigram 命中「索引」）", "bigram 命中" in why_dom, "why 未显示可读原因")
+            ok("wiki：命中项带 title/score", "聚簇索引" in why_dom and "score" in why_dom)
+
+        run_view("检索徽标 / wiki（命中 3 条）", check_retrieval_wiki)
+
+        def check_retrieval_none() -> None:
+            dom = chat_retrieval("none")
+            ok("none：徽标标注没查库（不是 0 命中）",
+               'data-mode="none"' in dom and 'data-status="none"' in dom and 'data-searched="0"' in dom,
+               "none 与 empty 没区分开")
+            ok("none：文案明确没查库", "没查库" in dom or "不检索" in dom)
+            ok("none：与查了没命中视觉不同（灰虚线 vs 橙）",
+               'data-status="none"' in dom and 'data-status="empty"' not in dom)
+
+        run_view("检索徽标 / none（没查库）", check_retrieval_none)
+
+        def check_retrieval_kg_empty() -> None:
+            dom = chat_retrieval("kg")
+            ok("kg：查了但 0 命中 → status=empty（与 none 不同）",
+               'data-mode="kg"' in dom and 'data-status="empty"' in dom and 'data-hits="0"' in dom,
+               "kg 空命中未标注")
+            ok("kg：明确写查了但 0 命中", "0 命中" in dom)
+
+        run_view("检索徽标 / kg（查了但 0 命中）", check_retrieval_kg_empty)
+
+        def check_retrieval_kg_hit() -> None:
+            dom = chat_retrieval("kg", kg_hit=True)
+            ok("kg 命中：status=ok + why 可见（DEPENDS_ON）",
+               'data-status="ok"' in dom and 'data-hits="1"' in dom)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"retrieval-why-toggle\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"retrieval-why\"]')", timeout=20, interval=0.2)
+            why_dom = driver.ch.outer_html()
+            ok("kg：why 显示跳数（DEPENDS_ON 1 跳）", "DEPENDS_ON" in why_dom, "kg 的可解释性未显示")
+
+        run_view("检索徽标 / kg（命中 1 条 + 路径）", check_retrieval_kg_hit)
+
+        def check_retrieval_rag_unavailable() -> None:
+            dom = chat_retrieval("rag")
+            ok("rag：不可用 → status=unavailable + 未使用知识库",
+               'data-mode="rag"' in dom and 'data-status="unavailable"' in dom and 'data-available="0"' in dom)
+            ok("rag：显示可读原因（未配置 embedding provider）",
+               'data-testid="retrieval-reason"' in dom and "embedding" in dom,
+               "不可用原因未显示")
+
+        run_view("检索徽标 / rag（不可用 + 原因）", check_retrieval_rag_unavailable)
+        api("/api/v1/_fixture/config?retrieval=wiki&kg_hit=0")
+
         run_view("降级 / 对话入口禁用 + 原因", check_deg_chat)
 
         # ============ 10. 降级：知识库 TTS 禁用（各能力独立） ============
@@ -602,7 +669,9 @@ def main() -> int:
             # ★ 答疑
             ask = c.get("ask") or {}
             ok("答疑流式返回（>40 字）", int(ask.get("len") or 0) > 40, json.dumps(ask, ensure_ascii=False)[:160])
-            ok("答疑看到学生的真实报错", "no such table" in str((ask.get("context") or {}).get("error")))
+            # 真后端没有 progress 帧 → 上下文在"回显的用户消息"里（ask_user_echo）；两条路都算证据
+            seen = str((ask.get("context") or {}).get("error") or "") + " " + str(c.get("ask_user_echo") or "")
+            ok("答疑看到学生的真实报错（SQL/报错进了提示词）", "no such table" in seen, seen[:160])
             ok("答疑是「先问后引」而不是直接给答案", "先别急着" in str(ask.get("head")))
             ok("答疑引用知识库卡片（≥1）", int(ask.get("citations") or 0) > 0)
             # ★ 错误归因三档（Lead 硬要求：三种不能长得一样）

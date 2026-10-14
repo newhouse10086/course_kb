@@ -152,6 +152,13 @@ export function crossCallTxRejection(sessionId: string, sql: string): Record<str
       who_source: 'http-layer-guard',
       // worker 侧也已拒绝（同码同语义）；这里是**纵深防御**：少起一个子进程 + HTTP 层永不说谎
       defense_in_depth: true,
+      /**
+       * ⚠️ **显式给 `false`**（而不是省略）：省略时消费者读到 `undefined`，很容易被当成
+       * "假值 = false"从而误判语义。口径写死在这里：
+       * **不再是"过渡期"**（worker 侧已同样拒绝），而是**长期存在的纵深防御**。
+       * （历史：worker 未修时这里是 `interim:true`；backend-core 修完后改为 `defense_in_depth`。）
+       */
+      interim: false,
       see_also: 'worker/sandbox/runner.py（每次调用独立进程 + autocommit）；worker/README.md §10.1.1',
     },
   };

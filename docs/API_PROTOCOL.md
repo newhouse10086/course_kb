@@ -723,6 +723,9 @@ data: {"task_id":"tsk_1","error":"ASR model load failed","code":"E_ASR_LOAD"}
 
 ```json
 { "type":"ready",        "session_id":"pi_abc", "model":"…", "tools":["read","bash"] }
+{ "type":"retrieval",    "mode":"wiki", "status":"ok", "available":true, "hits":2,
+                         "elapsedMs":1240, "why":["bigram 命中「聚簇索引」"],
+                         "reason":"", "sources":[{"kind":"unit","ref_id":"unt_0001","title":"3.1 聚簇索引"}] }
 { "type":"text_delta",   "delta":"聚簇" }
 { "type":"thinking_delta","delta":"先确认…" }
 { "type":"tool_start",   "id":"call_1", "tool":"read", "args":{...} }
@@ -732,6 +735,20 @@ data: {"task_id":"tsk_1","error":"ASR model load failed","code":"E_ASR_LOAD"}
 { "type":"settled",      "aborted":false }
 { "type":"error",        "code":"E_PI_EXIT", "msg":"pi process exited" }
 ```
+
+> **共 10 种帧**（原清单漏了 `retrieval` —— 由独立验收发现：契约 `RETRIEVAL.md` §4 要求它，
+> 而实现的服务端**已算出 `retrievalStatus`/`retrievalReason` 并写进 audit，却没发给客户端**，
+> 导致学生无法知道这次回答有没有用知识库、用的哪种检索）。
+>
+> **`retrieval` 帧的两条硬约束**：
+> 1. **每轮恰好一帧**，且必须在**检索处理完、发 prompt 给 SDK 之前**发出（顺序：`ready → retrieval → …`）
+> 2. ★ **`status` 必须显式区分五种情况**：`none`（没查库）/ `ok`（命中）/ **`empty`（查了但 0 命中）** /
+>    `unavailable`（能力不可用）/ `error`。
+>    **`available` 单字段表达不了这个区分** —— `none` 与 `empty` 都是 `available:true`，
+>    但"没查库"与"查了没命中"对学生是完全不同的信息（这正是"四种检索各自独立"的可见性基础）。
+> 3. **不可用/出错也要发帧**（`available:false` + 可读 `reason`）——
+>    否则"没发帧"与"没检索"分不清。
+> 4. **帧里不带正文片段**（`sources` ≤5 条，只有 id/title/kind/score）。
 
 ### 7.3 事件映射（pi → 我们的桥）
 

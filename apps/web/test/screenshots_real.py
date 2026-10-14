@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """真后端截图：**如实保留空态**（不用 mock 数据美化）
 
@@ -41,7 +41,7 @@ VIEWS = [
     ('wiki', 'wiki', "!!document.getElementById('wiki-report')"),
     ('graph', 'graph', "!!document.getElementById('perf-report')"),
     ('docs', 'docs', "!!document.getElementById('docs-report')"),
-    ('lab', 'lab', "!!document.getElementById('lab-report')"),
+    ('lab', 'lab?load=1', "!!document.getElementById('lab-report') && !!document.querySelector('[data-table]')"),
     ('settings', 'settings', "!!document.getElementById('settings-report')"),
 ]
 
@@ -126,3 +126,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+

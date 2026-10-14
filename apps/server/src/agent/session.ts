@@ -32,7 +32,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { AgentSession, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
@@ -305,6 +305,110 @@ export async function resolveConfiguredModelRef(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * 校验 pi 的 `auth.json` **形状**（不是内容安全，只看结构）。
+ *
+ * 为什么需要：形状错时 pi **不报错也不作答**（静默挂死），排查成本极高。
+ * 实测（backend-api 的四形状对照）：
+ * ```
+ * {"amr":{"type":"api_key","key":"…"}}                  → ❌ 静默挂死（25s 零帧 → E_PI_TIMEOUT）
+ * {"amr":{"type":"api_key","apiKey":"…"}}               → ❌ No API key found for amr
+ * {"amr":"<key>"}                                        → ⚠️ 不报错但零内容
+ * {"providers":{"amr":{"type":"api_key","key":"…"}}}    → ✅ 唯一可用形状
+ * ```
+ *
+ * 策略（保守，不误伤）：
+ * - 文件**不存在** → 放行（生产可能走 env / 其他凭据来源，不能替 pi 判死）
+ * - JSON 解析失败 → 拒绝（明确给解析错）
+ * - 有 `providers` 层：每个条目必须是对象且 `type` + `key` 齐备（`apiKey` 单独不算）
+ * - **没有 `providers` 层**（顶层直接是 provider 名）→ 拒绝（这就是静默挂死的那个形状）
+ * - 值是字符串（`{"amr":"sk-…"}`）→ 拒绝（不报错但零内容）
+ *
+ * ⚠️ 报错信息里**绝不含 key 值**。
+ */
+export function checkAuthShape(agentDir: string | undefined): { ok: boolean; problem?: string; note?: string } {
+  if (!agentDir) return { ok: true };
+  const authPath = join(agentDir, 'auth.json');
+  if (!existsSync(authPath)) return { ok: true, note: `未发现 auth.json（${authPath}）→ 交给 pi 自行解析凭据` };
+
+  let raw: string;
+  try {
+    raw = readFileSync(authPath, 'utf8');
+  } catch (err) {
+    return { ok: true, note: `auth.json 读取失败（${err instanceof Error ? err.message : String(err)}）→ 交给 pi 处理` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return {
+      ok: false,
+      problem: `pi 凭据文件形状不合法：${authPath} 不是合法 JSON（${err instanceof Error ? err.message : String(err)}）—— pi 在这种情况下会**静默挂死**（既不报错也不作答），请修正该文件`,
+    };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      problem: `pi 凭据文件形状不合法：${authPath} 顶层必须是对象（实际 ${Array.isArray(parsed) ? '数组' : typeof parsed}）`,
+    };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  const wrongShapeHint =
+    `${authPath} 需要这一形状：{"providers":{"<providerId>":{"type":"api_key","key":"<KEY>"}}}。` +
+    `实测：缺 providers 层会让 pi **静默挂死**（既不报错也不作答），只有 providers 包裹的形状可用`;
+
+  // 没有 providers 层：顶层直接写 provider → 就是会挂死的那个形状
+  if (!('providers' in obj)) {
+    const names = Object.keys(obj);
+    // 空的 `{}` 不拦（可能只是没写凭据，pi 会走 env）；但"有 provider 名却没 providers 层"要拦
+    if (names.length === 0) return { ok: true, note: `auth.json 为空对象（${authPath}）` };
+    return {
+      ok: false,
+      problem: `pi 凭据文件形状不合法：${authPath} 缺少 \`providers\` 层（发现顶层键：${names
+        .slice(0, 5)
+        .join(', ')}）。${wrongShapeHint}`,
+    };
+  }
+
+  const providers = obj.providers;
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
+    return { ok: false, problem: `pi 凭据文件形状不合法：${authPath} 的 \`providers\` 必须是对象。${wrongShapeHint}` };
+  }
+
+  for (const [id, entry] of Object.entries(providers as Record<string, unknown>)) {
+    if (typeof entry === 'string') {
+      return {
+        ok: false,
+        problem: `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 是字符串 —— 这种形状 pi 不报错但**不产生任何内容**。${wrongShapeHint}`,
+      };
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return {
+        ok: false,
+        problem: `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 必须是对象。${wrongShapeHint}`,
+      };
+    }
+    const cred = entry as Record<string, unknown>;
+    if (typeof cred.type !== 'string' || cred.type === '') {
+      return {
+        ok: false,
+        problem: `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 缺少 \`type\`（如 "api_key"）。${wrongShapeHint}`,
+      };
+    }
+    if (typeof cred.key !== 'string' || cred.key === '') {
+      const hadApiKey = typeof cred.apiKey === 'string' && cred.apiKey !== '';
+      return {
+        ok: false,
+        problem:
+          `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 缺少 \`key\`` +
+          `${hadApiKey ? '（写成 `apiKey` 不算 —— 实测 pi 会报 "No API key found"）' : ''}。${wrongShapeHint}`,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 /** 浏览器会话 id 校验（同时防止把 id 拼进文件路径） */const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -795,6 +899,20 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       throw new Error(`非法 session id：${sessionId}`);
     }
     if (this.opts.sessionFactory) return this.opts.sessionFactory(sessionId);
+
+    // ★ 前置校验**必须在加载 SDK 之前**：坏形状要"立刻"失败（~5ms），
+    //   而 SDK 动态 import 要 ~2s —— 学生等 2 秒才拿到一个配置错误是没必要的。
+    //   `auth.json` 形状不对时 pi **会静默挂死**（不是报错）。真机对照实验（backend-api 4 次定位）：
+    //     {"amr":{"type":"api_key","key":"…"}}              → 静默挂死（25s 零帧）
+    //     {"amr":"<key>"}                                    → 不报错但零内容
+    //     {"providers":{"amr":{"type":"api_key","key":"…"}}} → ✅ 唯一可用
+    const authCheck = checkAuthShape(this.agentDir);
+    if (!authCheck.ok) {
+      const err = new Error(authCheck.problem);
+      err.name = 'PiAuthShapeInvalid';
+      throw err;
+    }
+    if (authCheck.note) this.diagnostic(authCheck.note);
 
     const sdk = await this.sdkAvailable();
     if (!sdk.available) {

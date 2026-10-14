@@ -583,6 +583,7 @@ test('★ 跨调用事务：单发 BEGIN/COMMIT/ROLLBACK → **如实拒绝**（
       assert.match(String(e.hint), /multi/, `${sql} 必须指出可用路径（multi:true）`);
       assert.match(String(e.hint), /独立进程/, `${sql} hint 必须解释"为什么"（安全前提），不是"能力缺失"`);
       assert.equal(e.defense_in_depth, true, '标明这是纵深防御（worker 侧也已拒绝）');
+      assert.equal(e.interim, false, '★ 口径：不再是"过渡期"（worker 已同样拒绝）—— 显式 false，不是缺字段');
     }
 
     // ② 数据没有被"假回滚"骗到（我们根本没执行任何写）

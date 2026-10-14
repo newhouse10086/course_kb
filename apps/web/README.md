@@ -1,4 +1,4 @@
-# apps/web —— Vue3 + Vite 前端
+﻿# apps/web —— Vue3 + Vite 前端
 
 > **七个视图**：知识库（Wiki）/ 知识图谱 / 视频课堂 / pi 助教 / 文档管理 / **SQL 练习台** / **模型设置**
 > 契约：`docs/API_PROTOCOL.md`（REST §5 / SSE §6 / WebSocket §7.2）
@@ -60,24 +60,35 @@ npm test               # unit + e2e
 
 ## 3A. 接真后端（2026-10-15 实测）—— mock 与真实的差异清单
 
-真后端：`cd apps/server && npm run dev`（本机默认 `127.0.0.1:8787`；我验证时用 `COURSE_KB_PORT=8799` 另起实例，避免与 Lead 的进程抢端口）。
-前端接法：`npm run dev`（Vite 代理 `/api → 127.0.0.1:8787`）；无头测试用 `test/real_e2e.py`（自起"同源前端 + `/api` 反代"，真 cookie 才生效）。
+真后端：`cd apps/server && npm run dev`（默认 `127.0.0.1:8787`；验证时也可 `COURSE_KB_PORT=8799 npm start` 起一个**不带 --watch** 的稳定实例）。
+前端接法：`npm run dev`（Vite 代理 `/api → 127.0.0.1:8787`）；无头验证用 `test/real_e2e.py`（自起"同源前端 + `/api` 反代"，真 httpOnly cookie 才生效）。
 
-| # | 我 mock 的形状 | **真后端实测** | 前端怎么处理 |
+| # | 我 mock 的形状 | **真后端实测** | 前端怎么改的 |
 |---|---|---|---|
-| 1 | `{roles:[], permissions:[], authRequired}` | **`{user:{...,roles:[...]}, courses, can:"admin：可见全部"}`** —— roles 在 `user` 里，**没有 permissions[]** | 两处都读（`user.roles` 优先），缺一个也不会把教师误判成学生 |
-| 2 | 无登录流程 | **`POST /auth/login` → httpOnly cookie `ckb_session`**；未登录受保护接口 401 `E_UNAUTHENTICATED`（hint 指向登录接口） | 新增 `/login` 页；401 → 跳登录并记住 `next`；退出调 `/auth/logout` |
-| 3 | `/models`（8 个模型）、`/settings`、`/settings/llm/switch` | **全部 404 `E_NOTFOUND`（尚未实现）** | 页面显示「后端尚未实现」+ 需求出处，**收起切换控件**（不摆假界面） |
-| 4 | `/capabilities.sandbox = {engines, limits}` | **没有 `sandbox` 段**（响应里是 `"sandbox": null`，后端有钩子没实现） | 练习台显示「后端尚未提供 SQL 沙箱」+ 文档指向，**不渲染编辑器/结果表** |
-| 5 | `/sandbox/{datasets,session,execute,reset,ask}` | **404 `E_NOTFOUND`** | 同上；`loadDatasets()` 必须 try/catch（第一版没 catch → 异常冒泡，连报告都写不出来） |
-| 6 | `GET /tasks/{id}`（写死 mock 任务 id） | **`GET /tasks` 列表**才是真的（`{tasks:[{id,kind,status,progress,stage,detail,...}]}`）；`progress` 是 **0–1 比例** + `stage` 文案 | 设置页改为读列表 + 按 `kind` 过滤 LLM 任务；不再写死 id（那是我自己造的假前提） |
-| 7 | 文档列表有 `created_at/updated_at` | 真文档字段是 `{id,title,kind,source_path,size_bytes,page_count,lang,status,meta{uploaded_at,...}}` —— **没有顶层时间戳** | 排序回退为后端顺序（不伪造时间） |
-| 8 | `/capabilities` 即时返回 | **每次 7.3–8.4s**（4 次采样：7288/8360/7393ms；`pi.cached=true`、`worker.cached=true`，但 `pi.loadMs≈2941`、`model.latencyMs≈2549` 每次都跑） | ① 401 本身就是"要登录"的最快信号 → 不等 caps 也显示登录入口；② caps 未到时显示「能力接口加载中…（真探测较慢）」 |
-| 9 | 降级：整段 sandbox 缺失 | 真后端**两种降级要分清**：① 段缺失（没实现）② 段在但引擎 `available:false`（起不来） | 两种分别渲染不同文案（mock 也补齐了"段在但不可用"的用例） |
-| 10 | `/search?q=…` 在中文文档上命中 | 真后端 `/search` 支持 `doc_id` 过滤：**英文手册搜中文词 = 0 命中是正确行为** | 前端不特殊处理；但**换文档时清空上一次检索结果**（否则旧命中留在屏幕上，看着像"在新文档里搜到了"） |
-| 11 | `auth.bootstrap` 我 mock 成 `initialized` | 真后端也是 **`initialized`**（`admin/Admin2026lab` 登录成功）——Lead 看到的 `not_initialized` 在**当前 DB 上不可复现** | 无需处理；若别的实例仍报 `not_initialized`，那是那台实例的 DB 没有管理员 |
+| 1 | `{roles:[],permissions:[],authRequired}` | **`{user:{…,roles:[…]}, courses, can:"admin：可见全部"}`** —— roles 在 `user` 里，**没有 permissions[]** | 两处都读（`user.roles` 优先）；实测不改就会把教师误判成学生 |
+| 2 | 无登录流程 | `POST /auth/login` → **httpOnly cookie `ckb_session`**；未登录 401 `E_UNAUTHENTICATED` | 新增 `/login` 页 + 401 自动跳登录（`setUnauthenticatedHandler`）+ 退出 |
+| 3 | `auth.bootstrap` 我写死 initialized | 真后端也是 **`initialized`**，`admin/Admin2026lab` 可登录 → Lead 早期看到的 `not_initialized` **在当前 DB 不可复现** | 无需处理 |
+| 4 | `/models` 我自己编了 8 个模型 | **真的 8 个**，字段 `{id,providerId,runtime,configured,available,latencyMs,reason,active,fallback,sources,cached}` + 顶层 `activeModel/activeAvailable/probedAt/busy/fallbacks/concurrency`；`busy={busy,runningLlm,runningAll,pending,llmKinds,source}` | 模型表按真字段渲染；`busy` 作为"是否运行中"的**权威来源**；`switchedFrom/At` 改读 `/settings/llm` |
+| 5 | `/settings` 扁平 `{source,llm:{…}}` | **`{settings:{llm,sandbox,quota,hotReload}, meta:{source,path,revision,mtimeMs}}`** | client 里统一拍平成"扁平 + meta"，页面只写一种读法 |
+| 6 | 切换 3 种 mode 我编了响应 | 真后端：`now` 运行中 → **409 `E_MODEL_BUSY`**；探测失败 → **502 `E_MODEL_PROBE` + 回滚**；**`drain` 超时是 200 + `state:'timeout'`（=没切！）** | `state==='timeout'` 不当成功；502 后**重读 `/settings/llm`** 拿真实 activeModel |
+| 7 | 我自己编了 `student-course/sc` 数据集与 `student/course/sc` 表 | 真：默认 `sc`，表是 **`students/courses/enrollments`**；datasets 带 `description/tables/teachingPoints/dialectNotes` | 默认数据集读服务端 `default`；表清单读 **`schema.tables`**（`rows` + `columns[{name,type,pk,notnull,fk,default}]`）；方言读 `schema.dialect` |
+| 8 | `/sandbox/execute` 错误 `{code,msg}`，码 `E_SANDBOX_*` | 真：**恒 HTTP 200**，`{ok:false, columns, rows, rowCount, truncated, elapsedMs, statementKind, affected, dbBytes, hints, error?, killedBy?, hardKilled?, statements?}`；**`error.message`（不是 msg）**；码是 **`E_SQL_SYNTAX` / `E_SQL_NO_OBJECT` / `E_SQL_FORBIDDEN` / `E_SQL_PRAGMA` / `E_SQL_MULTI` / `E_SQL_TIMEOUT` / `E_SQL_UNSUPPORTED`** | 前端按真码/真字段渲染；mock 也改成同码（否则 mock 会教错形状） |
+| 9 | 我没实现 `error.who` | 真：`who ∈ {student, student_logic, rules, system, config, caller}` + `who_label` + `localReading` + `hint` + `localMatched` | **`who` 驱动三档话术**（写法问题 / 规则与设计约束 / 系统与配置）——徽标颜色、边框、措辞都不同（Lead 硬要求） |
+| 10 | 单条 `BEGIN/ROLLBACK` 我当成合法 | 真：**`E_SQL_UNSUPPORTED` + `who:'rules'`**（每次 execute 独立进程，跨调用无事务语义）；正确路径是 **`multi:true` 整批**，响应带 `statements[{index,kind,ok,affected,sql}]` | 加「整批执行（multi）」开关 + 多条 `;` 自动提示 + 逐条结果渲染 + 说明"为什么必须整批" |
+| 11 | `interim:true`（backend-api 文档） | 实测响应是 **`interim:false`**（同一码 `E_SQL_UNSUPPORTED`）→ 与 backend-api 消息不一致（**已上报**） | 条件渲染：只有 `interim===true` 才显示"有意约束"提示条 |
+| 12 | `/sandbox/ask` 帧名我自造 `progress/text/citation/done` | 真：**`open` / `frame` / `done` / `error`**；`frame` 是 pi 信封 `{type:'text_delta'|'message_end'|'error'|'settled'}`；`done` 带**全文 + citations**；**真会失败**（实测上游 `E_LLM 403`），并如实给"读不到引擎日志（logSource 未接入）" | 两套帧名都处理；`done.text` 作为权威全文；引用缺 href 时前端自己拼 `#/wiki?doc=…&unit=…&card=…`；显示"如实声明"与 `E_LLM` |
+| 13 | 会话每次新建、表随 reset 返回 | 真：session **按 (user,dataset) 持久**（sessionId 固定，DB 跨运行保留）；`reset` 只回 `{reset,schema}`；另有 `/sandbox/schema|history|logs|engines` | 自检**幂等化**（`DROP TABLE IF EXISTS` 再建）；reset/DDL 后用 `/sandbox/schema` 刷新表清单；"最近执行"优先用服务端 `history` |
+| 14 | `/capabilities` 即时返回 | **每次 7–14s**（无 TTL：`pi.loadMs≈2.9s` + 模型探测 ≈2.5s + 4 引擎探测 + FTS 计数）；`sandbox` 段新增 `transactions_cross_call:false` + `transactions_note` | ① 401 本身就是"要登录"的最快信号 → 不等 caps 也显示登录入口；② caps 未到时显示"能力接口加载中…（真探测较慢）"；③ 事务实验按 `transactions_cross_call` 引导整批 |
+| 15 | 文档字段带 `created_at` | 真：`{id,title,kind,source_path,size_bytes,page_count,lang,status,meta{uploaded_at,parse…}}`，**无顶层时间戳** | 排序回退为后端顺序（不伪造时间）；401 时显示"未登录（401）"而不是"还没有文档" |
+| 16 | 我 mock 的搜索总能命中 | 真 `/search` 支持 `doc_id` 过滤：**英文手册搜中文词 = 0 命中是正确行为** | 前端不特殊处理；但**换文档时清空上次检索结果**（否则旧命中留在屏幕上，看着像"在新文档里搜到了"） |
 
-**真数据下的空态（如实保留，未用 mock 美化）**：`/health` = `documents:2, units:2528, cards:0, entities:0, edges:0` → 知识库显示「知识点卡片 ×0」「本节暂无知识卡片」、内嵌图谱显示「0 节点 / 0 边：本单元暂无图谱实体（不是渲染失败）」、图谱页 0 节点、检索仍可用（中文样本文档 5 单元）。
+**真数据空态（如实保留，未用 mock 美化）**：`/health` = `documents:2, units:2528, cards:0, entities:0, edges:0`
+→ 知识库「知识点卡片 ×0」「本节暂无知识卡片」、内嵌图谱「0 节点 / 0 边：本单元暂无图谱实体（不是渲染失败）」、图谱页 0 节点；中文样本文档 5 单元、检索可用。
+
+**真后端下的环境事实（如实记录）**：
+- `tts/ocr` 不可用，原因是**缺环境变量**（页面逐字显示 `缺少 ALIYUN_AK / ALIYUN_SK / ALIYUN_APPKEY`）。
+- `/sandbox/ask` 的 LLM 上游当前 **403**（`E_LLM`）→ 答疑面板显示错误 + 后端"日志读不到"的如实声明，**不假装给出答案**；引用 0 张（因为没答成）。
+- `npm run dev` = `node --watch`：**队友改后端源码会重启进程** → 我的真后端 e2e 期间出现过 `ECONNREFUSED`（2s 窗口）。改用 `npm start`（8799，不带 watch）后 80/80 全绿 → **这是开发模式重启，不是崩溃**。
 
 ## 3B. 模型设置（教师 / admin）—— `docs/SETTINGS_AND_SANDBOX.md` §2
 
@@ -113,11 +124,12 @@ npm test               # unit + e2e
 ```powershell
 npm run typecheck   # vue-tsc：0 错
 npm run build       # vite：✓ built
-npm test            # Vitest 63/63 + headless Chrome DOM 断言 180/180（契约 mock）
-python test/real_e2e.py --backend http://127.0.0.1:8799   # 真后端 42/42（真 cookie 登录 + 真数据空态 + 未实现接口如实降级）
+npm test            # Vitest 63/63 + headless Chrome DOM 断言 186/186（契约 mock）
+python test/real_e2e.py --backend http://127.0.0.1:8799   # 真后端 80/80（登录/cookie、真 SQL CRUD、E_SQL_* + who、整批事务、答疑 SSE）
 python test/screenshots_real.py --backend http://127.0.0.1:8799  # 真后端截图 12 张（空态如实保留）
 npm run test:perf   # 真实体量性能数字
-python test/screenshots.py   # 14 张截图 + 对比度实测
+python test/screenshots.py   # 14 张（契约 mock）+ 对比度实测
+python test/screenshots_real.py --backend http://127.0.0.1:8799  # 12 张（真后端，空态如实）
 ```
 
 ### 4.1 为什么 e2e 驱动是 Python（**本机实测，不是偏好**）
@@ -141,7 +153,8 @@ python test/screenshots.py   # 14 张截图 + 对比度实测
 
 ## 5. 实测数字（本机）
 
-**测试**：`npm test` = Vitest 单测 **63/63** + headless Chrome DOM 断言 **180/180**（`npm run test:e2e`）。
+**测试**：`npm test` = Vitest 单测 **63/63** + 契约 mock 的 headless Chrome DOM 断言 **186/186**；
+**真后端** `python test/real_e2e.py --backend http://127.0.0.1:8799` = **80/80**（真 cookie 登录 + 真 SQL/真错误码/真答疑 + 如实降级）。
 新增页贡献：模型设置页 30 条（热切换状态机：409 拒绝 / 502 回滚 / 断点续推）、SQL 练习台 26 条（完整 CRUD / SQL 红线 / 答疑引用 / 截断明示 / 降级门控）、文档页真 multipart 上传 6 条。
 
 **图谱性能**（真实上游数据 1644 节点 / 481 边 / 66 flagged，headless Chromium，亮色）：
@@ -196,6 +209,8 @@ apps/web/
 - 合成时钟模式（`?simclock=1`）下 `media_check` 标 `skipped(simclock)` —— **N/A 不冒充通过**。
 - 图谱页"可见边"过滤是**排他**语义：只看 flagged 时可见边全部为 flagged（e2e 断言 `flagged_not_ok === 0`）。
 - 对话页 `set_model` 后端会回 `E_PI_CMD`（pi SDK 需要 Model 对象）→ 前端**不做模型下拉框**，只提供「新会话」。
+
+
 
 
 

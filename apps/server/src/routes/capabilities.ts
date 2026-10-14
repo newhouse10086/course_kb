@@ -121,12 +121,111 @@ function llmBlock(deps: AppDeps, caps: Record<string, unknown> | undefined): Rec
   };
 }
 
+/**
+ * `/capabilities` 的**短 TTL 缓存**。
+ *
+ * 为什么需要（web-ui 实测）：该端点无缓存时 **7–14s**（`pi.loadMs≈2.9s` + 模型真探测 ≈2.5s +
+ * 4 个引擎真探测 + FTS 计数）。首屏能力横幅等 7–14s，用户会以为页面卡住了。
+ *
+ * 诚实性要求（不能因为"要快"就假装是实时值）：
+ * - 命中缓存时响应里带 `cached:true` + `cached_age_ms` + `cache_ttl_ms`，UI/脚本能看出来
+ * - `?refresh=1`（或 `?deep=1`）**强制绕过缓存**重新探测
+ * - 只缓存**成功**的响应；出错不缓存（避免把一次故障钉在 TTL 里）
+ */
+const CAPS_TTL_MS = 15_000;
+
+/**
+ * 缓存命中时**必须实时重算**的字段（白名单）。
+ *
+ * ## 为什么要有这个白名单（这个 bug class 已踩**两次**）
+ * 加 15s 缓存是为了修"首屏 7–14s"，但缓存会**悄悄抵消**掉"某些字段承诺实时"的语义：
+ * 1. `auth.bootstrap` —— 语义是"实时反映库里有没有用户"（启动后 `create-admin` 建号要立刻变
+ *    `initialized`）。被缓存冻住 → 复活"启动瞬间快照"那个 bug。（kg-rag 抓到）
+ * 2. `retrieval.*.dataReady` —— 语义是"**当前**有没有数据"（抽完资料要立刻变 `true`）。
+ *    被缓存冻住 → 抽完后 15s 内仍显示"知识库为空 → 先去抽取" → **学生会重复去抽**。（kg-rag 实测）
+ *
+ * 三者共同点：**都是"当前状态"**，且都**极便宜**（`auth` 一次 COUNT；`retrieval.capabilities()`
+ * 实测 0.05ms；`settings` 读内存 store）—— 与"昂贵探测"（pi 加载 ≈2.9s / 模型探测 ≈2.5s /
+ * 4 引擎探测 / FTS 计数）差好几个数量级。
+ *
+ * **判据（写在这里防止第三次）**：加缓存/去重优化时，逐个字段问
+ * "这个字段承诺的是**实时**还是**快照**？" —— 承诺实时的，一律放进这里。
+ */
+const REALTIME_ON_CACHE_HIT = ['auth', 'settings', 'retrieval'] as const;
+
 export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): void {
+  let capsCache: { at: number; key: string; body: Record<string, unknown> } | null = null;
+
+  /** 构造白名单里那几个**实时**字段（缓存命中路径与主路径共用 → 两处语义不会漂）。 */
+  async function realtimeFields(): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {
+      auth: {
+        required: deps.auth.required,
+        bootstrap: deps.repo.rbac.countUsers() > 0 ? 'initialized' : 'not_initialized',
+      },
+    };
+    if (deps.settingsCapabilities) {
+      try {
+        out.settings = await deps.settingsCapabilities();
+      } catch (err) {
+        // 如实报"探测失败"（而不是省略字段 —— 省略会让前端分不清"没接入"和"探测失败"）
+        out.settings = {
+          available: false,
+          reason: `设置层探测失败：${redact(err instanceof Error ? err.message : String(err))}`,
+        };
+      }
+    } else {
+      out.settings = {
+        available: false,
+        reason: '设置层未接入（src/settings/** 或 routes/settings.ts 不可用）→ 模型选择走 providers.yaml/.env',
+        activeModel: null,
+      };
+    }
+    if (deps.retrieval?.capabilities) {
+      try {
+        out.retrieval = await deps.retrieval.capabilities();
+      } catch (err) {
+        out.retrieval = { registered: true, error: redact(err instanceof Error ? err.message : String(err)) };
+      }
+    } else {
+      out.retrieval = {
+        registered: false,
+        reason: '检索层未接入（src/retrieval/** 动态导入失败或未交付）→ chat 按 retrieval:none 走',
+        modes: {
+          none: { available: true, reason: '不检索' },
+          wiki: { available: false, reason: '检索层未接入' },
+          kg: { available: false, reason: '检索层未接入' },
+          rag: { available: false, reason: '检索层未接入' },
+        },
+      };
+    }
+    return out;
+  }
+
   app.get('/api/v1/capabilities', async (req, reply) => {
     try {
       const q = (req.query ?? {}) as Record<string, unknown>;
       // 默认深探测（诚实值）；`?deep=0` 走缓存求快
       const deep = q.deep !== '0' && q.deep !== 'false';
+      const cacheKey = deep ? 'deep' : 'shallow';
+      const forceRefresh = q.refresh === '1' || q.force === '1';
+
+      // ★ 短 TTL 缓存：命中就**如实标注** `cached:true` + 年龄（不假装是实时值）
+      // ⚠️ 但白名单里的字段（`REALTIME_ON_CACHE_HIT`）必须**每次实时重算** —— 见那里的注释
+      //   （这个 bug class 已踩两次：`auth.bootstrap` 一次、`retrieval.dataReady` 一次）
+      if (!forceRefresh && capsCache && capsCache.key === cacheKey) {
+        const age = Date.now() - capsCache.at;
+        if (age < CAPS_TTL_MS) {
+          return reply.send({
+            ...capsCache.body, // 只有**昂贵探测**（pi 加载 / 模型探测 / 4 引擎 / FTS 计数）走缓存
+            ...(await realtimeFields()), // ★ 承诺实时的字段：auth / settings / retrieval
+            cached: true,
+            cached_age_ms: age,
+            cache_ttl_ms: CAPS_TTL_MS,
+            realtime_fields: [...REALTIME_ON_CACHE_HIT],
+          });
+        }
+      }
 
       // worker：真 import 探测（缓存 300s）。走注入的探针，保证测试可控、生产为真执行
       deps.workerCapability = await deps.workerProbe(deep && q.force === '1');
@@ -165,27 +264,8 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
 
       const schema = schemaSummary(deps.enums);
 
-      // ④ 检索能力（逐模式**各自独立探测、独立上报**；未接入 → 如实说"未接入"）
-      //    ⚠️ 这里**不写死**"wiki 可用" —— 真值只能来自检索层自己的探测。
-      let retrieval: Record<string, unknown>;
-      if (deps.retrieval?.capabilities) {
-        try {
-          retrieval = await deps.retrieval.capabilities();
-        } catch (err) {
-          retrieval = { registered: true, error: redact(err instanceof Error ? err.message : String(err)) };
-        }
-      } else {
-        retrieval = {
-          registered: false,
-          reason: '检索层未接入（src/retrieval/** 动态导入失败或未交付）→ chat 按 retrieval:none 走',
-          modes: {
-            none: { available: true, reason: '不检索' },
-            wiki: { available: false, reason: '检索层未接入' },
-            kg: { available: false, reason: '检索层未接入' },
-            rag: { available: false, reason: '检索层未接入' },
-          },
-        };
-      }
+      // ④ 检索能力 / ⑤ 系统设置段：**由 `realtimeFields()` 统一构造**（见 `REALTIME_ON_CACHE_HIT`）——
+      //    这里不再各自算一遍，否则缓存命中路径与主路径就有**两处真相**，迟早漂。
 
       // ④ 学生 SQL 沙箱：逐引擎**真探测**（不可用必给 reason + 指向部署文档）
       let sandbox: Record<string, unknown>;
@@ -204,41 +284,17 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
         };
       }
 
-      // ⑤ 系统设置段：**如实**报当前生效模型与来源（未接入时也要说清"没有设置层"）
-      let settings: Record<string, unknown>;
-      if (deps.settingsCapabilities) {
-        try {
-          settings = await deps.settingsCapabilities();
-        } catch (err) {
-          settings = {
-            available: false,
-            reason: `设置层探测失败：${redact(err instanceof Error ? err.message : String(err))}`,
-          };
-        }
-      } else {
-        settings = {
-          available: false,
-          reason: '设置层未接入（src/settings/** 或 routes/settings.ts 不可用）→ 模型选择走 providers.yaml/.env',
-          activeModel: null,
-        };
-      }
+      // ⑤ 系统设置段：**由 `realtimeFields()` 统一构造**（同 ④，避免两处真相）
 
-      return reply.send({
+      const body = {
         version: SERVER_VERSION,        // ⓪ RBAC 自述（docs/RBAC.md §8）：UI 据此决定要不要显示登录页
-        //    `bootstrap` **每次请求实时计算**（语义 = "库里是否已有用户"）。
-        //    原实现把它固定在启动瞬间 → 启动后再用 `npm run create-admin` 建号仍报
-        //    `not_initialized`（误导）。现已改为实时判断。
-        auth: {
-          required: deps.auth.required,
-          bootstrap: deps.repo.rbac.countUsers() > 0 ? 'initialized' : 'not_initialized',
-        },
-        retrieval,
+        //   `auth` / `retrieval` / `settings` 三个字段与**缓存命中路径共用** `realtimeFields()`
+        //   （见 `REALTIME_ON_CACHE_HIT`）→ 两条路径的语义不会漂。
+        //   历史：`bootstrap` 曾在组装期算一次 → 建号后仍报 `not_initialized`（已修，并加了结构级守卫）。
+        ...(await realtimeFields()),
         // ④ 学生 SQL 沙箱：**真探测**（逐引擎 + 不可用必给 reason）——
         //    `sqlite` 永远可用；MySQL/PostgreSQL/openGauss 未部署 → 如实 false + 指向部署文档
         sandbox: sandbox,
-        // ⑤ 系统设置 / 模型热切换（数据由 video-pipeline 的 `settingsCapabilities` 提供）：
-        //    `activeModel`/`switchedFrom`/`switchedAt`/`settingsSource`/`lastReloadError`/`ignored[]`
-        settings: settings,
         // ① 解析能力：**来自 worker 的真探测**（worker 不可用 → 空数组 + worker.reason 说明）
         adapters: adaptersFromWorker(worker.available),
         // ② 契约 §5.1 的四个能力块（缺一个就是"假装可用"）
@@ -280,7 +336,10 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
           uploads: deps.cfg.uploadsDir,
           artifacts: deps.cfg.artifactsDir,
         },
-      });
+      };
+      // 只缓存**成功**的响应（出错不缓存，避免把一次故障钉在 TTL 里）
+      capsCache = { at: Date.now(), key: cacheKey, body };
+      return reply.send({ ...body, cached: false, cache_ttl_ms: CAPS_TTL_MS });
     } catch (err) {
       return sendError(reply, err);
     }

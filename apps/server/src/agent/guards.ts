@@ -121,6 +121,8 @@ export interface RetrievedHitLike {
   title?: string;
   snippet?: string;
   score?: number;
+  /** 可解释性（检索器给的一句话，如 DEPENDS_ON 1 跳：索引 → B+树）；会进 etrieval 帧的 why */
+  why?: string;
 }
 
 /**

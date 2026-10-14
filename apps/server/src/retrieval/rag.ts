@@ -85,11 +85,15 @@ export class RagRetriever implements Retriever {
   /**
    * 真探测：provider **与** 向量表都要就绪。
    * 顺序有讲究：先看表（便宜、本地），再看 provider。
+   *
+   * ★ `dataReady` = **向量表里有数据**（与 `ok` 正交；rag 的 `ok` 还要求 provider）。
    */
   async healthCheck(): Promise<RetrieverHealth> {
     const table = this.embeddingsTableState();
     const probes = await this.providerProbes();
     const usable = probes.filter((p) => p.available);
+    const dataReady = table.state === 'ready' && table.rows > 0;
+    const dataCount = table.state === 'ready' ? table.rows : 0;
 
     // 原因 1：provider（最根本的缺件）
     if (usable.length === 0) {
@@ -97,6 +101,8 @@ export class RagRetriever implements Retriever {
       const detail = first?.reason ?? (probes.length === 0 ? 'providers.embedding 为空' : '没有可用的 embedding provider');
       return {
         ok: false,
+        dataReady,
+        dataCount,
         reason:
           `未配置可用的 embedding provider（${detail}）；` +
           `向量表状态：${table.state === 'ready' ? `已有 ${table.rows} 行` : table.reason}。` +
@@ -107,14 +113,21 @@ export class RagRetriever implements Retriever {
     if (table.state === 'empty') {
       return {
         ok: false,
+        dataReady: false,
+        dataCount: 0,
         reason: `embedding provider（${usable.map((p) => p.id).join(', ')}）就绪，但${table.reason}`,
       };
     }
     // 原因 3：表缺失
     if (table.state === 'missing') {
-      return { ok: false, reason: table.reason };
+      return { ok: false, dataReady: false, dataCount: 0, reason: table.reason };
     }
-    return { ok: true, reason: `向量检索就绪：模型 ${table.models.join(', ')}，${table.rows} 行` };
+    return {
+      ok: true,
+      dataReady: true,
+      dataCount,
+      reason: `向量检索就绪：模型 ${table.models.join(', ')}，${table.rows} 行`,
+    };
   }
 
   /**
@@ -177,6 +190,9 @@ export class RagRetriever implements Retriever {
     const probes = await this.providerProbes();
     return {
       available: health.ok,
+      /** ★ 与 `available` 正交（见 types.ts 的 `RetrieverHealth`） */
+      dataReady: health.dataReady,
+      dataCount: health.dataCount,
       mode: 'rag',
       reason: health.reason ?? '',
       embedding_providers: probes.map((p) => ({ id: p.id, available: p.available, reason: p.reason ?? '' })),

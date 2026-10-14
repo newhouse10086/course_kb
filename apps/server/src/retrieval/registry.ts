@@ -326,29 +326,73 @@ export function formatContext(items: RetrievedItem[], mode?: string): string {
 // 能力自述（`/capabilities` 的 `retrieval` 段）
 // ═══════════════════════════════════════════════════════════════════════
 
-/** 逐模式真探测（**并行**：彼此独立，互不阻塞）。 */
+/**
+ * 逐模式真探测（**并行**：彼此独立，互不阻塞）。
+ *
+ * ★ 每个模式都同时报 **`available`（能力就绪）** 与 **`dataReady`（当前有数据）**。
+ * 二者**正交**，`reason` 必须让用户一眼看出是哪一种 —— 见 `types.ts` 的 `RetrieverHealth`。
+ * 特别是"能力就绪但库里没数据"这一态：**不能让 UI 显示成"可用"然后学生查什么都空**。
+ */
 export async function retrievalCapabilities(registry: Registry): Promise<Record<string, unknown>> {
   const modes = await Promise.all(
     (['wiki', 'kg', 'rag'] as const).map(async (m) => {
       const r = registry.get(m);
-      if (!r) return [m, { available: false, reason: `未注册 ${m} 检索器` }] as const;
+      if (!r) {
+        return [m, { available: false, dataReady: false, dataCount: 0, reason: `未注册 ${m} 检索器` }] as const;
+      }
       try {
         const h = await r.healthCheck();
-        return [m, { available: h.ok, reason: h.reason ?? '' }] as const;
+        return [
+          m,
+          {
+            available: h.ok,
+            dataReady: h.dataReady,
+            dataCount: h.dataCount,
+            reason: h.reason ?? '',
+          },
+        ] as const;
       } catch (err) {
-        return [m, { available: false, reason: `探测抛错：${err instanceof Error ? err.message : String(err)}` }] as const;
+        return [
+          m,
+          {
+            available: false,
+            dataReady: false,
+            dataCount: 0,
+            reason: `探测抛错：${err instanceof Error ? err.message : String(err)}`,
+          },
+        ] as const;
       }
     }),
   );
   const per: Record<string, unknown> = {};
   for (const [m, v] of modes) per[m] = v;
-  return {
+
+  /** 汇总：UI 可据此显示一条总提示，而不是自己拼三段。 */
+  const anyAvailable = modes.some(([, v]) => v.available);
+  const anyData = modes.some(([, v]) => v.dataReady);
+  const retrieval: Record<string, unknown> = {
     modes: ['none', 'wiki', 'kg', 'rag'],
     default: DEFAULT_RETRIEVAL_MODE,
-    /** ★ `none` 永远可用（不查库） */
-    none: { available: true, reason: '不检索（基线对照）' },
+    /** ★ `none` 永远可用、永远"有数据"（它不查库，不存在"空库"问题） */
+    none: { available: true, dataReady: true, dataCount: 0, reason: '不检索（基线对照）' },
     ...per,
+    /**
+     * 汇总态（**新增，供 UI 一句话提示**）：
+     * - `available && dataReady` → 正常
+     * - `available && !dataReady` → **去了能跑但查不到东西**（该提示"先抽取"）
+     * - `!available` → 能力不可用
+     */
+    summary: {
+      any_available: anyAvailable,
+      any_data: anyData,
+      /** 三种都"能力就绪但无数据" ⟹ 这份资料还没抽过 */
+      empty_kb: anyAvailable && !anyData,
+      hint: anyAvailable && !anyData
+        ? '检索能力已就绪，但知识库当前为空（未抽取）→ 先上传资料并跑抽取，否则任何检索都必然 0 命中'
+        : '',
+    },
     // 已验证常量，供 UI 展示"本次检索会用几条边、几跳"
     limits: { default_limit: DEFAULT_LIMIT, max_hops: 2, min_degree_for_page: 2 },
   };
+  return retrieval;
 }

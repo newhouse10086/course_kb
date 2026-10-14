@@ -17,7 +17,8 @@ async function load(force = false): Promise<CapsModel | null> {
   error.value = ''
   promise = (async () => {
     try {
-      const raw = await api.capabilities()
+      // `refresh=1` = 强制重探（真后端 15s TTL 缓存；点"重新探测"时必须绕过缓存）
+      const raw = await api.capabilities(force)
       caps.value = normalizeCapabilities(raw)
       return caps.value
     } catch (e) {

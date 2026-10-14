@@ -362,8 +362,11 @@ export class KgRetriever implements Retriever {
 
   /**
    * 真探测：查边表。
-   * 边表为空**不算不可用** —— 那只是"这份库还没有图谱"，是**可用的空结果**。
-   * 只有"查边表本身失败"（表不存在/迁移没跑）才是 `ok:false`。
+   *
+   * ★ **"能力就绪"与"当前有数据"必须分开报**（`ok` vs `dataReady`）：
+   * 表在、枚举已加载 ⟹ `ok:true`；但边 0 条 ⟹ **`dataReady:false`**。
+   * 二者合报会让前端显示"图谱检索可用"而学生查什么都空（接近"看起来可用"）。
+   * 无数据时 `reason` 必须说清"**必然 0 命中**"并指出下一步动作（去跑抽取）。
    *
    * ⚠️ 边类型枚举缺省（`deps.edgeTypes` 未注入）**不算不可用** ——
    * 此时用**图里实际观察到的类型**兜底（`observedEdgeTypes`），
@@ -373,24 +376,44 @@ export class KgRetriever implements Retriever {
    */
   async healthCheck(): Promise<RetrieverHealth> {
     try {
-      const row = this.deps.db.get<{ c: number }>('SELECT COUNT(*) AS c FROM edges');
+      const edgeCount = Number(this.deps.db.scalar<number>('SELECT COUNT(*) FROM edges') ?? 0);
       const types = this.deps.db.all<{ etype: string }>('SELECT DISTINCT etype FROM edges').map((r) => r.etype);
       const contract = this.edgeTypes();
       const effective = contract.length > 0 ? contract : types;
+      const dataReady = edgeCount > 0;
       if (effective.length === 0) {
         // 既没有契约枚举、图里也没有任何边 → 无从遍历，如实不可用
         return {
           ok: false,
+          dataReady: false,
+          dataCount: 0,
           reason: '图谱没有可遍历的边类型（edges 为空且读不到 contracts/schema/edge_types.json）',
         };
       }
       const source = contract.length > 0 ? `契约 ${contract.length} 种` : `图内观察 ${types.length} 种（未注入契约枚举）`;
+      if (!dataReady) {
+        return {
+          ok: true,
+          dataReady: false,
+          dataCount: 0,
+          reason:
+            `图遍历能力就绪（边类型 ${source}）；但**当前图谱为空（边 0 条）→ 检索必然 0 命中**。` +
+            '需先上传资料并跑抽取（POST /documents/:id/extract）生成实体与边。',
+        };
+      }
       return {
         ok: true,
-        reason: `图谱可用：边 ${Number(row?.c ?? 0)} 条，边类型 ${source}`,
+        dataReady: true,
+        dataCount: edgeCount,
+        reason: `图谱可用：边 ${edgeCount} 条，边类型 ${source}`,
       };
     } catch (err) {
-      return { ok: false, reason: `图谱不可用（edges 表读不到：${err instanceof Error ? err.message : String(err)}）` };
+      return {
+        ok: false,
+        dataReady: false,
+        dataCount: 0,
+        reason: `图谱不可用（edges 表读不到：${err instanceof Error ? err.message : String(err)}）`,
+      };
     }
   }
 

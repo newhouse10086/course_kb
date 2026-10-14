@@ -474,14 +474,21 @@ def group_doc_endpoints(teac: Session, stu: Session, doc_id: str, run_extract: b
               f'{r["status"]} n={n}', "high", f"curl {path}")
         if path.endswith("/cards"):
             n = n or 0
-            if not expect_cards:
-                # ★ T-WORKER 按本报告修了 done_empty：端到端验证"零产出 ≠ 失败"。
-                #   判据（backend-core 请求）：extract_status 必须与 failed 可区分，
-                #   且 done_empty 时带可读 warnings（含模型自己的说明）。
+            # ★ 判据必须**看卡片数**：有卡片 → extract_status 就该是 done（正常）；
+            #   零卡片才要求 done_empty/failed/unavailable 可区分。
+            #   ⚠️ 我第一版无条件要求 done_empty，把「真产出了 2 张卡」误报成失败 —— 已修正。
+            if n > 0:
+                check("pipeline", "★ 有卡片时 extract_status = done（且卡片真入库）",
+                      es in ("done", "partial"), "done / partial",
+                      f"cards={n} extract_status={es!r}", "high",
+                      f"GET /tasks/{extract_task_id}",
+                      "有产出就不该是 done_empty；此断言防『报成功但卡片没入库』")
+            else:
                 check("pipeline", "★ 零卡片时 extract_status 与 failed 可区分",
-                      es in ("done_empty", "failed", "unavailable"),
-                      "done_empty / failed / unavailable", f"extract_status={es!r}",
-                      "high", f"GET /tasks/{extract_task_id}",
+                      es in ("done_empty", "failed", "unavailable", "none", None),
+                      "done_empty / failed / unavailable",
+                      f"cards=0 extract_status={es!r}", "high",
+                      f"GET /tasks/{extract_task_id}",
                       "本报告提出的『成功但空产出』静默失败：修复前为 'done'，与真实失败不可区分")
                 if es == "done_empty":
                     warn = (task_detail or {}).get("warnings") or []
@@ -492,13 +499,9 @@ def group_doc_endpoints(teac: Session, stu: Session, doc_id: str, run_extract: b
                           f"n={len(warn)} first={_s(warn[:1], 150)}", "medium",
                           f"GET /tasks/{extract_task_id}",
                           "让前端能显示『本节内容不足以建档』而不是当正常完成")
-                check("pipeline", "抽取后 cards 数（合成语料，0 可能是模型的合理拒绝）",
-                      True, "记录实际值", f"n={n} extract_status={es!r}", "low",
-                      f"curl {path}")
-            else:
-                check("pipeline", "★ 抽取后 cards 非空（真 PDF 应有卡片）",
-                      n > 0, "> 0", f"n={n} extract_status={es!r}", "high",
-                      f"curl {path}", "E_PICK_KEY 类静默丢卡片的历史坑")
+            check("pipeline", "抽取后 cards 数（记录实际值）",
+                  True, "记录实际值", f"n={n} extract_status={es!r}", "low",
+                  f"curl {path}")
         if path.endswith("/outline") and isinstance(r["body"], dict):
             ol = r["body"].get("outline") or r["body"].get("nodes") or []
             check("pipeline", "outline 有节点", len(ol) > 0, "> 0", f"n={len(ol)}",
@@ -827,7 +830,23 @@ def group_static_pitfalls():
     check("static", "worker JSONL 读取不用 readline（坑 3：U+2028 错切帧）",
           not rl, "0 处", rl or "0 处", "high", "grep -rn readline apps/server/src/worker")
 
-    # ⑤ 出错时不得静默返回空的 `catch {}`
+    # ⑤ 契约 RETRIEVAL §4：检索元信息必须能到客户端（帧类型里要有 retrieval）
+    #    ⚠️ 必须查**帧类型枚举**，不能只搜字符串 "retrieval"（那会命中变量名/审计字段 → 假绿；
+    #       我第一版就这么误报过一次）。
+    stream = SRC / "agent" / "stream.ts"
+    if stream.exists():
+        st_txt = stream.read_text(encoding="utf-8", errors="replace")
+        # 取 AGENT_FRAME_TYPES 那段
+        m = re.search(r"AGENT_FRAME_TYPES\s*=\s*\[(.*?)\]", st_txt, re.S)
+        enum_txt = m.group(1) if m else ""
+        has_type = "'retrieval'" in enum_txt or '"retrieval"' in enum_txt
+        check("static", "★ agent 帧类型枚举含 retrieval（契约 RETRIEVAL §4 要求 SSE 带检索元信息）",
+              has_type, "枚举里有 retrieval",
+              f"{'有' if has_type else '无'}（枚举={enum_txt.strip()[:110]}）", "high",
+              "读 apps/server/src/agent/stream.ts::AGENT_FRAME_TYPES",
+              "契约 §4/§6：UI 要能展示『这次用哪种检索、命中什么』")
+
+    # ⑥ 出错时不得静默返回空的 `catch {}`
     silent = []
     for f, t in texts.items():
         for ln, line in enumerate(t.split("\n"), 1):

@@ -147,8 +147,36 @@ export interface Retrieved {
 // Retriever 接口 / 依赖
 // ═══════════════════════════════════════════════════════════════════════
 
+/**
+ * 探测结果 —— ★ **必须把"能力就绪"与"当前有数据"分开报**。
+ *
+ * ## 为什么必须分开（lead 裁定 + 本项目"如实降级"原则的延伸）
+ * 实测出现过这个组合：
+ * ```text
+ * /capabilities.retrieval.kg = { available: true, reason: "图谱可用：边 0 条…" }
+ * /health                    = cards: 0, entities: 0, edges: 0
+ * ```
+ * `available:true` 是**对的**（表在、12 种边类型已加载 ⟹ 图遍历能力就绪），
+ * 但前端会显示"图谱检索可用"而**学生查什么都空** ⟹ 接近"看起来可用"。
+ *
+ * ⟹ 拆成两个正交概念：
+ * - `ok`（对外 `available`）：**能力**是否就绪（表/枚举/迁移在不在）
+ * - `dataReady`：**当前是否真有数据**（能不能真的召回）
+ *
+ * 二者**四种组合都合法**，且 `reason` 必须说清是哪一种（见 `registry.ts` 的组装）：
+ * | ok | dataReady | 语义 |
+ * |---|---|---|
+ * | true | true | 正常可用 |
+ * | true | **false** | **能力就绪但暂无数据** → UI 显示"先去抽取"，而不是"坏了" |
+ * | false | false | 能力不可用（缺 provider / 缺表） |
+ * | false | true | 不该出现（有数据却探测失败）→ 要能暴露出来 |
+ */
 export interface RetrieverHealth {
   ok: boolean;
+  /** ★ 当前是否有数据（真查表/真探测得出，**不是**从 `ok` 推断） */
+  dataReady: boolean;
+  /** 数据的规模（`wiki`=索引行数、`kg`=边数、`rag`=向量行数）；无数据时为 0 */
+  dataCount: number;
   reason?: string;
 }
 

@@ -345,13 +345,15 @@ test('kg：契约外边类型被**如实标注**（枚举封闭，不静默忽�
   db.close();
 });
 
-test('kg：healthCheck 真探测（查 edges 表；空边不算不可用）', async () => {
+test('kg：healthCheck 真探测（空边 → 能力就绪但 dataReady:false，不是"不可用"）', async () => {
   const { db, repo } = fresh();
   const f = createRetrievalFacade({ db, repo, edgeTypes: ALL_12 });
   const caps = await f.capabilities();
-  const kg = caps.kg as { available: boolean; reason: string };
-  assert.equal(kg.available, true, '空边不叫不可用（只是这份库还没图）');
-  assert.match(kg.reason, /图谱可用/);
+  const kg = caps.kg as { available: boolean; dataReady: boolean; dataCount: number; reason: string };
+  assert.equal(kg.available, true, '空边不叫不可用（表在、枚举在 ⟹ 能力就绪）');
+  assert.equal(kg.dataReady, false, '★ 但没有数据 ⟹ dataReady:false（防"显示可用却查什么都空"）');
+  assert.equal(kg.dataCount, 0);
+  assert.match(kg.reason, /0 命中/, 'reason 要说清"必然 0 命中"并指出去跑抽取');
   db.close();
 });
 

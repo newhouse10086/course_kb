@@ -1088,6 +1088,31 @@ test('★ auth.bootstrap 实时反映"库里有没有用户"（启动后建号�
     );
     // 而且新账号**马上能登录**（不需要重启）
     assert.equal((await login(live, 'lateadmin', 'late-pass-12345')).status, 200);
+
+    /**
+     * ★ 结构级守卫（比"源码 grep"更强）：**把启动快照改成错的**，响应必须仍然正确。
+     *
+     * 这直接杀死"`bootstrap` 读 `deps.auth`（组装期算一次）"这类实现 ——
+     * 无论快照是何时被塞进 `deps` 的、也无论缓存怎么改：只要实现读了快照，下面两条就会红。
+     *
+     * 为什么需要它：这个 bug 出现过**两次**（一次是启动快照；一次是我给 `/capabilities` 加缓存时
+     * 把 `auth` 一起冻住）。**行为断言只覆盖"当时那条路径"** —— 与实现解耦的守卫才能防第三次。
+     */
+    const deps = live.built.deps as { auth: { required: boolean; bootstrap: string } };
+    deps.auth.bootstrap = 'not_initialized'; // 故意改错：库里明明有用户
+    const cached = await req(live, 'GET', '/api/v1/capabilities?deep=0'); // 走**缓存命中**路径
+    assert.equal(
+      (cached.body.auth as Record<string, unknown>).bootstrap,
+      'initialized',
+      '★ 缓存命中时也必须实时算（不能读 deps.auth 快照，也不能沿用缓存里的 auth）',
+    );
+    const refreshed = await req(live, 'GET', '/api/v1/capabilities?deep=0&refresh=1'); // 绕过缓存
+    assert.equal(
+      (refreshed.body.auth as Record<string, unknown>).bootstrap,
+      'initialized',
+      '★ 绕过缓存时同样必须是实时值（说明主路径也没读快照）',
+    );
+    assert.equal(deps.auth.required, true, 'required 是静态的（与 bootstrap 不同，不必实时）');
   } finally {
     await live.built.close();
   }
@@ -1126,6 +1151,73 @@ test('★ /capabilities 的 retrieval 段：逐模式独立上报；未接入时
       // 本次实测：wiki 依赖库里的文档 → 该测试库无文档时也必须**如实**说明（不是假装有结果）
       assert.equal(typeof entry('wiki')?.available, 'boolean');
     }
+  } finally {
+    await live.built.close();
+  }
+});
+
+test('★ 缓存命中时 auth/settings/retrieval 必须**实时**（HTTP 级：预热 → 写数据 → 再查）', async () => {
+  const live = await listen(await makeApp());
+  const db = (live.built.deps as unknown as { db: { run: (sql: string, ...p: unknown[]) => unknown } }).db;
+  try {
+    // ① 预热：写缓存（空库 → kg 必然"能力就绪但没数据"）
+    const warm = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal(warm.status, 200);
+    assert.equal(warm.body.cached, false, '首次必须是真探测（不是缓存）');
+    const kgOf = (b: Record<string, unknown>): Record<string, unknown> =>
+      (((b.retrieval as Record<string, unknown>)?.modes as Record<string, Record<string, unknown>>)?.kg ??
+        ((b.retrieval as Record<string, unknown>)?.kg as Record<string, unknown>)) as Record<string, unknown>;
+    assert.equal(kgOf(warm.body).dataReady, false, '空库必须如实 dataReady:false');
+    assert.equal(kgOf(warm.body).dataCount, 0);
+
+    // ② 写入**真实数据**（一条边 → kg 的 dataCount = `SELECT COUNT(*) FROM edges`）
+    const now = Date.now();
+    db.run(
+      "INSERT INTO documents (id,title,kind,source_path,status,created_at) VALUES ('doc_cache','缓存测试','pdf','x.pdf','ready',?)",
+      now,
+    );
+    db.run(
+      "INSERT INTO entities (id,doc_id,name,type,name_key) VALUES ('ent_a','doc_cache','A','概念','a'),('ent_b','doc_cache','B','概念','b')",
+    );
+    db.run(
+      "INSERT INTO edges (id,doc_id,src_id,dst_id,etype) VALUES ('edge_1','doc_cache','ent_a','ent_b','references')",
+    );
+
+    // ③ 立刻再查 → **必须命中缓存**（否则这条测试没验证到缓存路径），但状态类字段必须是**新值**
+    const hit = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal(hit.body.cached, true, '★ 这条测试必须走缓存命中路径（否则它守不住任何东西）');
+    assert.ok(Number(hit.body.cached_age_ms) >= 0);
+    assert.equal(
+      kgOf(hit.body).dataReady,
+      true,
+      '★ 缓存命中时 retrieval 也必须实时：抽完资料后 15s 内仍报"知识库为空"会让学生重复去抽',
+    );
+    assert.equal(kgOf(hit.body).dataCount, 1, '★ dataCount 必须是真的边数（1 条）');
+
+    // ④ 同一时刻：`auth.bootstrap` 与 `settings.activeModel` 也必须实时
+    assert.equal(
+      (hit.body.auth as Record<string, unknown>).bootstrap,
+      'initialized',
+      '★ auth 在缓存命中时也要实时（库里已有用户）',
+    );
+    assert.ok(
+      (hit.body.settings as Record<string, unknown>)?.activeModel !== undefined,
+      'settings 段必须存在（缓存命中时同样实时重算）',
+    );
+
+    // ⑤ 缓存命中路径与 `?refresh=1` 路径**不许漂**（同一个字段两处真相 = 迟早不一致）
+    const fresh = await req(live, 'GET', '/api/v1/capabilities?deep=0&refresh=1');
+    assert.equal(fresh.body.cached, false);
+    assert.equal(kgOf(fresh.body).dataReady, true);
+    assert.equal(kgOf(fresh.body).dataCount, 1);
+    assert.deepEqual(kgOf(fresh.body), kgOf(hit.body), '★ 两条路径的 retrieval 段必须逐字段一致');
+
+    // ⑥ 明确标注了"哪些字段实时"（新增字段时被迫做一次显式决定，见 AGENTS.md 坑 19）
+    assert.deepEqual(
+      hit.body.realtime_fields,
+      ['auth', 'settings', 'retrieval'],
+      '★ 白名单必须显式可见（这就是防止第 4 次踩坑的机制）',
+    );
   } finally {
     await live.built.close();
   }

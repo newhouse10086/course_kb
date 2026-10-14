@@ -80,6 +80,13 @@ function facadeFor(db: Db, repo: Repo) {
   return createRetrievalFacade({ db, repo, edgeTypes: undefined });
 }
 
+/** 契约的 12 种边类型（`contracts/schema/edge_types.json`）。 */
+const ALL_12 = [
+  'DEPENDS_ON', 'PART_OF', 'REALIZES', 'IMPLEMENTS', 'CONTRASTS_WITH', 'INSTANCE_OF',
+  'SCHEMA_PATTERN', 'USED_IN_ROLE', 'GOVERNED_BY', 'HISTORICAL_ORIGIN',
+  'COMMON_MISCONCEPTION', 'ASSESSED_BY',
+];
+
 // ═══════════════════════════════════════════════════════════════════════
 // 模式表达式规范化
 // ═══════════════════════════════════════════════════════════════════════
@@ -309,5 +316,85 @@ test('★ formatContext 门面：外部构造的**假锚点**同样被挡（不�
   assert.match(text, /真锚点/, '合法锚点必须保留');
   assert.doesNotMatch(text, /假锚点/, '★ page 0/0 必须被挡（这正是 as never 强转会放行的）');
   assert.doesNotMatch(text, /非法锚点/, '非法 kind 必须被挡');
+  db.close();
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ★ 一致性：available（能力就绪）与 dataReady（当前有数据）必须分开
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ 空知识库：wiki/kg 都必须 available:true + dataReady:false（不许显示成"可用"让人以为坏了）', async () => {
+  const db = Db.open(':memory:');
+  const repo = new Repo(db);
+  // ★ 用**真实部署形状**：契约枚举已加载（= lead 实测到的 "边类型 契约 12 种"），
+  //   但库里一条边都没有 —— 这正是需要区分 available / dataReady 的那个态。
+  const f = createRetrievalFacade({ db, repo, edgeTypes: ALL_12 });
+  const caps = (await f.capabilities()) as Record<string, Record<string, unknown>>;
+
+  for (const m of ['wiki', 'kg'] as const) {
+    const block = caps[m] as unknown as { available: boolean; dataReady: boolean; dataCount: number; reason: string };
+    assert.equal(block.available, true, `${m} 表/枚举在 ⟹ 能力就绪 = true`);
+    assert.equal(block.dataReady, false, `★ 空库时 ${m} 必须 dataReady:false`);
+    assert.equal(block.dataCount, 0, `${m} dataCount 必须是真探测出的 0`);
+    assert.match(block.reason, /0 命中/, `${m} reason 必须说清"必然 0 命中"（学生据此知道该去抽取）`);
+  }
+
+  // rag：provider 没有 ⟹ 能力不可用；数据也没有 ⟹ dataReady:false
+  const rag = caps.rag as unknown as { available: boolean; dataReady: boolean };
+  assert.equal(rag.available, false, 'rag 缺 provider ⟹ 能力不可用');
+  assert.equal(rag.dataReady, false, 'rag 向量表空 ⟹ dataReady:false');
+
+  // none 永远可用（它不查库，不存在"空库"问题）
+  const none = caps.none as unknown as { available: boolean; dataReady: boolean };
+  assert.equal(none.available, true);
+  assert.equal(none.dataReady, true, 'none 不查库 ⟹ 不存在"无数据"问题');
+
+  // ★ 汇总：UI 一句话就能提示"先抽取"
+  const summary = caps.summary as unknown as { any_available: boolean; any_data: boolean; empty_kb: boolean; hint: string };
+  assert.equal(summary.any_available, true, '有模式能力就绪');
+  assert.equal(summary.any_data, false, '但都没有数据');
+  assert.equal(summary.empty_kb, true, '★ 这正是"能力就绪但库是空的"那一态');
+  assert.match(summary.hint, /抽取/, 'hint 要指出下一步动作');
+  db.close();
+});
+
+test('★ 有数据后：wiki/kg 都 dataReady:true，且 dataCount 是真实条数', async () => {
+  const { db, repo } = await seedWithIndex();
+  // seed() 里已有图（3 条边）
+  const f = facadeFor(db, repo);
+  const caps = (await f.capabilities()) as Record<string, Record<string, unknown>>;
+
+  const wiki = caps.wiki as unknown as { available: boolean; dataReady: boolean; dataCount: number };
+  assert.equal(wiki.available, true);
+  assert.equal(wiki.dataReady, true, '★ 索引有行 ⟹ dataReady:true');
+  assert.ok(wiki.dataCount > 0, `wiki dataCount 必须是真索引行数，实测 ${wiki.dataCount}`);
+
+  const kg = caps.kg as unknown as { available: boolean; dataReady: boolean; dataCount: number; reason: string };
+  assert.equal(kg.available, true);
+  assert.equal(kg.dataReady, true, '★ 有边 ⟹ dataReady:true');
+  assert.equal(kg.dataCount, 3, `kg dataCount 必须是真实边数 3，实测 ${kg.dataCount}`);
+  assert.match(kg.reason, /图谱可用/, '有数据时 reason 不再说"必然 0 命中"');
+
+  const summary = caps.summary as unknown as { any_data: boolean; empty_kb: boolean };
+  assert.equal(summary.any_data, true);
+  assert.equal(summary.empty_kb, false, '有数据 ⟹ 不再是空库态');
+  db.close();
+});
+
+test('★ dataReady 正交性：rag 可以 dataReady:true 而 available:false（该态必须能暴露）', async () => {
+  // 直接插向量（模拟"表里有数据但 provider 没配"）—— 四种组合里最该被看见的一种
+  const db = Db.open(':memory:');
+  const repo = new Repo(db);
+  db.run(
+    'INSERT INTO embeddings(model,ref_kind,ref_id,dim,vector,created_at) VALUES(?,?,?,?,?,?)',
+    'test-model', 'card', 'crd_x', 3, Buffer.from([1, 2, 3]), Date.now(),
+  );
+  const f = facadeFor(db, repo);
+  const caps = (await f.capabilities()) as Record<string, Record<string, unknown>>;
+  const rag = caps.rag as unknown as { available: boolean; dataReady: boolean; dataCount: number };
+  assert.equal(rag.dataReady, true, '★ 向量表里有 1 行 ⟹ dataReady:true');
+  assert.equal(rag.dataCount, 1);
+  assert.equal(rag.available, false, 'provider 仍未配 ⟹ available:false');
+  // 两字段正交 ⟹ UI 不能只凭 available 推断数据状态
   db.close();
 });
