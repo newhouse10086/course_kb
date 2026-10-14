@@ -722,19 +722,42 @@ data: {"task_id":"tsk_1","error":"ASR model load failed","code":"E_ASR_LOAD"}
 **服务端 → 客户端**（**复用 pi 事件名**，见 §7.3 映射）：
 
 ```json
-{ "type":"ready",        "session_id":"pi_abc", "model":"…", "tools":["read","bash"] }
+{ "type":"ready",        "session_id":"pi_abc", "model":"…", "tools":["read","bash"],
+                         "agent_mode":"chat", "tools_source":"disabled-by-role" }
+{ "type":"context",      "used":{"doc_id":"doc_x","unit_id":"unt_y","page":3},
+                         "resolved":{"doc_title":"…","unit_title":"3.1 聚簇索引"},
+                         "dropped":[{"field":"unit_id","value":"unt_zzz","reason":"未找到或无权访问"}] }
 { "type":"retrieval",    "mode":"wiki", "status":"ok", "available":true, "hits":2,
                          "elapsedMs":1240, "why":["bigram 命中「聚簇索引」"],
                          "reason":"", "sources":[{"kind":"unit","ref_id":"unt_0001","title":"3.1 聚簇索引"}] }
 { "type":"text_delta",   "delta":"聚簇" }
 { "type":"thinking_delta","delta":"先确认…" }
-{ "type":"tool_start",   "id":"call_1", "tool":"read", "args":{...} }
+{ "type":"tool_start",   "id":"call_1", "tool":"kb_get", "args":{"ref_id":"crd_0042"} }
 { "type":"tool_update",  "id":"call_1", "partial":"…" }
 { "type":"tool_end",     "id":"call_1", "ok":true, "duration_ms":120 }
 { "type":"message_end",  "message":{...} }
 { "type":"settled",      "aborted":false }
 { "type":"error",        "code":"E_PI_EXIT", "msg":"pi process exited" }
 ```
+
+> **共 11 种帧**。每轮帧序：**`context → retrieval → tool_* → text_delta → settled`**
+> （`ready` 只在**会话建立 / 模式切换**时发）。
+>
+> **`agent_mode` vs `mode` —— 两个都叫"模式"但语义完全不同，不要混用**：
+> - `ready.agent_mode` = `'chat' | 'agent'` —— **能不能调用知识库只读工具**
+> - `ready.mode` = 执行模式（恒 `'sdk'`）—— 与 pi 的集成方式
+>
+> **`context` 帧（页面上下文）的三条硬约束**：
+> 1. **请求侧只接受 id，不收自由文本** —— 客户端不可信；服务端必须用知识库把 id
+>    解析成**真实标题/snippet** 再注入（与"客户端不许传检索 context 文本"同一原则）
+> 2. **`dropped` 非空必须如实回** —— 前端要显示"未找到你当前章节，已忽略"，**不许静默丢**
+> 3. **`session_id` 要按 `userId` 校验归属** —— 否则是一条跨用户读取路径
+>
+> **`context` 与 `retrieval` 正交**：`retrieval:'none'` 时 `context` 仍然存在 ——
+> 所以单开一帧，不塞进 `retrieval`（塞一起会让"我在看哪一页"与"查不查库"两个维度纠缠）。
+>
+> **`agent` 模式只给 `kb_search` / `kb_get`（只读知识库）**，
+> **绝不含 `bash`/`read`/`edit`/`write`** —— 危险工具仍由两道显式开关把关（见 §7.2 安全说明）。
 
 > **共 10 种帧**（原清单漏了 `retrieval` —— 由独立验收发现：契约 `RETRIEVAL.md` §4 要求它，
 > 而实现的服务端**已算出 `retrievalStatus`/`retrievalReason` 并写进 audit，却没发给客户端**，
