@@ -269,7 +269,7 @@ def main() -> int:
 
             # ============ 8. 真后端已实现：模型设置页（真模型表 + busy + 二次确认）============
             # 真后端自检要跑完整 CRUD/切换流程（几十秒）→ 等 selftest-report，不是只等页面 report
-            dom = nav('settings?selftest=1', "!!document.getElementById('selftest-report')", 300)
+            dom = nav('settings?selftest=1', "!!document.getElementById('selftest-report')", 420)
 
             def check_settings_real() -> None:
                 rep = report(dom, 'settings-report') or {}
@@ -301,7 +301,8 @@ def main() -> int:
             run_view('真后端 / 模型设置页（真模型表 + busy + 二次确认）', check_settings_real)
 
             # ============ 8b. 真后端已实现：SQL 练习台（真引擎 + 真 schema + 真 CRUD + 真错误码）============
-            dom = nav('lab?selftest=1', "!!document.getElementById('selftest-report')", 300)
+            # 真后端：自检要跑 10+ 条真 SQL（每条 0.3–3.4s）+ 真模型答疑（可达 180s）→ 给 600s
+            dom = nav('lab?selftest=1', "!!document.getElementById('selftest-report')", 600)
 
             def check_lab_real() -> None:
                 rep = report(dom, 'lab-report') or {}

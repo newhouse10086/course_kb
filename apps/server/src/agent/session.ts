@@ -84,9 +84,37 @@ export interface AgentManagerOptions {
   sessionDir?: string | null;
   /** 是否持久化（默认 true；`sessionDir === null` 时自动 ephemeral） */
   persist?: boolean;
-  /** 显式工具白名单（`null`/缺省 = 用 pi 默认；`[]` = 全关） */
+  /**
+   * 工具白名单（**默认 `[]` = 不给任何工具**，fail-safe）。
+   *
+   * ⚠️ 为什么默认必须是空：pi 不传 `tools` 时会用它自己的**默认全集**
+   * （实测 `["read","bash","edit","write"]`）。学生面向的 chat 一旦走这个默认，
+   * 学生只要说一句"用 bash 执行 X"，**服务器就真的执行并把输出贴回去** ——
+   * 独立验收在 live 8787 上用 `student` 角色复现了（还能 `read` 任意文件、`edit`/`write` 同在）。
+   * 这等于绕过整个 RBAC 与沙箱设计。
+   *
+   * - `[]`（默认）→ 显式关掉全部工具
+   * - `['read', 'search_kb']` → 只给白名单里这些
+   * - 想用 pi 的默认全集 → 必须**显式**开 `allowPiDefaultTools: true`（危险，仅限可信角色）
+   */
   tools?: string[] | null;
+  /**
+   * ★ 显式允许回落到 **pi 的默认工具全集**（`read`/`bash`/`edit`/`write`）。
+   *
+   * 默认 **false**（fail-safe）：不设置 `tools` 时我们传 `[]`，把工具关掉。
+   * 只有确实需要（例如管理员在本机使用的运维会话）才打开 —— 打开前后务必确认调用方已按角色收窄。
+   */
+  allowPiDefaultTools?: boolean;
   excludeTools?: string[];
+  /**
+   * ★ 允许白名单里出现 **危险内置工具**（`bash`/`edit`/`write`/`read`）。
+   *
+   * 默认 **false**：即使调用方显式列了这几个名字，也会被**丢出白名单**并记诊断。
+   * 理由（真事故）：`read`/`bash` 能读主机任意文件、执行任意命令 ——
+   * 学生面向的会话里出现任何一个，都等于绕过 RBAC 与 SQL 沙箱。
+   * 需要"读知识库原文"请给**专用只读工具**（如 `kb_read`），不要用主机 `read`。
+   */
+  allowDangerousTools?: boolean;
   thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   idleTtlMs?: number;
   settleGraceMs?: number;
@@ -409,6 +437,23 @@ export function checkAuthShape(agentDir: string | undefined): { ok: boolean; pro
     }
   }
   return { ok: true };
+}
+
+/** pi 内置的**危险工具**（主机文件读写 / 任意命令执行）。默认一律拒之门外。 */
+export const DANGEROUS_PI_TOOLS = ['bash', 'edit', 'write', 'read'] as const;
+
+/**
+ * 过滤工具白名单：默认把危险内置工具踢掉（除非调用方显式 `allowDangerousTools`）。
+ * 返回 `{ tools, dropped }`；`dropped` 要记诊断（**不许静默**）。
+ */
+export function sanitizeToolList(
+  tools: readonly string[],
+  allowDangerous: boolean,
+): { tools: string[]; dropped: string[] } {
+  if (allowDangerous) return { tools: [...tools], dropped: [] };
+  const dangerous = new Set<string>(DANGEROUS_PI_TOOLS);
+  const dropped = tools.filter((t) => dangerous.has(t));
+  return { tools: tools.filter((t) => !dangerous.has(t)), dropped };
 }
 
 /** 浏览器会话 id 校验（同时防止把 id 拼进文件路径） */const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -849,16 +894,25 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   readonly cwd: string;
   readonly agentDir: string | undefined;
   readonly sessionDir: string | null;
-  readonly toolsSource: 'explicit' | 'none';
+  /** 工具从哪来：explicit（我们显式给的，含默认的空集）/ pi-default（**仅当显式放行**） */
+  readonly toolsSource: 'explicit' | 'pi-default';
   readonly idleTtlMs: number;
   readonly settleGraceMs: number;
 
   private readonly sessions = new Map<string, ManagedAgentSession>();
   private readonly opts: AgentManagerOptions;
-  private readonly tools: string[] | null;
+  private readonly toolsConfig: string[] | null;
+  private readonly allowPiDefaultTools: boolean;
   private readonly excludeTools: string[] | undefined;
   private readonly onDiagnostic: (message: string) => void;
   private reaper: NodeJS.Timeout | null = null;
+  /** 每个会话本次实际用的工具集（诊断/审计用） */
+  private readonly lastToolsFor = new Map<string, string[] | null>();
+
+  /** 新会话会用的工具白名单（`null` = pi 默认全集）。`/capabilities` 如实上报要用它。 */
+  get tools(): string[] | null {
+    return this.toolsConfig;
+  }
 
   /** 本轮硬超时（会话层用；没配就用默认 120s） */
   get promptTimeoutMs(): number {
@@ -869,9 +923,33 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     this.opts = opts;
     this.cwd = opts.cwd ?? defaultCwd();
     this.agentDir = opts.agentDir;
-    this.tools = opts.tools ?? null;
+    // ★ fail-safe 默认：不显式配置 = **不给任何工具**。
+    //
+    //   真事故（独立验收在 live 8787 用 student 角色复现）：原实现把"没配 tools"当成
+    //   "用 pi 默认"，而 pi 的默认是 `["read","bash","edit","write"]` —— 学生说一句
+    //   "用 bash 执行 X"，服务器就真的执行并把输出贴回去；还能 read 主机任意文件。
+    //   实测（真 SDK，`getActiveToolNames()`）：
+    //     不传 tools → ["read","bash","edit","write"]   ← 危险默认
+    //     tools: []  → []                               ← 空数组确实是"无工具"
+    //   所以这里默认就是 `[]`；要 pi 默认全集必须显式 `allowPiDefaultTools: true`。
+    this.allowPiDefaultTools = opts.allowPiDefaultTools === true;
+    const explicitTools = opts.tools ?? null;
+    if (explicitTools === null) {
+      this.toolsConfig = this.allowPiDefaultTools ? null : [];
+    } else {
+      const cleaned = sanitizeToolList(explicitTools, opts.allowDangerousTools === true);
+      if (cleaned.dropped.length > 0) {
+        (opts.onDiagnostic ?? (() => {}))(
+          `工具白名单里的危险内置工具已被移除：${cleaned.dropped.join(', ')}` +
+            `（read/bash 可读主机文件、执行任意命令；要读知识库请用专用只读工具，确需放开请显式 allowDangerousTools:true）`,
+        );
+      }
+      this.toolsConfig = cleaned.tools;
+    }
+    // ★ 诚实的来源标注：原实现把"没配"标成 'none'（读起来像"没有工具"），
+    //   而实际是 pi 的默认全集 —— 那个自相矛盾的信号（tools=[read,bash…] 而 source='none'）就是事故线索。
+    this.toolsSource = this.toolsConfig === null ? 'pi-default' : 'explicit';
     this.excludeTools = opts.excludeTools;
-    this.toolsSource = this.tools !== null ? 'explicit' : 'none';
     this.idleTtlMs = opts.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
     this.settleGraceMs = opts.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
     this.onDiagnostic = opts.onDiagnostic ?? (() => {});
@@ -894,7 +972,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   }
 
   /** 造一个 SDK 会话（真路径）。测试可注入 `sessionFactory` 完全绕过。 */
-  async createInit(sessionId: string): Promise<SessionInit> {
+  async createInit(sessionId: string, perSessionTools?: string[] | null): Promise<SessionInit> {
     if (!isValidSessionId(sessionId)) {
       throw new Error(`非法 session id：${sessionId}`);
     }
@@ -989,7 +1067,8 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       sessionManager: sessionManager as CreateAgentSessionOptions['sessionManager'],
     };
     if (this.agentDir) options.agentDir = this.agentDir;
-    if (this.tools !== null) options.tools = this.tools;
+    const effectiveTools = perSessionTools !== undefined ? perSessionTools : this.toolsConfig;
+    if (effectiveTools !== null) options.tools = effectiveTools;
     if (this.excludeTools) options.excludeTools = this.excludeTools;
     if (this.opts.thinkingLevel) options.thinkingLevel = this.opts.thinkingLevel;
 
@@ -1089,13 +1168,30 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   }
 
   /** 取会话（同 id 复用；已 dispose 则重建）。 */
-  async getOrCreate(sessionId: string): Promise<ManagedAgentSession> {
+  async getOrCreate(sessionId: string, init?: { tools?: string[] }): Promise<ManagedAgentSession> {
     const existing = this.sessions.get(sessionId);
     if (existing && !existing.disposed) {
+      // 已存在的会话保持原有工具集（避免半个会话中途换工具）。若请求的不同，记诊断说明**没生效**。
+      if (init?.tools && this.lastToolsFor.get(sessionId)?.join(',') !== init.tools.join(',')) {
+        this.diagnostic(
+          `会话 ${sessionId} 已存在，忽略本次工具白名单变更（原：${(this.lastToolsFor.get(sessionId) ?? []).join(',') || '无'}；` +
+            `请求：${init.tools.join(',') || '无'}）—— 换工具集请新建会话`,
+        );
+      }
       return existing;
     }
-    const init = await this.createInit(sessionId);
-    const session = new ManagedAgentSession(sessionId, this, init);
+    // ★ 按会话（= 按角色）的工具白名单：**只在创建时生效**。
+    //   危险内置工具仍会被过滤（除非 allowDangerousTools 显式放行）。
+    const perTools = init?.tools
+      ? sanitizeToolList(init.tools, this.opts.allowDangerousTools === true)
+      : null;
+    if (perTools && perTools.dropped.length > 0) {
+      this.diagnostic(`会话 ${sessionId} 请求的危险工具已被移除：${perTools.dropped.join(', ')}`);
+    }
+    const effectiveTools: string[] | null = perTools ? perTools.tools : this.toolsConfig;
+    this.lastToolsFor.set(sessionId, effectiveTools);
+    const created = await this.createInit(sessionId, effectiveTools);
+    const session = new ManagedAgentSession(sessionId, this, created);
     this.sessions.set(sessionId, session);
     return session;
   }

@@ -42,6 +42,112 @@ const ADMIN_PASS = 'chat-pass-12345';
 let authCookie: string | null = null;
 
 /**
+ * ★★ 安全回归：**只有 admin 能拿到 agent 工具**（`read`/`bash`/`edit`/`write`）。
+ *
+ * ## 为什么要这条（polysemy-prober live 复现的 critical）
+ * 学生连上后 `ready.tools = ["read","bash","edit","write"]` —— 直接拿到**服务器 shell**：
+ * 绕过 RBAC（`RBAC.md §1` 没有"执行命令"）、绕过整个 SQL 沙箱（用 `bash` 跑 `sqlite3` 从旁边绕），
+ * 还能读任意文件（实测读到 `C:\Windows\win.ini`）。
+ *
+ * 这里断言**服务端策略**：工厂收到的 `allowTools` 必须按**服务端身份**判定
+ * （`teacher`/`student` → false，`admin` → true），且**客户端无法影响它**
+ * （帧里塞 `roles`/`allowTools` 都不许改变结果 —— 与"客户端不许传检索 context"同一条原则）。
+ *
+ * 注：agent 层"真的不注册工具"由 pi-bridge 的测试覆盖；本条守的是**判定与传递**这一环。
+ */
+test('★★ 安全：仅 admin 允许 agent 工具；student/teacher 一律 false（服务端权威，客户端伪造无效）', async () => {
+  const seen: { user: unknown; allowTools: unknown }[] = [];
+  const spyFactory: ChatConnectionFactory = async (opts) => {
+    seen.push({ user: opts.user, allowTools: opts.allowTools });
+    return {
+      async handleClientMessage() {
+        /* noop */
+      },
+      async close() {
+        /* noop */
+      },
+    };
+  };
+  const built = await makeApp(spyFactory);
+  const wsBase = await listen(built); // ⚠️ 本文件的 listen() 返回的是 **ws://** 基址
+  const httpBase = wsBase.replace(/^ws/, 'http');
+  try {
+    // admin 建号：一个 student、一个 teacher
+    for (const [name, role] of [
+      ['sec-stu', 'student'],
+      ['sec-tea', 'teacher'],
+    ] as const) {
+      const res = await fetch(`${httpBase}/api/v1/users`, {
+        method: 'POST',
+        headers: { cookie: authCookie!, 'content-type': 'application/json' },
+        body: JSON.stringify({ username: name, password: 'sec-pass-12345', roles: [role] }),
+      });
+      assert.ok(res.status === 200 || res.status === 201, `建号 ${name} 失败：${res.status} ${await res.text()}`);
+    }
+
+    const connectAs = async (name: string): Promise<Record<string, unknown>[]> => {
+      const login = await fetch(`${httpBase}/api/v1/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: name, password: 'sec-pass-12345' }),
+      });
+      const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+      assert.equal(login.status, 200, `${name} 登录失败`);
+      const before = seen.length;
+      const ws = new WebSocket(`${wsBase}/api/v1/chat/sec-${name}`, { headers: { cookie } });
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener('open', () => {
+          // ★ 客户端**伪造**角色与 allowTools：服务端必须无视
+          ws.send(JSON.stringify({ type: 'prompt', message: 'hi', roles: ['admin'], allowTools: true, user: { roles: ['admin'] } }));
+          setTimeout(() => {
+            try {
+              ws.close();
+            } catch {
+              /* ignore */
+            }
+            resolve();
+          }, 250);
+        });
+        ws.addEventListener('error', () => reject(new Error(`${name} WS 连接失败`)));
+      });
+      assert.equal(seen.length, before + 1, `${name} 应触发一次工厂调用`);
+      return seen.slice(before);
+    };
+
+    const stu = await connectAs('sec-stu');
+    const stu0 = stu[0]!;
+    assert.equal(stu0.allowTools, false, '★★ student 绝不许拿工具（服务器 shell = 绕过 RBAC + 沙箱）');
+    assert.deepEqual((stu0.user as { roles: string[] }).roles, ['student'], '角色必须是**服务端**解出的，不是帧里的');
+
+    const tea = await connectAs('sec-tea');
+    assert.equal(tea[0]!.allowTools, false, '★★ teacher 也不许（教学场景不需要服务器 shell）');
+
+    // admin：允许（管理员本来就有服务器权限，工具不扩大其权力）
+    const adminSeenBefore = seen.length;
+    const wsAdmin = new WebSocket(`${wsBase}/api/v1/chat/sec-admin`, {
+      headers: { cookie: authCookie! },
+    });
+    await new Promise<void>((resolve, reject) => {
+      wsAdmin.addEventListener('open', () => {
+        setTimeout(() => {
+          try {
+            wsAdmin.close();
+          } catch {
+            /* ignore */
+          }
+          resolve();
+        }, 250);
+      });
+      wsAdmin.addEventListener('error', () => reject(new Error('admin WS 连接失败')));
+    });
+    assert.equal(seen.length, adminSeenBefore + 1);
+    assert.equal(seen[seen.length - 1]!.allowTools, true, 'admin 应允许工具');
+  } finally {
+    await built.close();
+  }
+});
+
+/**
  * 回归：**连接就绪前到达的客户端帧不许丢**。
  *
  * 原 bug（polysemy-prober 的"180s 零帧"）：`socket.on('message')` 在

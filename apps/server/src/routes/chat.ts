@@ -101,6 +101,23 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
         //   客户端只能传模式名（`retrieval`），不许传 context 文本 —— pi-bridge 已在帧层拒绝
         retrieval: deps.retrieval ?? null,
         user: user ? { id: user.id, roles: user.roles } : null,
+        /**
+         * ★★ **仅 admin 可给 agent 工具**（`read`/`bash`/`edit`/`write`）—— 安全边界，不是体验选项。
+         *
+         * ## 为什么（polysemy-prober live 复现的 critical）
+         * 原先 `tools_source` 报 `"none"`（代码以为关了工具），但 pi 实际用了**默认全集**：
+         * 学生连上后 `ready.tools = ["read","bash","edit","write"]` → 直接拿到服务器 **shell**：
+         * - **绕过整个 RBAC**（`RBAC.md §1` 的学生能力里没有"在服务器执行命令"）
+         * - **绕过 SQL 沙箱**：我们辛苦做的禁 ATTACH/多语句、独立库、路径限制、硬超时、跨学生隔离，
+         *   全都可以用 `bash` 跑 `sqlite3` CLI 从旁边绕过去
+         * - 还能读服务器任意文件（实测读到了 `C:\Windows\win.ini`）
+         *
+         * ## 判定规则（**服务端权威**）
+         * `roles` 来自 `req.user`（会话令牌解出的身份），**绝不从客户端帧里读** ——
+         * 与"不许客户端传检索 context 文本"同一条原则（那类伪造我们已修过一次）。
+         * `teacher`/`student` → `false`；`admin` → `true`（管理员本来就有服务器权限，工具不扩大其权力）。
+         */
+        allowTools: Array.isArray(user?.roles) && user.roles.includes('admin'),
         // 每轮回答的审计（教学场景留痕）：三档引用校验 + 检索状态
         onAnswerAudit: (a) => {
           try {

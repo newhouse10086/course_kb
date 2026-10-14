@@ -40,7 +40,7 @@ class FakeSession implements ChatSessionLike {
   }
   readyFrame(): ReadyFrame {
     return {
-      type: 'ready', session_id: this.id, model: null, tools: [], tools_source: 'none', version: null,
+      type: 'ready', session_id: this.id, model: null, tools: [], tools_source: 'explicit', version: null,
       mode: 'sdk', persistence: 'ephemeral', persistence_reason: '测试', session_file: null,
       pi_session_id: null, thinking_level: null, restarted: false,
     };

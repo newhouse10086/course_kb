@@ -846,6 +846,22 @@ def group_static_pitfalls():
               "读 apps/server/src/agent/stream.ts::AGENT_FRAME_TYPES",
               "契约 §4/§6：UI 要能展示『这次用哪种检索、命中什么』")
 
+    # ⑦ ★ 学生角色不得拿到执行类工具（bash/read/edit/write）—— 本轮发现 6（critical）
+    #    纯静态查不到（tools 由 pi 全局默认提供），只能查代码是否**显式**传了 tools。
+    if stream.exists():
+        st_txt = stream.read_text(encoding="utf-8", errors="replace")
+        # createAgentSession 的 options 里是否显式设了 tools（空数组也算显式关闭）
+        explicit_tools = re.search(r"\btools\s*:\s*(\[\]|null|opts\.tools|this\.tools)", st_txt)
+        check("security", "★ agent 会话**显式**设置 tools（不依赖 pi 全局默认）",
+              bool(explicit_tools), "显式 tools: []",
+              f"{explicit_tools.group(0) if explicit_tools else '未找到显式赋值'}", "critical",
+              "读 apps/server/src/agent/stream.ts + session.ts",
+              "本轮发现 6：学生 chat 拿到 read/bash/edit/write 并**真执行了 shell**；"
+              "ready.tools 报 4 个而 tools_source='none' 自相矛盾 → 说明未真正传下去")
+        # tools_source 与实际 tools 必须自洽
+        m_src = re.search(r"tools_source\s*[:(]\s*['\"](\w+)['\"]", st_txt)
+        p("     （提示：运行时请断言 student 的 ready.tools == []）")
+
     # ⑥ 出错时不得静默返回空的 `catch {}`
     silent = []
     for f, t in texts.items():

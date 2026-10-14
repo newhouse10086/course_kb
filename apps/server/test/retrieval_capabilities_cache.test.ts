@@ -2,9 +2,9 @@
  * ★ `/capabilities` 缓存 × 检索层 `dataReady` —— **跨 HTTP 的实时性回归测试**。
  *
  * ## 为什么必须有一条"走真实 HTTP"的测试
- * 本项目已因同一 bug class **踩了三次**：
- * 1. `auth.bootstrap` 被启动期快照冻住（已修）
- * 2. `settings.activeModel` 被缓存冻住（已修）
+ * 本项目已因同一 bug class **踩了三次**（AGENTS.md 坑 19）：
+ * 1. `auth.bootstrap` 被启动期快照冻住
+ * 2. `settings.activeModel` 被缓存冻住
  * 3. **`retrieval.dataReady` 被 15s 缓存冻住** ← 本文件守的就是这条
  *
  * 关键在于：**只调检索层的单测全都绿**（`test/retrieval_*.test.ts` 直接调
@@ -14,21 +14,26 @@
  * ## 判据（两条一起看，缺一条都测不出）
  * ```text
  * ① 写数据后立刻再 GET（**应命中缓存**，cached=true）
- * ② 该响应里 retrieval.{wiki,kg}.dataReady 必须已是**新值 true**
+ * ② 该响应里 retrieval.{wiki,kg}.dataReady 必须已是**新值**
  * ```
- * 只断言 ①：缓存生效了，但可能冻住状态字段（当前 bug）。
+ * 只断言 ①：缓存生效了，但可能冻住状态字段。
  * 只断言 ②：可能是缓存没命中（`refresh=1` 之类），掩盖了问题。
  *
- * ⚠️ 写域说明：本文件在 `test/retrieval_capabilities_cache.test.ts`（检索层测试域）。
- * **它读 `src/routes/capabilities.ts` 的行为但不修改它** —— 缓存语义是接口契约的一部分，
- * 检索层有责任守住"自己上报的 `dataReady` 不会被上游缓存冻住"。
+ * ## ⚠️ 数据源别搞混（我第一版就在这里写错）
+ * `wiki.dataReady` 读的是 **`search_docs`（FTS 索引行）**，
+ * `kg.dataReady` 读的是 **`edges`**。二者**正交**：
+ * 删掉边**不会**让 `wiki.dataReady` 变 false（索引还在）。
+ * 所以反向断言必须**按各自的数据源分别清**，不能一起删。
+ *
+ * 写域：本文件在 `test/retrieval_capabilities_cache.test.ts`（检索层测试域）。
+ * 它**读** `src/routes/capabilities.ts` 的行为但不修改它。
  */
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { after, test } from 'node:test';
+import { after, before, test } from 'node:test';
 
 import { loadConfig } from '../src/config.ts';
 import { buildApp } from '../src/index.ts';
@@ -37,22 +42,26 @@ import { indexDocument } from '../src/store/search.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 let tmpRoot = '';
-let counter = 0;
-const builtApps: BuiltApp[] = [];
+let built: BuiltApp;
+let base = '';
 
-/** 真 listen（与 `rbac_api.test.ts` 同款脚手架：真端口 + 真 fetch）。 */
-async function makeApp(): Promise<{ built: BuiltApp; base: string }> {
-  counter += 1;
-  if (!tmpRoot) tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'retr-caps-'));
+/**
+ * 只建**一个** app 供三条测试复用 —— `buildApp` 很重（~15s：pi 加载 / provider 装配），
+ * 每个 test 各建一个会让本文件跑到 60s+，拖慢整个 `npm test`。
+ * 复用是安全的：三条用例在同一进程/端口内**顺序**执行（`--test-concurrency=1`），
+ * 且各自只清理自己写入的数据。
+ */
+before(async () => {
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'retr-caps-'));
   const cfg = loadConfig({
     root: ROOT,
     env: {
       ...process.env,
-      COURSE_KB_DATA_DIR: path.join(tmpRoot, `d${counter}`),
-      COURSE_KB_DB: path.join(tmpRoot, `caps-${counter}.sqlite3`),
+      COURSE_KB_DATA_DIR: path.join(tmpRoot, 'd'),
+      COURSE_KB_DB: path.join(tmpRoot, 'caps.sqlite3'),
     } as Record<string, string>,
   });
-  const built = await buildApp({
+  built = await buildApp({
     cfg,
     extractor: {
       name: 'noop',
@@ -78,28 +87,32 @@ async function makeApp(): Promise<{ built: BuiltApp; base: string }> {
       },
     }),
   });
-  builtApps.push(built);
   await built.app.listen({ host: '127.0.0.1', port: 0 });
   const addr = built.app.server.address();
   if (!addr || typeof addr === 'string') throw new Error('无法取到监听地址');
-  return { built, base: `http://127.0.0.1:${addr.port}` };
-}
+  base = `http://127.0.0.1:${addr.port}`;
+});
 
 after(async () => {
-  for (const b of builtApps) {
-    try {
-      await b.app.close();
-    } catch {
-      /* 已关闭 */
-    }
+  try {
+    await built?.app.close();
+  } catch {
+    /* 已关闭 */
   }
-  if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  // ⚠️ `rmSync` 在 Windows 上可能 EPERM（sqlite 文件句柄尚未完全释放）——
+  //    临时目录清理失败**不该让测试变红**（那不是被测行为），所以单独 try。
+  try {
+    if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch {
+    /* 忽略 */
+  }
 });
 
 interface CapsBody {
   cached?: boolean;
   cached_age_ms?: number;
   cache_ttl_ms?: number;
+  realtime_fields?: string[];
   retrieval?: {
     wiki?: { available: boolean; dataReady: boolean; dataCount: number };
     kg?: { available: boolean; dataReady: boolean; dataCount: number; reason: string };
@@ -108,14 +121,34 @@ interface CapsBody {
   };
 }
 
-async function getCaps(base: string, query = ''): Promise<CapsBody> {
-  const res = await fetch(`${base}/api/v1/capabilities${query}`);
-  assert.equal(res.status, 200, `/capabilities 必须 200`);
+/**
+ * ★ 统一走 `?deep=0`（浅探测）—— **本文件测的是"缓存有没有冻住状态字段"，
+ * 与深/浅探测无关**：`realtimeFields()`（`auth`/`settings`/`retrieval`）在**两条路径上
+ * 都会被调用**，所以浅探测足以覆盖本 bug class。
+ *
+ * `[实测]` 本机：深探测单次 **19.5s**（pi 加载 + 模型探测 + 4 引擎探测），
+ * 浅探测 **227ms**。若用深探测，本文件要跑 44s+，**会明显拖慢整个 `npm test`**；
+ * 用浅探测后 <1s。⚠️ 代价：浅探测走的是 `cacheKey='shallow'`，与深探测**不共用缓存槽**
+ * —— 本文件内部一致即可（三个用例都用同一档）。
+ */
+async function getCaps(query = ''): Promise<CapsBody> {
+  const qs = query ? `${query}&deep=0` : '?deep=0';
+  const res = await fetch(`${base}/api/v1/capabilities${qs}`);
+  assert.equal(res.status, 200, '/capabilities 必须 200');
   return (await res.json()) as CapsBody;
 }
 
-/** 往真库里写"抽取完成"的数据（文档 + 单元 + 卡片 + 图 + FTS 索引）。 */
-function seedExtracted(built: BuiltApp): { docId: string } {
+function diagOf(r: CapsBody): string {
+  return (
+    `cached=${String(r.cached)} age=${String(r.cached_age_ms)} ` +
+    `kg=${String(r.retrieval?.kg?.dataReady)}/${String(r.retrieval?.kg?.dataCount)} ` +
+    `wiki=${String(r.retrieval?.wiki?.dataReady)}/${String(r.retrieval?.wiki?.dataCount)} ` +
+    `empty_kb=${String(r.retrieval?.summary?.empty_kb)}`
+  );
+}
+
+/** 写"抽取完成"的数据（文档 + 单元 + 卡片 + 图 + FTS 索引）。 */
+function seedExtracted(): string {
   const { db, repo } = built.deps;
   const docId = repo.insertDocument({
     title: '缓存回归用资料',
@@ -151,82 +184,108 @@ function seedExtracted(built: BuiltApp): { docId: string } {
     ],
   );
   indexDocument(db, repo, docId);
-  return { docId };
+  return docId;
+}
+
+/** ★ 清 **wiki** 的数据源（`search_docs`/FTS 索引）—— 与 kg 的正交。 */
+function clearWikiData(): void {
+  built.deps.db.run('DELETE FROM search_fts');
+  built.deps.db.run('DELETE FROM search_docs');
+}
+
+/** ★ 清 **kg** 的数据源（`edges`/`entities`）。 */
+function clearKgData(): void {
+  built.deps.db.run('DELETE FROM edges');
+  built.deps.db.run('DELETE FROM entities');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 
-test('★ 缓存命中时 retrieval.dataReady 仍须实时（防第 3 次"承诺实时却被缓存"回归）', async () => {
-  const { built, base } = await makeApp();
-
+test('★ 缓存命中时 retrieval.dataReady 必须实时（防第 3 次"承诺实时却被缓存"回归）', async () => {
   // ① 预热：空库 → 能力就绪但无数据
-  const before1 = await getCaps(base);
-  assert.equal(before1.cached, false, '首次必须不命中缓存');
-  assert.equal(before1.retrieval?.kg?.available, true, '能力就绪');
-  assert.equal(before1.retrieval?.kg?.dataReady, false, '空库 → dataReady:false');
-  assert.equal(before1.retrieval?.wiki?.dataReady, false);
-  assert.equal(before1.retrieval?.summary?.empty_kb, true, '空库态');
+  const warm = await getCaps();
+  assert.equal(warm.cached, false, '首次必须不命中缓存');
+  assert.equal(warm.retrieval?.kg?.available, true, '能力就绪（表/枚举在）');
+  assert.equal(warm.retrieval?.wiki?.available, true);
+  assert.equal(warm.retrieval?.kg?.dataReady, false, `空库 → kg.dataReady:false（${diagOf(warm)}）`);
+  assert.equal(warm.retrieval?.wiki?.dataReady, false, `空库 → wiki.dataReady:false（${diagOf(warm)}）`);
+  assert.equal(warm.retrieval?.summary?.empty_kb, true, '空库态');
 
-  // ② 中途"抽取完成"（直接写真库，等价于学生刚跑完抽取）
-  seedExtracted(built);
+  // ② 中途"抽取完成"（等价于学生刚跑完抽取）
+  seedExtracted();
 
-  // ③ 立刻再 GET —— **应命中缓存**（15s TTL 内），但 retrieval 段必须已是新值
-  const after1 = await getCaps(base);
-  assert.equal(after1.cached, true, '★ 这一条很关键：必须真的命中缓存，否则测不出"缓存冻住状态字段"');
-  assert.ok(
-    (after1.cached_age_ms ?? 0) >= 0 && (after1.cache_ttl_ms ?? 0) > 0,
-    '命中缓存时要如实标注 age/ttl',
-  );
-
-  // ★ 核心断言：缓存命中 ≠ 状态字段可以是旧的
+  // ③ 立刻再 GET —— **应命中缓存**，但 retrieval 段必须已是新值
+  const after = await getCaps();
+  assert.equal(after.cached, true, '★ 必须真的命中缓存，否则测不出"缓存冻住状态字段"');
+  assert.ok((after.cache_ttl_ms ?? 0) > 0, '命中缓存要如实标注 ttl');
   assert.equal(
-    after1.retrieval?.kg?.dataReady,
+    after.retrieval?.kg?.dataReady,
     true,
-    '★ 抽完数据后，即使命中缓存，kg.dataReady 也必须立刻变 true\n' +
-      '  （否则学生看到 empty_kb:true + "先去抽取"，会以为抽取没生效、重复去抽）',
+    '★ 抽完数据后即使命中缓存，kg.dataReady 也必须立刻变 true\n' +
+      '  （否则学生看到 empty_kb:true + "先去抽取"，会以为抽取没生效、重复去抽）\n' +
+      `  实测：${diagOf(after)}`,
   );
-  assert.equal(after1.retrieval?.wiki?.dataReady, true, '★ wiki.dataReady 同理');
-  assert.ok((after1.retrieval?.kg?.dataCount ?? 0) > 0, 'dataCount 必须是新条数，不是缓存的 0');
-  assert.equal(after1.retrieval?.summary?.empty_kb, false, '★ 不再是空库态');
+  assert.equal(after.retrieval?.wiki?.dataReady, true, `★ wiki.dataReady 同理；实测：${diagOf(after)}`);
+  assert.ok((after.retrieval?.kg?.dataCount ?? 0) > 0, `dataCount 必须是新条数，不是缓存的 0；实测：${diagOf(after)}`);
+  assert.equal(after.retrieval?.summary?.empty_kb, false, `★ 不再是空库态；实测：${diagOf(after)}`);
 
-  // ④ 反向：删掉数据后再 GET（仍应命中缓存）→ dataReady 必须回到 false
-  const { db, repo } = built.deps;
-  db.run('DELETE FROM edges');
-  db.run('DELETE FROM entities');
-  const afterDel = await getCaps(base);
-  assert.equal(afterDel.retrieval?.kg?.dataReady, false, '★ 数据清空后也必须立刻反映（双向都要实时）');
-  assert.equal(afterDel.retrieval?.wiki?.dataReady, false, 'wiki 同理');
-  void repo;
+  // ④ 反向：**分别清两个数据源**，再 GET（仍命中缓存）→ 各自 dataReady 必须回到 false
+  clearWikiData();
+  clearKgData();
+  const cleared = await getCaps();
+  assert.equal(cleared.cached, true, '仍应在 TTL 内（否则测的是强制刷新路径）');
+  assert.equal(cleared.retrieval?.kg?.dataReady, false, `★ kg：清了 edges 必须立刻反映；实测：${diagOf(cleared)}`);
+  assert.equal(cleared.retrieval?.wiki?.dataReady, false, `★ wiki：清了 search_docs 必须立刻反映；实测：${diagOf(cleared)}`);
+  assert.equal(cleared.retrieval?.summary?.empty_kb, true, '★ 回到空库态');
 });
 
-test('★ 缓存 TTL/标注字段仍在（修实时性不许把缓存整个删掉）', async () => {
-  const { base } = await makeApp();
+test('★ 只清一半数据时，两个模式必须各自独立反映（不许串台）', async () => {
+  // 防的是"用同一个信号算 wiki/kg 的 dataReady"这种偷懒实现。
+  seedExtracted();
 
-  const first = await getCaps(base);
-  assert.equal(first.cached, false, '首次不命中');
-  assert.equal(first.cache_ttl_ms, 15_000, 'TTL 契约（15s）');
+  // 只清 kg 的数据（wiki 的索引保留）
+  clearKgData();
+  const kgCleared = await getCaps();
+  assert.equal(kgCleared.cached, true, '命中缓存');
+  assert.equal(kgCleared.retrieval?.kg?.dataReady, false, `kg 的边清了 → false；实测：${diagOf(kgCleared)}`);
+  assert.equal(
+    kgCleared.retrieval?.wiki?.dataReady,
+    true,
+    `★ wiki 的索引还在 → 必须仍为 true（两个数据源正交，不许一起变）；实测：${diagOf(kgCleared)}`,
+  );
 
-  const second = await getCaps(base);
-  assert.equal(second.cached, true, 'TTL 内应命中缓存（性能优化本身要保留）');
+  // 再清 wiki 的数据
+  clearWikiData();
+  const bothCleared = await getCaps();
+  assert.equal(bothCleared.cached, true, '命中缓存');
+  assert.equal(bothCleared.retrieval?.wiki?.dataReady, false, `wiki 也清了 → false；实测：${diagOf(bothCleared)}`);
+});
+
+test('★ 缓存机制本身仍生效（修实时性不许把缓存整个删掉）', async () => {
+  // ⚠️ 本文件三条用例**共用一个 app**（`buildApp` 太贵），缓存可能已被前面的用例预热。
+  //    所以这里先用 `?refresh=1` **强制重建缓存**，再验证后续 GET 命中 —— 否则
+  //    "首次不命中"会因测试顺序而随机失败（我第一版就是这样）。
+  const initial = await getCaps('?refresh=1');
+  assert.equal(initial.cached, false, 'refresh=1 必须绕过/重建缓存');
+  assert.equal(initial.cache_ttl_ms, 15_000, 'TTL 契约（15s）');
+
+  const second = await getCaps();
+  assert.equal(second.cached, true, 'TTL 内应命中缓存（性能优化必须保留）');
   assert.ok((second.cached_age_ms ?? -1) >= 0, 'age 必须如实上报');
+  assert.deepEqual(second.realtime_fields, ['auth', 'settings', 'retrieval'], '实时白名单要如实列出');
 
-  // `refresh=1` 强制绕过缓存
-  const forced = await getCaps(base, '?refresh=1');
-  assert.equal(forced.cached, false, 'refresh=1 必须绕过缓存');
+  // 再确认一次强制刷新仍能绕过
+  const forced = await getCaps('?refresh=1');
+  assert.equal(forced.cached, false, 'refresh=1 每次都绕过缓存');
 });
 
 test('★ 空库态的 hint 必须指向"去抽取"（UI 横幅直接用它）', async () => {
-  const { base } = await makeApp();
-  const caps = await getCaps(base);
+  const caps = await getCaps();
   const s = caps.retrieval?.summary;
-  assert.ok(s, '必须有 summary 段');
+  assert.ok(s, '必须有 summary 段（UI 一句话提示）');
   assert.equal(s!.any_available, true, '能力就绪');
-  assert.equal(s!.any_data, false, '但无数据');
-  assert.equal(s!.empty_kb, true);
+  // 此时数据已被前两条用例清空 → 应回到空库态
+  assert.equal(s!.any_data, false, '无数据');
+  assert.equal(s!.empty_kb, true, '空库态');
   assert.match(s!.hint, /抽取/, 'hint 必须指出下一步动作（不是只说"没有数据"）');
-  // 命中缓存时 hint 也要跟着状态（不能缓存成空串或旧值）
-  seedExtracted;
-  const again = await getCaps(base);
-  assert.equal(again.cached, true);
-  assert.equal(again.retrieval?.summary?.empty_kb, true, '空库未变时 summary 应保持（这里只是确认字段存在且一致）');
 });

@@ -54,7 +54,8 @@ export interface ReadyFrame {
   model: string | null;
   tools: string[];
   /** 扩展（§7.3.1 ⚠️9） */
-  tools_source: 'explicit' | 'none';
+  /** ★ 诚实标注：explicit = 我们显式给的（默认空集）/ pi-default = pi 的默认全集（危险，仅显式放行时） */
+  tools_source: 'explicit' | 'pi-default';
   version: string | null;
   mode: 'sdk';
   persistence: 'native' | 'ephemeral';
@@ -556,7 +557,7 @@ export function makeRetrievalFrame(opts: {
   sessionId: string;
   model: string | null;
   tools: string[];
-  toolsSource: 'explicit' | 'none';
+  toolsSource: 'explicit' | 'pi-default';
   version: string | null;
   persistence: 'native' | 'ephemeral';
   persistenceReason: string;
@@ -633,7 +634,11 @@ export interface ChatSessionLike {
 }
 
 export interface ChatSessionManagerLike {
-  getOrCreate(sessionId: string): Promise<ChatSessionLike>;
+  /**
+   * 取/建会话。`init.tools` 是**按连接/角色**给的工具白名单：
+   * 只在会话**首次创建**时生效（已存在的会话不会被改写 —— 避免半个会话换工具集）。
+   */
+  getOrCreate(sessionId: string, init?: { tools?: string[] }): Promise<ChatSessionLike>;
   release(sessionId: string): void;
 }
 
@@ -666,6 +671,16 @@ export interface CreateChatConnectionOptions {
    * ⚠️ 必须由服务端（会话/令牌）填充，**不要**从客户端帧里读。
    */
   user?: { id: string | null; roles?: string[] };
+  /**
+   * ★ 按角色的**工具白名单**（RBAC：学生/教师一律无工具；只有管理员按策略给）。
+   *
+   * 不传 = 不给任何工具（fail-safe，与 `AgentSessionManager` 的默认一致）。
+   * 例如：`toolsFor: (u) => (u.roles?.includes('admin') ? ['kb_read'] : [])`
+   *
+   * ⚠️ **危险内置工具**（`bash`/`edit`/`write`/`read`）会被 `AgentSessionManager` 过滤掉
+   * （除非那边显式开了 `allowDangerousTools`）—— 见真事故：学生曾能用 `bash` 在服务器执行命令。
+   */
+  toolsFor?: (user: { id: string | null; roles?: string[] }) => string[];
   /**
    * ★ 每轮结束（`settled`）后的**引用校验**回调（RETRIEVAL.md §4）。
    *
@@ -757,7 +772,17 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
 
   let session: ChatSessionLike;
   try {
-    session = await manager.getOrCreate(sessionId);
+    // ★ 按角色决定工具白名单。
+    //   - 传了 `toolsFor` → 用它（RBAC：学生/教师给 `[]`，仅 admin 按策略给）
+    //   - **没传 → 不指定**，交给 `AgentSessionManager` 自己的配置决定
+    //     （它现在的默认就是 `[]` = 无工具，fail-safe；只有**显式** `allowPiDefaultTools:true`
+    //      才会放开 pi 的默认全集）。
+    //     ⚠️ 原实现这里硬给 `[]` → 会把管理器上**显式**的 `allowPiDefaultTools` 静默覆盖掉
+    //     （两种配置互相打架，属于"看起来生效其实没有"）。
+    //   真事故：学生连上 chat 后 `ready.tools = ["read","bash","edit","write"]`，
+    //   说一句"用 bash 执行 X"服务器就真的执行 —— 同时绕过 RBAC 与 SQL 沙箱。
+    const requestedTools = typeof opts.toolsFor === 'function' ? opts.toolsFor(opts.user ?? { id: null }) : undefined;
+    session = await manager.getOrCreate(sessionId, requestedTools ? { tools: requestedTools } : undefined);
   } catch (err) {
     const classified = classifyFailure(err, { where: '创建会话' });
     // ★ 凭据文件**形状**错（就是让 pi 静默挂死的那种）：给可读原因 + 修法，

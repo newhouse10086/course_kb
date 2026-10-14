@@ -53,6 +53,17 @@ export type ChatConnectionFactory = (opts: {
   /** 服务端认定的会话身份（**不从客户端帧里读**，防伪造）。 */
   user?: { id: string; roles: string[] } | null;
   /**
+   * ★★ **是否允许给 agent 注册工具**（`read`/`bash`/`edit`/`write`）—— 安全边界，不是体验选项。
+   *
+   * 由 `routes/chat.ts` 依据**服务端身份**（`req.user.roles`）判定：**仅 `admin` 为 true**。
+   *
+   * ⚠️ 为什么必须显式传、且**不能靠"没传就默认关"**：实测过 `tools_source:"none"`（代码以为关了工具）
+   * 却拿到默认全集 —— 学生 `ready.tools=["read","bash","edit","write"]` → 服务器 shell +
+   * 任意文件读取（prober 实测读到 `C:\Windows\win.ini`），**绕过 RBAC 与整个 SQL 沙箱**。
+   * 显式布尔 + 断言，才不会再退化。
+   */
+  allowTools?: boolean;
+  /**
    * 每轮回答的审计回调（三档引用校验：cited/forged/missing + 检索状态）。
    * 我这边落到 `audit_log`（action=`chat`），教学场景要留痕。
    */

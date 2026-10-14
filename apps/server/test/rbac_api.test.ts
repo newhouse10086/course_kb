@@ -1173,7 +1173,8 @@ test('★ 缓存命中时 auth/settings/retrieval 必须**实时**（HTTP 级：
     // ② 写入**真实数据**（一条边 → kg 的 dataCount = `SELECT COUNT(*) FROM edges`）
     const now = Date.now();
     db.run(
-      "INSERT INTO documents (id,title,kind,source_path,status,created_at) VALUES ('doc_cache','缓存测试','pdf','x.pdf','ready',?)",
+      "INSERT INTO documents (id,title,kind,source_path,status,created_at,updated_at) VALUES ('doc_cache','缓存测试','pdf','x.pdf','ready',?,?)",
+      now,
       now,
     );
     db.run(

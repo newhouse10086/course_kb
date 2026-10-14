@@ -100,9 +100,19 @@ export interface AgentCapabilities {
   loadMs: number | null;
   /** 第 2 层 */
   model: AgentModelCapability;
-  /** 工具来源：显式白名单 vs 未指定（pi 1.0.2 的 get_state 无 tools，v2 同理不编造） */
-  tools: string[];
-  toolsSource: 'explicit' | 'none';
+  /**
+   * 新会话会拿到的工具白名单。
+   * `[]` = 无工具（安全默认）；`null` = **pi 的默认全集**（危险：`read`/`bash`/`edit`/`write`）。
+   *
+   * ⚠️ 原实现这里是 `manager.toolsSource === 'explicit' ? [] : []` —— **恒为 `[]`**，
+   * 于是 `/capabilities` 报"没有工具"，而 chat 会话实际拿着 4 个工具
+   * （真事故里"自相矛盾的信号"之一；已修）。
+   */
+  tools: string[] | null;
+  /** 工具从哪来：`explicit` = 我们显式给的；`pi-default` = pi 默认全集（**危险**，必须显式放行才会出现） */
+  toolsSource: 'explicit' | 'pi-default';
+  /** `toolsSource='pi-default'` 时的**警告**（不许安静：这就是"学生能执行 bash"的信号） */
+  toolsWarning: string | null;
   /** SDK 可用但模型不可用 → degraded=true（UI 可据此禁用输入并说明原因） */
   degraded: boolean;
   sessions: ReturnType<AgentSessionManager['stats']> | null;
@@ -418,15 +428,23 @@ export async function capabilities(opts: AgentCapabilitiesOptions = {}): Promise
   let sessions: ReturnType<AgentSessionManager['stats']> | null = null;
   let cwd: string | null = null;
   let sessionDir: string | null = null;
-  let tools: string[] = [];
-  let toolsSource: 'explicit' | 'none' = 'none';
+  // `null` = 未知/pi 默认全集；`[]` = 明确无工具
+  let tools: string[] | null = null;
+  let toolsSource: 'explicit' | 'pi-default' = 'pi-default';
+  let toolsWarning: string | null = null;
   if (manager) {
     try {
       sessions = manager.stats();
       cwd = manager.cwd;
       sessionDir = manager.sessionDir;
       toolsSource = manager.toolsSource;
-      tools = manager.toolsSource === 'explicit' ? [] : [];
+      // ★ 如实取**管理器实际配置**的白名单（原实现恒为 []，把危险默认掩盖了）
+      tools = manager.tools;
+      toolsWarning =
+        toolsSource === 'pi-default'
+          ? '会话工具回落到 pi 默认全集（read/bash/edit/write）—— 学生若可达将能执行命令、读主机文件；' +
+            '请给 AgentSessionManager 传 tools:[]（默认已是）或按角色收窄'
+          : null;
     } catch {
       /* 统计失败不影响能力上报 */
     }
@@ -442,6 +460,7 @@ export async function capabilities(opts: AgentCapabilitiesOptions = {}): Promise
     model,
     tools,
     toolsSource,
+    toolsWarning,
     degraded: sdk.available && !model.available,
     sessions,
     cwd,

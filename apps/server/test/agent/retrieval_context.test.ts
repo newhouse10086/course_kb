@@ -218,7 +218,7 @@ class FakeChatSession implements ChatSessionLike {
       session_id: this.id,
       model: null,
       tools: [],
-      tools_source: 'none',
+      tools_source: 'explicit',
       version: null,
       mode: 'sdk',
       persistence: 'ephemeral',
