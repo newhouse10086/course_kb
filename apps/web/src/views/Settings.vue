@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * 模型设置（教师 / admin）—— docs/SETTINGS_AND_SANDBOX.md §2
  *
@@ -117,15 +117,29 @@ async function loadRunning() {
   // ★ 真后端直接给了队列忙状态（`/models.busy` + `/settings/llm.busy`）——比前端猜准
   const b = busyInfo.value
   if (b && typeof b.busy === 'boolean') {
-    running.value = b.busy
-      ? {
-          taskId: (b.runningLlm || []).join(',') || 'queue',
-          kind: (b.runningLlm || [])[0] || 'llm',
-          done: 0, total: 0,
-          stage: `队列忙：running ${b.runningAll ?? 0} / pending ${b.pending ?? 0}`,
-          progress: 0,
-        }
-      : null
+    if (!b.busy) { running.value = null; return }
+    // busy 只说"忙不忙"；**进度条要的是单任务 done/total** → 能从 /tasks 拿到就用它，
+    // 拿不到就只显示"队列忙"（**不编造 0/368 这种假进度**）
+    try {
+      const r0 = await api.tasks()
+      const list0 = (r0.tasks || r0.items || []) as Array<Record<string, any>>
+      const t0 = list0.find((x) => (x.status === 'running' || x.status === 'queued') && LLM_TASK_KINDS.has(String(x.kind)))
+      if (t0) {
+        const d0 = (t0.detail || {}) as any
+        const total0 = Number(d0.total ?? 0) || 0
+        const done0 = d0.done != null ? Number(d0.done) : (total0 ? Math.round(Number(t0.progress ?? 0) * total0) : 0)
+        running.value = { taskId: String(t0.id), kind: String(t0.kind), done: done0, total: total0,
+          stage: String(t0.stage || ''), progress: Number(t0.progress ?? 0) }
+        return
+      }
+    } catch { /* /tasks 不可用 → 退回队列摘要 */ }
+    running.value = {
+      taskId: (b.runningLlm || []).join(',') || 'queue',
+      kind: (b.runningLlm || [])[0] || 'llm',
+      done: 0, total: 0,
+      stage: `队列忙：running ${b.runningAll ?? 0} / pending ${b.pending ?? 0}`,
+      progress: 0,
+    }
     return
   }
   try {
@@ -183,6 +197,9 @@ async function doSwitch() {
     noteKind.value = 'ok'
     await loadModels()
     await loadSettings()
+    // switchedFrom/switchedAt 的**权威来源是 `/settings/llm`**（真后端 `/models` 里没有这两个字段）
+    await loadSwitchInfo()
+    await loadRunning()
   } catch (e) {
     const err = e as ApiError
     // 运行中直接热切 → 409 E_MODEL_BUSY；探测失败 → 502 E_MODEL_PROBE（后端已回滚）
@@ -542,6 +559,7 @@ const staffChecklist = [
 .modal-box { background: var(--panel); border: var(--hair) solid var(--rule-strong); border-top: 2px solid var(--accent); padding: 16px 18px; max-width: 560px; box-shadow: var(--shadow-2); }
 .modes { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; font-size: 13px; }
 </style>
+
 
 
 

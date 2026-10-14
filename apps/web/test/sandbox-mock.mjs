@@ -9,7 +9,8 @@
  *      UPDATE / DELETE / DROP / BEGIN-COMMIT-ROLLBACK
  * 红线（与 docs/SETTINGS_AND_SANDBOX.md §3 一致）：禁 ATTACH / PRAGMA 白名单外 / 多语句 / load_extension
  *
- * ⚠️ 它**不追求 SQL 完整**：不能识别的语法一律 `E_SANDBOX_SQL` 并给出可读原因 —— 诚实优先于假装。
+ * ⚠️ 它**不追求 SQL 完整**：不能识别的语法一律 `E_SQL_SYNTAX` 并给出可读原因 —— 诚实优先于假装。
+ * ⚠️ 错误对象按**真后端分类器形状**给：`{code,raw,message,hint,localReading,who,who_label,who_source}`（对齐 2026-10-15 实测）。
  * 真正的执行在后端（better-sqlite3 + worker + 硬超时）。
  */
 
@@ -39,28 +40,28 @@ export class SandboxDb {
   execute(sql, { internal = false, maxRows = 200 } = {}) {
     const t0 = performance.now()
     const text = String(sql || '').trim().replace(/;+\s*$/, '')
-    if (!text) throw sandboxError('E_SANDBOX_EMPTY', 'SQL 为空')
+    if (!text) throw sandboxError('E_SQL_SYNTAX', 'SQL 为空')
     if (!internal) {
       for (const stmt of splitStatements(text)) {
         if (stmt !== text) {
-          throw sandboxError('E_SANDBOX_MULTI', '一次只允许一条语句（多语句拼接被拒：防注入式逃逸）')
+          throw sandboxError('E_SQL_MULTI', '只允许**单条**语句（检测到多个分号）：防注入式逃逸')
         }
       }
     }
     // ---- 红线 ----
     const upper = text.toUpperCase()
-    if (/\bATTACH\b/.test(upper)) throw sandboxError('E_SANDBOX_FORBIDDEN', 'ATTACH 被禁止（否则能读写别的库文件）')
-    if (/\bDETACH\b/.test(upper)) throw sandboxError('E_SANDBOX_FORBIDDEN', 'DETACH 被禁止')
-    if (/LOAD_EXTENSION/i.test(text)) throw sandboxError('E_SANDBOX_FORBIDDEN', 'load_extension 被禁止')
+    if (/\bATTACH\b/.test(upper)) throw sandboxError('E_SQL_FORBIDDEN', '禁止 ATTACH：会读写沙箱外的库文件（含主知识库）')
+    if (/\bDETACH\b/.test(upper)) throw sandboxError('E_SQL_FORBIDDEN', '禁止 DETACH')
+    if (/LOAD_EXTENSION/i.test(text)) throw sandboxError('E_SQL_FORBIDDEN', '禁止 load_extension：可加载任意本地库')
     if (/\bPRAGMA\b/.test(upper)) {
       const name = (text.match(/PRAGMA\s+([a-z_]+)/i) || [])[1] || ''
       if (!ALLOWED_PRAGMA.has(name.toLowerCase())) {
-        throw sandboxError('E_SANDBOX_FORBIDDEN', `PRAGMA ${name} 不在白名单内（只允许 ${Array.from(ALLOWED_PRAGMA).join(' / ')}）`)
+        throw sandboxError('E_SQL_PRAGMA', `PRAGMA ${name} 不在白名单内；只允许只读自省类：${Array.from(ALLOWED_PRAGMA).join(', ')}`)
       }
     }
     // 死循环演示：真实实现靠硬超时杀进程
     if (/WITH\s+RECURSIVE/i.test(text) && /UNION\s+ALL/i.test(text)) {
-      const e = sandboxError('E_SANDBOX_TIMEOUT', '语句超过 3000ms 硬超时被终止（服务未被阻塞）')
+      const e = sandboxError('E_SQL_TIMEOUT', '执行被中断（通常是超时）', { localReading: '递归 CTE 没有终止条件，跑到超时被沙箱停掉', hint: '给学生看的提示：递归 CTE 需要终止条件（WHERE 里的递归约束），先加 LIMIT 试小范围' })
       e.timeout = true
       throw e
     }
@@ -93,7 +94,7 @@ export class SandboxDb {
     }
     if ((m = text.match(/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([A-Za-z_][\w]*)$/i))) {
       const name = m[1].toLowerCase()
-      if (!this.tables.has(name)) throw sandboxError('E_SANDBOX_SQL', `no such table: ${name}`)
+      if (!this.tables.has(name)) throw sandboxError('E_SQL_NO_OBJECT', `no such table: ${name}`, { localReading: `表 ${name} 不存在` })
       this.tables.delete(name)
       return done([], [])
     }
@@ -110,11 +111,11 @@ export class SandboxDb {
       const groups = m[3].match(/\(([^)]*)\)/g) || []
       for (const g of groups) {
         const vals = splitCsv(g.slice(1, -1)).map(parseLiteral)
-        if (vals.length !== cols.length) throw sandboxError('E_SANDBOX_SQL', `table ${t.name} has ${cols.length} columns but ${vals.length} values were supplied`)
+        if (vals.length !== cols.length) throw sandboxError('E_SQL_SYNTAX', `table ${t.name} has ${cols.length} columns but ${vals.length} values were supplied`)
         const row = t.columns.map(() => null)
         cols.forEach((c, i) => {
           const idx = t.columns.findIndex((cc) => cc.name.toLowerCase() === c)
-          if (idx < 0) throw sandboxError('E_SANDBOX_SQL', `table ${t.name} has no column named ${c}`)
+          if (idx < 0) throw sandboxError('E_SQL_SYNTAX', `table ${t.name} has no column named ${c}`)
           row[idx] = vals[i]
         })
         t.rows.push(row)
@@ -135,7 +136,7 @@ export class SandboxDb {
         if (!pred(row)) continue
         for (const a of assigns) {
           const idx = t.columns.findIndex((c) => c.name.toLowerCase() === a.col)
-          if (idx < 0) throw sandboxError('E_SANDBOX_SQL', `no such column: ${a.col}`)
+          if (idx < 0) throw sandboxError('E_SQL_NO_OBJECT', `no such column: ${a.col}`, { localReading: `列 ${a.col} 不存在` })
           row[idx] = a.val
         }
         n++
@@ -158,19 +159,19 @@ export class SandboxDb {
     // ---- CREATE VIEW / INDEX ----
     if (/^CREATE\s+(UNIQUE\s+)?(VIEW|INDEX)\b/i.test(text)) return done([], [])
 
-    throw sandboxError('E_SANDBOX_SQL', `mock 沙箱不支持的语句：${text.slice(0, 60)}（真实现走 better-sqlite3）`)
+    throw sandboxError('E_SQL_SYNTAX', `mock 沙箱不支持的语句：${text.slice(0, 60)}（真实现走 better-sqlite3）`)
   }
 
   requireTable(name) {
     const t = this.tables.get(String(name).toLowerCase())
-    if (!t) throw sandboxError('E_SANDBOX_SQL', `no such table: ${String(name).toLowerCase()}`)
+    if (!t) throw sandboxError('E_SQL_NO_OBJECT', `no such table: ${String(name).toLowerCase()}`)
     return t
   }
 
   /** 只覆盖教学常用形态：单表/JOIN + WHERE + GROUP BY + COUNT/SUM/AVG/MAX/MIN + ORDER BY + LIMIT */
   select(text, maxRows, t0) {
     const from = text.match(/\bFROM\s+([\s\S]+?)(?:\s+WHERE\b|\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s+LIMIT\b|$)/i)
-    if (!from) throw sandboxError('E_SANDBOX_SQL', 'SELECT 缺少 FROM')
+    if (!from) throw sandboxError('E_SQL_SYNTAX', 'SELECT 缺少 FROM')
     // 解析 FROM：支持 t1 [AS] a JOIN t2 [AS] b ON ...
     const fromClause = from[1].trim()
     // JOIN 逐个匹配（左表 = 上一个表的别名/名字）—— 不能用"左表+JOIN"一起匹配，
@@ -185,7 +186,7 @@ export class SandboxDb {
     //    **JOIN 当成别名**（实测 baseAlias="JOIN" → `sc.sno` 查不到 → JOIN 永远 0 行）
     const KEYWORD = 'JOIN|INNER|LEFT|RIGHT|CROSS|ON|WHERE|GROUP|ORDER|LIMIT|HAVING|UNION|SET|VALUES'
     const first = fromClause.match(new RegExp(`^([A-Za-z_][\\w]*)(?:\\s+(?:AS\\s+)?(?!${KEYWORD}\\b)([a-z][\\w]*))?`, 'i'))
-    if (!first) throw sandboxError('E_SANDBOX_SQL', 'FROM 解析失败')
+    if (!first) throw sandboxError('E_SQL_SYNTAX', 'FROM 解析失败')
     const baseAlias = first[2] || first[1]
     const sources = new Map([[baseAlias.toLowerCase(), this.requireTable(first[1])]])
     for (const j of joins) sources.set(j.rightAlias.toLowerCase(), this.requireTable(j.right))
@@ -399,15 +400,57 @@ export function splitStatements(sql) {
   return out
 }
 
-export function sandboxError(code, msg) {
-  const e = new Error(msg)
-  e.code = code
-  return e
+export /**
+ * 构造**真后端形状**的错误对象（分类器结论一起给）。
+ * 真形状：`{code, raw, message, hint, localReading, localMatched, who, who_label, who_source}`
+ * ⚠️ 我第一版只有 `{code,msg}` —— 字段名与真后端全不一样，前端按真形状写就会两边都不对。
+ */
+function sandboxError(code, message, extra = {}) {
+  const whoByCode = {
+    E_SQL_SYNTAX: 'student', E_SQL_NO_OBJECT: 'student',
+    E_SQL_FORBIDDEN: 'rules', E_SQL_PRAGMA: 'rules', E_SQL_MULTI: 'rules',
+    E_SQL_TIMEOUT: 'student_logic',
+  }
+  const labelByCode = {
+    E_SQL_SYNTAX: '语法错', E_SQL_NO_OBJECT: '对象不存在',
+    E_SQL_FORBIDDEN: '被安全闸拒绝', E_SQL_PRAGMA: 'PRAGMA 不在白名单', E_SQL_MULTI: '多语句',
+    E_SQL_TIMEOUT: '执行超时',
+  }
+  const who = extra.who ?? whoByCode[code] ?? 'system'
+  const whoLabel = extra.who_label ?? labelByCode[code] ?? '系统侧问题'
+  const err = new Error(message)
+  err.sandbox = {
+    code, raw: message, message,
+    hint: extra.hint ?? (who === 'rules' ? '该语句被沙箱安全策略拒绝（并非 SQL 写错）'
+      : who === 'student' ? '检查关键字拼写与对象名；用 SELECT name FROM sqlite_master WHERE type=\'table\' 看现有表'
+      : '这是执行被中断，不是语法错；先加 LIMIT 缩小范围再试'),
+    localReading: extra.localReading ?? message,
+    localMatched: extra.localMatched ?? who === 'student',
+    who, who_label: whoLabel, who_source: extra.who_source ?? 'classifier',
+  }
+  return err
 }
 
 /* ---------------- 预置数据集（数据库课程经典 schema） ---------------- */
 
 export const DATASETS = [
+  // ★ 真后端默认数据集 `sc`（表名 students/courses/enrollments）—— 与真环境同名同结构，
+  //   这样"学生-课程-成绩"的 JOIN 断言在 mock 与真后端下是同一套（我第一版编了 student-course/sc，对不上）
+  {
+    id: 'sc',
+    label: '学生-课程-成绩（真后端默认）',
+    description: 'students / courses / enrollments：三表 JOIN、GROUP BY、NULL 与外键',
+    tables: ['students', 'courses', 'enrollments'],
+    teachingPoints: ['三表 JOIN：students ⋈ enrollments ⋈ courses', 'GROUP BY 按 dept 聚合', '外键约束与 NULL 的处理'],
+    dialectNotes: [],
+    schema: `CREATE TABLE students (sid INTEGER PRIMARY KEY, sname TEXT NOT NULL, age INTEGER, sex TEXT, dept TEXT);
+CREATE TABLE courses (cid INTEGER PRIMARY KEY, cname TEXT NOT NULL, teacher TEXT, credits INTEGER NOT NULL DEFAULT 3);
+CREATE TABLE enrollments (sid INTEGER NOT NULL REFERENCES students(sid), cid INTEGER NOT NULL REFERENCES courses(cid), grade REAL, term TEXT, PRIMARY KEY (sid, cid));`,
+    seed: `INSERT INTO students VALUES (1,'张明',20,'男','计算机系'),(2,'李静',21,'女','软件工程'),(3,'王强',19,'男','计算机系'),(4,'赵敏',22,'女','信息管理'),(5,'陈晨',20,'男','软件工程'),(6,'周悦',21,'女','计算机系');
+INSERT INTO courses VALUES (1,'数据库系统',  '刘老师',4),(2,'数据结构','陈老师',3),(3,'操作系统','孙老师',4),(4,'计算机网络','李老师',3),(5,'软件工程','周老师',3);
+INSERT INTO enrollments VALUES (1,1,92,'2026春'),(1,2,85,'2026春'),(2,1,78,'2026春'),(2,3,88,'2026春'),(3,2,95,'2026春'),(3,4,71,'2026春'),(4,1,83,'2026春'),(4,5,90,'2026春'),(5,3,66,'2026春'),(5,5,74,'2026春'),(6,1,89,'2026春'),(6,2,93,'2026春'),(6,4,80,'2026春'),(1,3,77,'2026春'),(2,5,84,'2026春');`,
+  },
+
   {
     id: 'student-course',
     label: '学生-课程-成绩（教材样例）',

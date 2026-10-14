@@ -93,8 +93,16 @@ export interface OpenAiCompatibleOptions {
  *
  * 取 512：足够容纳一次 "ping" 的推理开销（实测 ~54 tokens），
  * 又不至于在探测时烧掉太多额度。与 worker 侧契约一致（探测 ≥500，结构化 ≥2000）。
+ *
+ * ★ **导出**（`backend-api` 建议，采纳）：
+ * `settings/models.ts` 等处也要做 LLM 探测。若各自定义常量必然漂移 —— 实测就发生过：
+ * 本文件已改为 512，而 `settings/models.ts` 仍写 8，于是 `/models` 把 8 个模型里 7 个
+ * 报成 `available:true`（**假绿**）；更致命的是**热切换的回滚判断失效**
+ * （切到"能连通但产不出内容"的模型 → 探测报绿 → 不回滚 → 抽取静默 0 卡片）。
+ * ⟹ **所有 LLM 探测都必须 import 本常量，不许就地自定义**；
+ *    更根本的做法是直接复用本类的 `healthCheck()`（已含空 content 判定）。
  */
-const PROBE_MAX_TOKENS = 512;
+export const PROBE_MAX_TOKENS = 512;
 
 export class OpenAiCompatibleLlm implements Provider {
   readonly info: ProviderInfo;

@@ -507,7 +507,76 @@ test('★ 真跑 WITH RECURSIVE 死循环 → 超时被杀；**服务不阻塞**
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ⑦ 调用方错误 / 引擎能力
+// ⑦ ★ 事务语义（polysemy-prober 的 critical 发现 → 临时诚实闸 + 单次调用可用）
+// ═══════════════════════════════════════════════════════════════════════
+
+test('★ 跨调用事务：单发 BEGIN/COMMIT/ROLLBACK → **如实拒绝**（不再返回假的 ok:true）', async () => {
+  const live = await listen(await makeApp());
+  try {
+    const admin = await login(live, 'admin', ADMIN_PASS);
+    await createUser(live, admin, 'stu-tx', ['student']);
+    const stu = await login(live, 'stu-tx', 'pass-12345');
+    const sess = await req(live, 'POST', '/api/v1/sandbox/session', { cookie: stu, body: {} });
+    const sessionId = String(sess.body.sessionId);
+    await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, sql: 'CREATE TABLE tx(id INTEGER PRIMARY KEY, v TEXT)' },
+    });
+    await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, sql: "INSERT INTO tx VALUES (1,'base')" },
+    });
+
+    // ① 单发事务控制语句 → 200 + ok:false + 说明"是沙箱能力限制，不是你 SQL 写错"
+    for (const sql of ['BEGIN', 'BEGIN TRANSACTION', 'COMMIT', 'ROLLBACK', 'SAVEPOINT sp1', 'RELEASE sp1']) {
+      const r = await req(live, 'POST', '/api/v1/sandbox/execute', { cookie: stu, body: { sessionId, sql } });
+      assert.equal(r.status, 200, `${sql} 应 200（是"这条语句不被支持"，不是请求错）`);
+      assert.equal(r.body.ok, false, `★ ${sql} 不许返回 ok:true（旧行为是假的成功）`);
+      const e = r.body.error as Record<string, unknown>;
+      assert.equal(e.code, 'E_SQL_UNSUPPORTED', `${sql} 错误码`);
+      assert.equal(e.who, 'rules', `${sql} 责任方 = 沙箱能力限制（不是学生写错）`);
+      assert.match(String(e.hint), /multi/, `${sql} 必须指出可用路径（multi:true）`);
+      assert.equal(e.interim, true, '标明这是过渡期的诚实闸');
+    }
+
+    // ② 数据没有被"假回滚"骗到（我们根本没执行任何写）
+    const after = await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, sql: 'SELECT COUNT(*) FROM tx' },
+    });
+    assert.deepEqual(after.body.rows, [[1]]);
+
+    // ③ ★ 真正可用的路径：单次调用 + multi:true（同进程同连接）→ 回滚**真的生效**
+    const rb = await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, multi: true, sql: "BEGIN; INSERT INTO tx VALUES (2,'rollback_me'); ROLLBACK;" },
+    });
+    assert.equal(rb.status, 200);
+    assert.equal(rb.body.ok, true, JSON.stringify(rb.body.error ?? rb.body).slice(0, 300));
+    const afterRb = await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, sql: 'SELECT COUNT(*) FROM tx' },
+    });
+    assert.deepEqual(afterRb.body.rows, [[1]], '★ multi 事务里的 ROLLBACK 必须真的回滚（行数不变）');
+
+    // ④ 同一路径的 COMMIT 也要真的提交
+    const cm = await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, multi: true, sql: "BEGIN; INSERT INTO tx VALUES (3,'commit_me'); COMMIT;" },
+    });
+    assert.equal(cm.body.ok, true, JSON.stringify(cm.body.error ?? cm.body).slice(0, 300));
+    const afterCm = await req(live, 'POST', '/api/v1/sandbox/execute', {
+      cookie: stu,
+      body: { sessionId, sql: 'SELECT COUNT(*) FROM tx' },
+    });
+    assert.deepEqual(afterCm.body.rows, [[2]], '★ multi 事务里的 COMMIT 必须真的提交（行数 +1）');
+  } finally {
+    await live.built.close();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑧ 调用方错误 / 引擎能力
 // ═══════════════════════════════════════════════════════════════════════
 
 test('缺 sql / 缺 sessionId → 400；引擎能力段如实报（sqlite 可用，MySQL/openGauss 不可用带 reason）', async () => {

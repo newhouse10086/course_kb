@@ -339,6 +339,22 @@ def main() -> int:
                    (c.get('bad_table_error') or {}).get('code') == 'E_SQL_NO_OBJECT'
                    and 'no such table' in str((c.get('bad_table_error') or {}).get('msg')),
                    json.dumps(c.get('bad_table_error'), ensure_ascii=False)[:200])
+                # ★ who 驱动话术：三档必须不同（Lead 硬要求）
+                w1, w2, w3 = c.get('who_student') or {}, c.get('who_rules') or {}, c.get('who_system') or {}
+                ok('学生的错：who=student + E_SQL_SYNTAX', w1.get('kind') == 'student' and w1.get('code') == 'E_SQL_SYNTAX',
+                   json.dumps(w1, ensure_ascii=False)[:200])
+                ok('规则限制：who=rules + E_SQL_FORBIDDEN', w2.get('kind') == 'rules' and w2.get('code') == 'E_SQL_FORBIDDEN',
+                   json.dumps(w2, ensure_ascii=False)[:200])
+                ok('系统/超时：E_SQL_TIMEOUT + 归因', w3.get('kind') == 'system' and w3.get('code') == 'E_SQL_TIMEOUT',
+                   json.dumps(w3, ensure_ascii=False)[:200])
+                ok('三档视觉色调互不相同', len({w1.get('tone'), w2.get('tone'), w3.get('tone')}) == 3,
+                   f"{w1.get('tone')}/{w2.get('tone')}/{w3.get('tone')}")
+                ok('三档文案互不相同（规则/系统话术各就其位）',
+                   len({w1.get('text'), w2.get('text'), w3.get('text')}) == 3
+                   and '规则限制' in str(w2.get('text')),
+                   json.dumps([w1.get('text'), w2.get('text'), w3.get('text')], ensure_ascii=False)[:300])
+                ok('超时显示 killedBy/hardKilled 归因', 'killedBy=' in str(c.get('kill_attribution')),
+                   str(c.get('kill_attribution'))[:140])
                 ok('reset 回到初始 schema（表都回来且行数>0）', bool(c.get('reset_restores')),
                    json.dumps(c.get('reset_tables'), ensure_ascii=False)[:200])
                 # ★ 答疑：真模型流式 + 真引用

@@ -19,6 +19,8 @@
  */
 
 import type { ServerConfig } from '../config.ts';
+import type { ProviderConfigEntry, Provider } from '../providers/types.ts';
+import { createOpenAiCompatible } from '../providers/llm/openai_compatible.ts';
 import { redact } from '../config.ts';
 
 /**
@@ -40,6 +42,15 @@ export interface ModelProbe {
   /** 探测方式（排障用；**不含凭据**） */
   probe: string;
   checkedAt: number;
+  /**
+   * 判定依据说明。
+   *
+   * ⚠️ 这里**没有** `diagnostics` 结构化字段（曾加过又删）：探测已改为复用 provider 层的
+   * `healthCheck()`，而它把 `finish_reason` / `completion_tokens` / `reasoning_content` 字符数
+   * **写进 `reason` 文案**（`E_LLM_EMPTY_CONTENT：HTTP 200 但 content 为空（finish_reason=length，
+   * reasoning_content=31 字符）…`）。再解析回来属于"第二份实现"，会漂 —— 前端直接显示 `reason`。
+   */
+  judgedBy: 'provider.healthCheck';
 }
 
 export interface ModelEntry {
@@ -59,6 +70,13 @@ export interface ModelEntry {
   sources: string[];
   /** 探测缓存命中（true = 用的缓存，不是这次真发的请求） */
   cached: boolean;
+  /**
+   * 探测方式（如 `POST …/chat/completions (model=x, max_tokens=512)`）。
+   * 暴露它是为了让 UI/排障能看出**用的是什么预算与路径**（预算是被踩过的坑）。
+   */
+  probe: string;
+  /** 判定来源：始终是 provider 层的 `healthCheck()`（单一实现，不许漂） */
+  judgedBy: 'provider.healthCheck';
 }
 
 export interface ModelsResult {
@@ -80,13 +98,30 @@ export interface ModelCatalogOptions {
   ttlMs?: number;
   /** 单次探测超时（ms），默认 10_000 */
   timeoutMs?: number;
-  /** 注入 fetch（测试用假端点，不打真网络） */
+  /**
+   * **只有 `/models` 发现列表**用它的注入点（探测不用它 —— 探测走 provider 层）。
+   * 测试里也可以直接替换 `globalThis.fetch` 来驱动真 provider 探测路径。
+   */
   fetchImpl?: typeof fetch;
+  /**
+   * provider 构造注入点（默认 `createOpenAiCompatible`）。
+   * 测试用它可以给出脚本化的 `healthCheck` 结果，而不打网络。
+   */
+  makeProvider?: (entry: ProviderConfigEntry, model: string) => Provider | null;
   now?: () => number;
 }
 
-/** 探测/发现时用的最小请求参数（与 provider 层 `PROBE_MAX_TOKENS=8` 一致） */
-const PROBE_MAX_TOKENS = 8;
+/**
+ * 探测预算说明（**本模块不再自定义常量**）。
+ *
+ * 探测已改为复用 `providers/llm/openai_compatible.ts::healthCheck()`，预算由那里唯一拥有
+ * （`PROBE_MAX_TOKENS = 512`）。这里留一段说明是因为**曾经的 bug 值得记住**：
+ * 本文件原来自己写了一份 `PROBE_MAX_TOKENS = 8` 且只判 HTTP 200 —— 推理模型下
+ * 8 个 token 会被 reasoning 吃光、`content` 为空，却报 `available:true`（**假绿**），
+ * 导致热切换的"探测不通就回滚"失效 → 抽取静默产出 0 卡片。
+ * 教训：**同一个判据只许有一份实现**。`test/settings_models_probe.test.ts` 里有断言
+ * 保证 provider 层的预算是 ≥512。
+ */
 
 export class ModelCatalog {
   private readonly opts: ModelCatalogOptions;
@@ -122,70 +157,119 @@ export class ModelCatalog {
     this.cache.clear();
   }
 
+  // ── provider 取用 ────────────────────────────────────────────────────
+  /** 启用中的第一条 LLM provider 配置项（`providers.yaml` 的 `llm` 段）。 */
+  private llmEntry(): ProviderConfigEntry | null {
+    const list = this.opts.cfg.providers?.providers?.llm ?? [];
+    const preferred = this.opts.cfg.llm?.providerId;
+    const byId = preferred ? list.find((e) => e.id === preferred) : undefined;
+    return byId ?? list[0] ?? null;
+  }
+
+  /** 该项的密钥（**只用于日志打码，绝不外发**）。 */
+  private secretOf(entry: ProviderConfigEntry | null): string {
+    const o = (entry?.options ?? {}) as Record<string, unknown>;
+    return String(o.api_key ?? o.apiKey ?? '');
+  }
+
+  /**
+   * 为**任意模型名**构造一个临时 provider（同一端点/凭据，只换 `model`）。
+   *
+   * 这样"探测"这件事的实现只有 provider 层一份：预算、空 content 判定、reason 文案、
+   * 状态码解释全部复用，`/models` 与 `/capabilities` 不会给出互相矛盾的结论。
+   */
+  private makeProvider(entry: ProviderConfigEntry, model: string): Provider | null {
+    if (this.opts.makeProvider) return this.opts.makeProvider(entry, model);
+    return createOpenAiCompatible({
+      ...entry,
+      options: { ...entry.options, model },
+      missingEnv: entry.missingEnv ?? [],
+      envRefs: entry.envRefs ?? {},
+    });
+  }
+
   // ───────────────────────────────────────────────────────────────────
   // 真探测：一个模型
+  //
+  // ★ **复用 provider 层的 `healthCheck()`**，不自己写第二份探测。
+  //
+  //   为什么（实测教训）：本文件原先自己发 `POST /chat/completions` 且**只判 HTTP 200**
+  //   → 推理模型下预算被 reasoning 吃光、`content` 为空也报 `available:true`（**假绿**），
+  //   后果是热切换"探测不通就回滚"失效 → 抽取静默产出 0 卡片。
+  //   provider 层早已修好（预算 512 + 空 content 不算成功 + 诊断信息），
+  //   所以这里**构造一个临时 provider（只换 model）并调它的 healthCheck**：
+  //   判据、预算、reason 文案全部与 `/capabilities` 一致，不会漂。
   // ───────────────────────────────────────────────────────────────────
   async probe(model: string, opts: { force?: boolean } = {}): Promise<ModelProbe> {
-    const creds = this.creds;
     const now = this.now();
     if (!opts.force) {
       const hit = this.cache.get(model);
       if (hit && now - hit.checkedAt < this.ttl()) return hit;
     }
-    if (!creds || !creds.baseUrl || !creds.apiKey) {
-      const reason = creds
-        ? '凭据未配置：缺少 base_url / api_key（检查 config/providers.yaml 与 .env）'
+    const entry = this.llmEntry();
+    if (!entry) {
+      const reason = this.opts.cfg.llm
+        ? 'LLM 凭据不完整（缺 base_url / api_key / model）→ 检查 config/providers.yaml 与 .env'
         : '没有启用中的 LLM provider（config/providers.yaml 里 llm 段为空？）';
-      const miss: ModelProbe = { available: false, latencyMs: 0, reason, probe: 'config', checkedAt: now };
+      const miss: ModelProbe = {
+        available: false,
+        latencyMs: 0,
+        reason,
+        probe: 'config',
+        checkedAt: now,
+        judgedBy: 'provider.healthCheck',
+      };
       this.cache.set(model, miss);
       return miss;
     }
 
-    const doFetch = this.opts.fetchImpl ?? fetch;
     const timeoutMs = this.opts.timeoutMs ?? 10_000;
-    const url = `${creds.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-    const t0 = this.now();
-    const probeDesc = `POST ${url} (model=${model}, max_tokens=${PROBE_MAX_TOKENS})`;
-    try {
-      const res = await doFetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${creds.apiKey}` },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'user', content: 'ping' }],
-          max_tokens: PROBE_MAX_TOKENS,
-          temperature: 0,
-        }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      const latencyMs = this.now() - t0;
-      if (res.ok) {
-        const value: ModelProbe = { available: true, latencyMs, reason: '', probe: probeDesc, checkedAt: this.now() };
-        this.cache.set(model, value);
-        return value;
-      }
-      // ⚠️ 失败要把**上游原文**给出来（否则"就是不通"没法排查）；但要过 redact 去掉密钥
-      let snippet = '';
-      try {
-        snippet = (await res.text()).slice(0, 200);
-      } catch {
-        /* 读不到 body 就算了 */
-      }
-      const reason = `${explainHttp(res.status)}${snippet ? `｜上游：${redactSecret(snippet, creds.apiKey)}` : ''}`;
-      const value: ModelProbe = { available: false, latencyMs, reason, probe: probeDesc, checkedAt: this.now() };
-      this.cache.set(model, value);
-      return value;
-    } catch (e) {
-      const latencyMs = this.now() - t0;
-      const msg = e instanceof Error ? e.message : String(e);
-      const aborted = /abort|timeout/i.test(msg);
-      const reason = aborted
-        ? `探测超时（>${timeoutMs}ms）—— 端点在超时内没回；可能是网络/代理问题`
-        : `请求失败：${redactSecret(msg, creds.apiKey)}`;
-      const value: ModelProbe = { available: false, latencyMs, reason, probe: probeDesc, checkedAt: this.now() };
-      this.cache.set(model, value);
-      return value;
+    const provider = this.makeProvider(entry, model);
+    if (!provider) {
+      const miss: ModelProbe = {
+        available: false,
+        latencyMs: 0,
+        reason:
+          `provider 构造失败（entry=${entry.id}）—— 检查 config/providers.yaml 的 base_url / api_key` +
+          `（缺失环境变量：${(entry.missingEnv ?? []).join(', ') || '无'}）`,
+        probe: 'config',
+        checkedAt: now,
+        judgedBy: 'provider.healthCheck',
+      };
+      this.cache.set(model, miss);
+      return miss;
     }
+
+    const t0 = this.now();
+    let ok = false;
+    let reason = '';
+    let probeLabel = `healthCheck(model=${model})`;
+    let latencyMs = 0;
+    try {
+      const health = await provider.healthCheck(AbortSignal.timeout(timeoutMs));
+      ok = health.ok === true;
+      reason = health.reason ?? '';
+      if (health.probe) probeLabel = health.probe;
+      latencyMs = health.latencyMs ?? this.now() - t0;
+    } catch (e) {
+      // provider 承诺 healthCheck 不抛；真抛了也不能让 /models 整体 500（如实转成不可用）
+      reason = `探测抛异常：${redactSecret((e as Error).message, this.secretOf(entry))}`;
+      latencyMs = this.now() - t0;
+      probeLabel = 'healthCheck(threw)';
+    }
+
+    const value: ModelProbe = {
+      available: ok,
+      latencyMs,
+      // ★ 失败必须带**可读原因**（provider 的 reason 已含 finish_reason / reasoning 字符数等诊断）；
+      //   这里再兜一层脱敏，确保任何情况下密钥不会经由 /models 泄露。
+      reason: ok ? '' : redactSecret(reason || '探测失败（provider 未给原因）', this.secretOf(entry)),
+      probe: probeLabel,
+      checkedAt: this.now(),
+      judgedBy: 'provider.healthCheck',
+    };
+    this.cache.set(model, value);
+    return value;
   }
 
   // ───────────────────────────────────────────────────────────────────
@@ -260,6 +344,8 @@ export class ModelCatalog {
         fallback: input.fallbacks.includes(id),
         sources: [...srcSet],
         cached,
+        probe: p.probe,
+        judgedBy: p.judgedBy,
       });
     }
 

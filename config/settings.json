@@ -2,7 +2,7 @@
   "$schema": "./settings.schema.json",
   "version": 1,
   "llm": {
-    "active": "deepseek-v4.1-flash",
+    "active": "glm-5.3",
     "fallbacks": [
       "glm-5.3",
       "kimi-k3"

@@ -48,6 +48,79 @@ export function sanitizeIdPart(value: string): string {
   return value.replace(/[^A-Za-z0-9_\-\u4e00-\u9fff]/g, '').slice(0, 48);
 }
 
+/**
+ * ★ 临时诚实闸：**拒绝"跨调用事务控制语句"**（单发 `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`）。
+ *
+ * ## 为什么必须有（polysemy-prober 的 critical 发现，我已独立复现）
+ * worker 的 `sandbox.exec` 是**每次调用一个独立进程 + 独立连接 + autocommit**
+ * （`worker/sandbox/runner.py`：`isolation_level=None` + 每次 `conn.close()`）→
+ * `BEGIN` 确实开始了事务，但**连接一关事务就没了**。实测：
+ * ```
+ * BEGIN    → ok=True        ← 看起来成功（假象）
+ * INSERT   → ok=True        ← 看起来成功
+ * ROLLBACK → ok=False E_SQL_EXEC "cannot rollback - no transaction is active"
+ * 回滚后 count=2           ← ★ 期望 1：数据**已被提交**
+ * ```
+ * 学生会以为"回滚成功"，实际写坏了数据 —— 典型的"看起来成功"，比报错危险得多。
+ *
+ * ## 为什么在 HTTP 层拦而不是等 worker 修
+ * 正确修法在 worker（会话级长连接 / 显式事务 API），但**这个假象不能带上线**。
+ * 拦在这里可以立刻把"静默说谎"变成"如实说明"，且**不削弱安全设计**（仍是每次一进程 + 硬超时）。
+ *
+ * ## 学生怎么做事务实验？→ **单次调用 + `multi:true`**（我已实测可用）
+ * ```
+ * POST /sandbox/execute {"sql":"BEGIN; INSERT INTO t VALUES(3); ROLLBACK;", "multi":true}
+ *   → ok=True，回滚后行数不变 ✅
+ * POST /sandbox/execute {"sql":"BEGIN; INSERT INTO t VALUES(4); COMMIT;", "multi":true}
+ *   → ok=True，行数 +1 ✅
+ * ```
+ *
+ * ⚠️ **worker 实现会话级事务后请把它改成 `false`**（或在 `sandbox.engines` 的能力报告里
+ *    给出 `transactions.cross_call=true` 后自动判定）—— 那时单发 `BEGIN` 才有意义。
+ */
+export const REJECT_CROSS_CALL_TX = true;
+
+/** 跨调用事务控制语句（词法判定，足够严格：只认"整条语句就是它"）。 */
+const TX_CONTROL_RE = /^\s*(begin(\s+(deferred|immediate|exclusive|transaction))?|commit(\s+transaction)?|rollback(\s+transaction)?|savepoint\s+\S+|release(\s+savepoint)?\s+\S+)\s*;?\s*$/i;
+
+export function isCrossCallTxControl(sql: string): boolean {
+  return TX_CONTROL_RE.test(sql);
+}
+
+/** 跨调用事务被拒时的**如实**响应（HTTP 200 + `ok:false`，与"规则拒绝"同一形状）。 */
+export function crossCallTxRejection(sessionId: string, sql: string): Record<string, unknown> {
+  return {
+    sessionId,
+    ok: false,
+    columns: [],
+    rows: [],
+    rowCount: 0,
+    truncated: false,
+    elapsedMs: 0,
+    statementKind: null,
+    affected: null,
+    hints: [],
+    killedBy: null,
+    hardKilled: false,
+    error: {
+      code: 'E_SQL_UNSUPPORTED',
+      message:
+        '沙箱每次执行都是**独立进程**，事务状态无法跨调用保留：单独发 BEGIN/COMMIT/ROLLBACK 不具备事务语义',
+      raw: sql,
+      hint:
+        '做事务实验请把整批语句放在**同一次**请求里：{"sql":"BEGIN; INSERT …; ROLLBACK;","multi":true}（已在同一次调用内实测可用）；或用 POST /sandbox/reset 恢复初始数据',
+      localReading: '沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）',
+      localMatched: true,
+      // 责任方 = 沙箱规则/能力限制（**不是学生的错**），与 §10.3 的 who 枚举一致
+      who: 'rules',
+      who_label: '沙箱能力限制',
+      who_source: 'http-layer-guard',
+      interim: true,
+      see_also: 'worker/sandbox/runner.py（每次调用独立进程 + autocommit）',
+    },
+  };
+}
+
 /** userId → 可放进会话 id 的**可逆**片段（base64url：只含 `A-Za-z0-9-_`，符合 worker 白名单）。 */
 export function encodeOwner(userId: string): string {
   return Buffer.from(userId, 'utf8').toString('base64url');
@@ -222,6 +295,13 @@ export function registerSandboxRoutes(app: FastifyInstance, deps: AppDeps): void
       assertOwnSession(user.id, sessionId);
       const maxRows = num(body.maxRows, lim.maxRows, 1, 5000);
       const timeoutMs = num(body.timeoutMs, lim.timeoutMs, 100, 60_000);
+
+      // ★ 临时诚实闸：单发的 BEGIN/COMMIT/ROLLBACK… 在"每次一进程"的沙箱里**不具备事务语义**
+      //   （worker 连接一关事务就没了）→ 宁可如实拒绝，也不返回一个假的 ok:true。
+      //   `multi:true`（整批在同一次调用内）不受影响，那是**真正可用**的事务实验路径。
+      if (REJECT_CROSS_CALL_TX && body.multi !== true && isCrossCallTxControl(sql)) {
+        return reply.send(crossCallTxRejection(sessionId, sql));
+      }
 
       const out = await callWorker(
         'sandbox.exec',

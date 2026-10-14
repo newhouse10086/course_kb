@@ -177,8 +177,16 @@ interface Ctx {
 }
 
 async function makeCtx(opts: {
-  /** URL 子串 → 响应；未命中给 200 ok */
-  routes?: Record<string, { status: number; body?: string }>;
+  /**
+   * 脚本化的 **healthCheck 结果**（按模型名）。
+   *
+   * ⚠️ 探测已改为**复用 provider 层的 `healthCheck()`**（单一实现），
+   * 所以这里注入的是"provider 探测结果"，而不是 HTTP 响应 —— 早期版本按 URL/HTTP 脚本化，
+   * 在换成 provider 路径后会**静默去连真网络**。
+   */
+  probes?: Record<string, { ok: boolean; reason?: string; latencyMs?: number }>;
+  /** `/models` 发现端点的 HTTP 响应（这条仍走我自己的 fetch） */
+  discovery?: { status: number; body?: string };
   settings?: Record<string, unknown>;
   /** 起几个"在跑"的 LLM 任务 */
   running?: { kind: string; params?: Record<string, unknown> }[];
@@ -219,22 +227,34 @@ async function makeCtx(opts: {
     fetchImpl: fakeFetch((url, init) => {
       calls.push(url);
       if (url.endsWith('/models')) {
-        const hit = opts.routes?.['__discovery'];
-        if (hit) return hit;
+        if (opts.discovery) return opts.discovery;
         return { status: 200, body: JSON.stringify({ data: [{ id: 'discovered-1' }, { id: 'discovered-2' }] }) };
       }
-      // ⚠️ 模型名在**请求体**里，不在 URL 里 —— 早期版本按 URL 匹配，
-      //    结果"给 model-beta 配 402"永远不生效（测试会莫名其妙地全绿）。
-      let model = '';
-      try {
-        model = String((JSON.parse(String(init?.body ?? '{}')) as { model?: string }).model ?? '');
-      } catch {
-        model = '';
-      }
-      const hit = opts.routes?.[model];
-      if (hit) return hit;
+      void init;
       return { status: 200, body: JSON.stringify({ choices: [{ message: { content: 'pong' } }] }) };
     }),
+    // ★ 注入脚本化 provider（探测走 provider 层的 healthCheck 契约）
+    makeProvider: (_entry, model) => {
+      const scripted = opts.probes?.[model];
+      const probeLabel = `POST https://fake.local/v1/chat/completions (model=${model}, max_tokens=512)`;
+      return {
+        info: {
+          id: 'amr', kind: 'llm', label: `fake(${model})`, vendor: 'fake', runtime: 'cloud',
+          configured: true, available: false, capabilities: {},
+        },
+        async healthCheck() {
+          if (scripted) {
+            return {
+              ok: scripted.ok,
+              ...(scripted.reason ? { reason: scripted.reason } : {}),
+              latencyMs: scripted.latencyMs ?? 1,
+              probe: probeLabel,
+            };
+          }
+          return { ok: true, latencyMs: 1, probe: probeLabel };
+        },
+      };
+    },
   });
 
   const store = new SettingsStore({ root: dir, file, pollMs: 50, fsWatch: false });
@@ -461,7 +481,9 @@ test('GET /models：每个模型都有 available/latencyMs/reason，且来自**�
   await withCtx({}, async (ctx) => {
     const r = await req(ctx, 'GET', '/api/v1/models', { as: 'teacher' });
     assert.equal(r.status, 200);
-    const models = r.body.models as { id: string; available: boolean; latencyMs: number; active: boolean; sources: string[] }[];
+    const models = r.body.models as {
+      id: string; available: boolean; latencyMs: number; active: boolean; sources: string[]; probe: string;
+    }[];
     const ids = models.map((m) => m.id).sort();
     // 候选 = settings.active + fallbacks + provider 配的 model + 端点发现
     assert.deepEqual(ids, [MODEL_A, 'cfg-model', 'discovered-1', 'discovered-2', 'fallback-1'].sort());
@@ -473,55 +495,99 @@ test('GET /models：每个模型都有 available/latencyMs/reason，且来自**�
     assert.equal(models[0]?.active, true);
     assert.equal(r.body.activeModel, MODEL_A);
     assert.equal(r.body.activeAvailable, true);
-    // 真发了 chat/completions 请求（不是照抄配置）
-    assert.ok(ctx.calls.some((u) => u.endsWith('/chat/completions')), `应真探测，实际调用：${JSON.stringify(ctx.calls)}`);
+    // 判定来自 provider 层的 healthCheck（不是我自己发的裸请求）
+    assert.match(String(models[0]?.probe), /max_tokens=512/, '必须用 provider 层的 512 预算');
     assert.equal((r.body.discovery as Record<string, unknown>).ok, true);
   });
 });
 
-test('GET /models：模型 402 → available:false + 可读 reason（区分"欠费"而不是"请求失败"）', async () => {
+test('★ GET /models：模型探测不通 → available:false + **可读 reason**（不假绿）', async () => {
   await withCtx(
-    { routes: { [MODEL_B]: { status: 402, body: JSON.stringify({ error: { message: 'insufficient_balance' } }) } }, settings: { version: 1, llm: { active: MODEL_A, fallbacks: [MODEL_B] } } },
+    {
+      settings: { version: 1, llm: { active: MODEL_A, fallbacks: [MODEL_B] } },
+      probes: {
+        [MODEL_B]: {
+          ok: false,
+          reason:
+            '额度不足/欠费（本项目实测遇到过 Coding Plan 配额耗尽，响应头会带 reset_at）（HTTP 402：insufficient_balance）',
+          latencyMs: 8,
+        },
+      },
+    },
     async (ctx) => {
       const r = await req(ctx, 'GET', '/api/v1/models', { as: 'admin' });
       const models = r.body.models as { id: string; available: boolean; reason: string }[];
       const bad = models.find((m) => m.id === MODEL_B);
       assert.ok(bad, '应有 model-beta');
       assert.equal(bad?.available, false);
-      assert.match(bad?.reason ?? '', /HTTP 402：余额不足/);
+      assert.match(bad?.reason ?? '', /额度不足|欠费/);
       assert.match(bad?.reason ?? '', /insufficient_balance/, '要带上游原文（已脱敏）');
       assert.equal(r.body.activeAvailable, true, '当前模型仍可用');
+      // ★ 失败原因里绝不能有密钥
+      assert.ok(!/sk-fake-key/.test(String(bad?.reason)), 'reason 不得泄漏 api key');
     },
   );
 });
 
-test('GET /models：探测抛异常（超时）→ available:false + 超时说明', async () => {
+test('★ GET /models：**HTTP 200 但 content 为空**（推理 token 吃光预算）→ available:false【旧实现会红】', async () => {
+  // 这条走**真 provider 路径**（补丁 globalThis.fetch），因此验证的是 provider 层的
+  // 空 content 判定 —— 旧实现（只看 HTTP 200）在这里会报 available:true（假绿）。
+  await withCtx(
+    { settings: { version: 1, llm: { active: MODEL_A } } },
+    async (ctx) => {
+      const orig = globalThis.fetch;
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: '', reasoning_content: '推理'+'很长'.repeat(40) }, finish_reason: 'length' }],
+            usage: { completion_tokens: 8, completion_tokens_details: { reasoning_tokens: 31 } },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )) as typeof fetch;
+      try {
+        const { ModelCatalog } = await import('../src/settings/models.ts');
+        const realCatalog = new ModelCatalog({ cfg: ctx.cfg, timeoutMs: 500 });
+        const p = await realCatalog.probe(MODEL_A, { force: true });
+        assert.equal(p.available, false, 'HTTP 200 且 content 为空 → 必须判为**不可用**');
+        assert.match(p.reason, /E_LLM_EMPTY_CONTENT/);
+        assert.match(p.reason, /finish_reason=length/);
+        assert.match(p.reason, /reasoning_content=\d+ 字符/);
+        assert.equal(p.judgedBy, 'provider.healthCheck');
+      } finally {
+        globalThis.fetch = orig;
+      }
+    },
+  );
+});
+
+test('GET /models：healthCheck 抛异常 → available:false（不让 /models 整体 500）', async () => {
   await withCtx(
     {
       settings: { version: 1, llm: { active: MODEL_A } },
-      routes: Object.fromEntries(
-        [MODEL_A].map(() => [] as unknown as [string, { status: number }]),
-      ) as Record<string, { status: number }>,
+      probes: {},
     },
     async (ctx) => {
-      // 直接换掉 catalog 的探测路径：让 fetch 抛错
+      const { ModelCatalog } = await import('../src/settings/models.ts');
       const cat = new ModelCatalog({
         cfg: ctx.cfg,
         timeoutMs: 500,
-        fetchImpl: (async () => {
-          throw new Error('The operation was aborted');
-        }) as typeof fetch,
+        makeProvider: () => ({
+          info: { id: 'x', kind: 'llm', label: 'x', vendor: 'x', runtime: 'cloud', configured: true, available: false, capabilities: {} },
+          healthCheck() {
+            throw new Error('boom: connection reset');
+          },
+        }),
       });
       const list = await cat.list({ active: MODEL_A, fallbacks: [] });
       assert.equal(list.models[0]?.available, false);
-      assert.match(list.models[0]?.reason ?? '', /探测超时/);
+      assert.match(list.models[0]?.reason ?? '', /探测抛异常：boom/);
     },
   );
 });
 
 test('GET /models：/models 发现失败 → discovery.ok=false 且**不影响**其它字段', async () => {
   await withCtx(
-    { routes: { __discovery: { status: 404, body: '{"error":"not found"}' } } },
+    { discovery: { status: 404, body: '{"error":"not found"}' } },
     async (ctx) => {
       const r = await req(ctx, 'GET', '/api/v1/models', { as: 'admin' });
       assert.equal(r.status, 200);
@@ -668,13 +734,13 @@ test('★ switch mode:abort → cancel → 等终态 → 切 → 续推（同一
 
 test('★ switch：新模型探测失败 → **502 E_MODEL_PROBE + 回滚**（内存与磁盘都回旧值）', async () => {
   await withCtx(
-    { routes: { [MODEL_B]: { status: 401, body: '{"error":{"message":"invalid api key"}}' } } },
+    { probes: { [MODEL_B]: { ok: false, reason: '凭据无效或已过期，请检查 API key（HTTP 401）', latencyMs: 5 } } },
     async (ctx) => {
       const r = await req(ctx, 'POST', '/api/v1/settings/llm/switch', { as: 'admin', body: { model: MODEL_B, mode: 'now' } });
       assert.equal(r.status, 502);
       assert.equal(codeOf(r.body), 'E_MODEL_PROBE');
       assert.match(msgOf(r.body), /已\*\*回滚\*\*到 model-alpha/);
-      assert.match((r.body.error as Record<string, string>).detail ?? '', /HTTP 401：凭据无效/);
+      assert.match((r.body.error as Record<string, string>).detail ?? '', /凭据无效或已过期/);
       // ★ 回滚：内存 + 磁盘
       assert.equal(ctx.store.get().llm.active, MODEL_A);
       const onDisk = JSON.parse(fs.readFileSync(ctx.file, 'utf8')) as { llm: { active: string } };
@@ -685,6 +751,44 @@ test('★ switch：新模型探测失败 → **502 E_MODEL_PROBE + 回滚**（�
       assert.match(String(audit.entries[0]?.detail_json), /"result":"failed"/);
     },
   );
+});
+
+test('★ switch 回滚：新模型"能连通但 content 为空"（真 provider 判定）→ 502 + 回滚', async () => {
+  // 这是 `/models` 假绿 bug 的**后果级**回归测试：若 `available` 不可信，
+  // 切到"通但产不出内容"的模型不会回滚 → 抽取静默 0 卡片。
+  await withCtx({}, async (ctx) => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '', reasoning_content: 're'.repeat(30) }, finish_reason: 'length' }],
+          usage: { completion_tokens: 8, completion_tokens_details: { reasoning_tokens: 31 } },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )) as typeof fetch;
+    try {
+      const { ModelCatalog } = await import('../src/settings/models.ts');
+      const { ModelSwitcher } = await import('../src/settings/switcher.ts');
+      const realCatalog = new ModelCatalog({ cfg: ctx.cfg, timeoutMs: 500 });
+      const sw = new ModelSwitcher({
+        cfg: ctx.cfg, store: ctx.store, repo: ctx.repo, catalog: realCatalog, queue: ctx.queue,
+      });
+      await assert.rejects(
+        () => sw.switch({ model: MODEL_B, mode: 'now', userId: 'u-admin' }),
+        (e: unknown) => {
+          const err = e as { code?: string; message?: string };
+          assert.equal(err.code, 'E_MODEL_PROBE', `应回滚并报 E_MODEL_PROBE，实际：${err.code}`);
+          assert.match(String(err.message), /E_LLM_EMPTY_CONTENT|content 为空/);
+          return true;
+        },
+      );
+      assert.equal(ctx.store.get().llm.active, MODEL_A, '★ 必须回滚到旧模型');
+      const onDisk = JSON.parse(fs.readFileSync(ctx.file, 'utf8')) as { llm: { active: string } };
+      assert.equal(onDisk.llm.active, MODEL_A, '★ 磁盘也必须回滚');
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
 });
 
 test('switch：切到当前模型 → 只探测不切（幂等，notes 说明）', async () => {

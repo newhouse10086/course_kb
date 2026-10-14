@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 /**
  * SQL 练习台（学生端）—— docs/LAB_DB_DEPLOY.md §6/§7 + docs/SETTINGS_AND_SANDBOX.md §3
  *
@@ -42,7 +42,22 @@ const tables = ref<SandboxTable[]>([])
 const sql = ref('SELECT * FROM student')
 const history = ref<Array<{ sql: string; ok: boolean; at: number }>>([])
 const result = ref<SandboxResult | null>(null)
-const runError = ref<{ code: string; msg: string; hint?: string; who?: string } | null>(null)
+/** 错误归因三档（由后端 `error.who` 驱动；缺省 unknown 就如实显示原始错误） */
+type WhoKind = 'student' | 'rules' | 'system' | 'unknown'
+const runError = ref<{
+  code: string; msg: string; hint?: string; localReading?: string
+  who?: string; whoLabel?: string; kind?: WhoKind
+  killedBy?: string; hardKilled?: boolean
+} | null>(null)
+
+/** 三档话术（Lead 要求：三种绝不能长得一样） */
+const WHO_TEXT: Record<WhoKind, { title: string; tone: string; note: string }> = {
+  student: { title: '你的 SQL 有问题（可以自己改）', tone: 'student', note: '这是**学生的错**：按下面的提示改写法再跑一次。' },
+  rules: { title: '被沙箱安全策略拒绝（不是 SQL 写错）', tone: 'rules', note: '这是**规则限制**：课程沙箱不允许这类语句，改写法没有用，需要换思路（见对照表）。' },
+  system: { title: '执行被中断 / 系统侧问题', tone: 'system', note: '这是**系统或超时**：语句可能没写完就被停掉了 —— 看下面的 killedBy 归因，别当成语法错。' },
+  unknown: { title: '执行失败（后端未给出归因）', tone: 'unknown', note: '后端没有给 `who`：下面只显示原始错误，**不猜**是谁的问题。' },
+}
+const whoText = computed(() => WHO_TEXT[(runError.value?.kind || 'unknown') as WhoKind])
 const busy = ref(false)
 const note = ref('')
 const noteKind = ref<'info' | 'ok' | 'bad' | 'warn'>('info')
@@ -177,11 +192,25 @@ async function run() {
     result.value = { ...r, maxRows: Number(limits.value.maxRows) || 200 }
     if (r.schema) tables.value = schemaToTables(r.schema)
     if (r.error) {
-      // 真后端错误对象：message + hint + who_label（分类器结论）→ 三个都显示，别只显示 code
-      runError.value = { code: r.error.code, msg: r.error.message || r.error.raw || '', hint: r.error.hint || '', who: r.error.who_label || '' }
+      /**
+       * ★ `who` 必须驱动话术（Lead 硬要求）："学生的错 / 规则限制 / 系统或超时"三种**绝不能长得一样**。
+       * 真后端实测分类（2026-10-15）：
+       *   student       → E_SQL_SYNTAX / E_SQL_NO_OBJECT（写错了，可以自己改）
+       *   rules         → E_SQL_FORBIDDEN / E_SQL_PRAGMA / E_SQL_MULTI（安全闸拒绝，**不是写错**）
+       *   student_logic → E_SQL_TIMEOUT（逻辑问题导致跑不完，但**是执行被中断**，配 killedBy/hardKilled）
+       *   其它/缺失      → 如实显示原始错误，不猜归因
+       */
+      const who = String(r.error.who || '')
+      const kind: WhoKind = who === 'student' ? 'student' : who === 'rules' ? 'rules' : who ? 'system' : 'unknown'
+      runError.value = {
+        code: r.error.code, msg: r.error.message || r.error.raw || '',
+        hint: r.error.hint || '', localReading: r.error.localReading || '',
+        who, whoLabel: r.error.who_label || '', kind,
+        killedBy: r.killedBy, hardKilled: r.hardKilled,
+      }
       history.value = [{ sql: text, ok: false, at: Date.now() }, ...history.value].slice(0, 30)
       note.value = `${r.error.code}：${r.error.message || r.error.raw || ''}`
-      noteKind.value = 'bad'
+      noteKind.value = kind === 'rules' ? 'warn' : 'bad'
       if (r.killedBy) note.value += `（${r.killedBy}${r.hardKilled ? ' / 硬杀' : ''}）`
     } else {
       history.value = [{ sql: text, ok: true, at: Date.now() }, ...history.value].slice(0, 30)
@@ -340,23 +369,49 @@ async function runSelftest() {
   await exec('COMMIT')
 
   // ② JOIN + 聚合（课程 Real 场景）
-  const join = await exec('SELECT s.sname, c.cname, sc.grade FROM sc JOIN student s ON sc.sno = s.sno JOIN course c ON sc.cno = c.cno ORDER BY sc.grade DESC LIMIT 3')
+  const join = await exec('SELECT st.sname, co.cname, en.grade FROM enrollments en JOIN students st ON en.sid = st.sid JOIN courses co ON en.cid = co.cid ORDER BY en.grade DESC LIMIT 3')
   rec('join', { cols: join.result?.columns, rows: join.result?.rows })
   need('join', !join.error && join.result?.rowCount === 3)
-  const agg = await exec('SELECT sdept, COUNT(*) AS n FROM student GROUP BY sdept')
+  const agg = await exec('SELECT dept, COUNT(*) AS n FROM students GROUP BY dept')
   rec('agg', { cols: agg.result?.columns, rows: agg.result?.rows })
   need('agg', !agg.error && agg.result?.rowCount === 3)
+
+  // ★ 错误三档必须**长得不一样**（Lead 硬要求：由后端 error.who 驱动）
+  const whoKind = async (sql: string) => {
+    await exec(sql)
+    await nextTick()
+    const el = document.querySelector('[data-testid="run-error"]') as HTMLElement | null
+    return {
+      kind: el?.dataset.whoKind || null, who: el?.dataset.who || null, code: el?.dataset.code || null,
+      tone: (el?.querySelector('.who-badge') as HTMLElement | null)?.dataset.tone || null,
+      text: (el?.textContent || '').replace(/\s+/g, ' ').slice(0, 120),
+    }
+  }
+  const eSyntax = await whoKind('SELEC * FROM students')
+  const eRules = await whoKind("ATTACH DATABASE 'other.db' AS other")
+  const eTimeout = await whoKind('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c')
+  rec('who_student', eSyntax)
+  rec('who_rules', eRules)
+  rec('who_system', eTimeout)
+  need('who_student_kind', eSyntax.kind === 'student' && eSyntax.code === 'E_SQL_SYNTAX')
+  need('who_rules_kind', eRules.kind === 'rules' && eRules.code === 'E_SQL_FORBIDDEN')
+  need('who_system_kind', eTimeout.kind === 'system' && eTimeout.code === 'E_SQL_TIMEOUT')
+  need('who_tones_differ', !!eSyntax.tone && !!eRules.tone && !!eTimeout.tone
+    && new Set([eSyntax.tone, eRules.tone, eTimeout.tone]).size === 3)
+  need('who_wording_differs', new Set([eSyntax.text, eRules.text, eTimeout.text]).size === 3
+    && /规则限制/.test(eRules.text) && /系统|中断/.test(eTimeout.text))
+  rec('kill_attribution', (document.querySelector('[data-testid="kill-attribution"]')?.textContent || '').replace(/\s+/g, ' ').slice(0, 90))
 
   // ③ 安全红线（必须被拒，且原因可读）
   const attach = await exec("ATTACH DATABASE 'other.db' AS other")
   rec('attach_blocked', attach.error)
-  need('attach_blocked', attach.error?.code === 'E_SANDBOX_FORBIDDEN')
+  need('attach_blocked', attach.error?.code === 'E_SQL_FORBIDDEN')
   const multi = await exec('SELECT 1; DROP TABLE student')
   rec('multi_blocked', multi.error)
-  need('multi_blocked', !!multi.error)
+  need('multi_blocked', multi.error?.code === 'E_SQL_MULTI')
   const badTable = await exec('SELECT * FROM no_such_table')
   rec('bad_table_error', badTable.error)
-  need('bad_table_error', badTable.error?.code === 'E_SANDBOX_SQL' && /no such table/.test(badTable.error?.msg || ''))
+  need('bad_table_error', badTable.error?.code === 'E_SQL_NO_OBJECT' && /no such table/.test(badTable.error?.msg || ''))
 
   // ④ maxRows 截断要明示
   const many = await exec('SELECT * FROM sc')
@@ -494,9 +549,36 @@ async function runSelftest() {
         </div>
 
         <!-- 结果 -->
-        <div v-if="runError" class="note bad" data-testid="run-error" :data-code="runError.code">
-          <b>{{ runError.code }}</b>：{{ runError.msg }}
-          <div class="small" style="margin-top: 4px">看不懂报错？点上面的<b>答疑</b>，让 AI 先帮你定位是哪一类问题。</div>
+        <!-- ★ 错误按 `who` 分三档渲染（Lead 硬要求）：学生的错 / 规则限制 / 系统超时 —— 长得不一样 -->
+        <div
+          v-if="runError"
+          class="note who-note"
+          :class="runError.kind === 'rules' ? 'warn' : 'bad'"
+          data-testid="run-error"
+          :data-code="runError.code"
+          :data-who="runError.who || ''"
+          :data-who-kind="runError.kind"
+        >
+          <div class="who-head">
+            <span class="who-badge" :data-tone="whoText.tone">{{ runError.whoLabel || whoText.title }}</span>
+            <b>{{ runError.code }}</b>
+            <span class="small muted">{{ whoText.title }}</span>
+          </div>
+          <div class="who-body">{{ runError.localReading || runError.msg }}</div>
+          <div v-if="runError.hint" class="small" style="margin-top: 4px">
+            <b>怎么改：</b>{{ runError.hint }}
+          </div>
+          <div v-if="runError.killedBy" class="small" style="margin-top: 4px" data-testid="kill-attribution">
+            中断归因：<code>killedBy={{ runError.killedBy }}</code>
+            <code>hardKilled={{ runError.hardKilled ? 'true' : 'false' }}</code>
+            {{ runError.hardKilled ? '（进程被硬杀，可能已留下半成品数据）' : '（进程正常退出，数据未受影响）' }}
+          </div>
+          <div class="small" style="margin-top: 4px">{{ whoText.note }}</div>
+          <div class="small" style="margin-top: 4px">
+            <span v-if="runError.kind === 'student'">看不懂报错？点上面的<b>答疑</b>，让 AI 先帮你定位是哪一类问题。</span>
+            <span v-else-if="runError.kind === 'rules'">这类拒绝是**设计如此**，别改 SQL 硬试；点<b>答疑</b>可以问"这类实验该怎么做"。</span>
+            <span v-else>这类失败不是你的 SQL 写错；点<b>答疑</b>可以把 killedBy 一起交给 AI 分析。</span>
+          </div>
         </div>
         <div v-else-if="result" class="result" data-testid="result">
           <div class="small muted" data-testid="result-meta">
@@ -592,7 +674,20 @@ async function runSelftest() {
 .stages { margin: 6px 0; padding-left: 18px; }
 .asktext { white-space: pre-wrap; font-family: var(--font-body); font-size: 13.5px; }
 .cites { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+/* 三档错误的视觉区分：徽标颜色 + 左边框（学生的错=橙、规则=蓝、系统=红） */
+.who-note { border-left: 3px solid var(--bad); }
+.who-note.warn { border-left-color: var(--warn); }
+.who-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.who-badge { display: inline-block; padding: 1px 7px; font-size: 12px; font-weight: 600;
+  border: var(--hair) solid currentColor; border-radius: var(--r-sm); }
+.who-badge[data-tone="student"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.who-badge[data-tone="rules"] { color: var(--accent-ink); background: var(--accent-soft); }
+.who-badge[data-tone="system"] { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.who-badge[data-tone="unknown"] { color: var(--muted); }
+.who-body { margin-top: 5px; font-size: 13.5px; }
 </style>
+
+
 
 
 

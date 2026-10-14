@@ -343,7 +343,10 @@ export class ModelSwitcher {
           this.auditEvent(req, from, model, 'failed', `drain 超时（剩 ${still.length} 个 LLM 任务）`);
           return {
             ok: true, mode: req.mode, activeModel: from, switchedFrom: from, switchedAt: this.now(),
-            probe: { available: false, latencyMs: 0, reason: '未执行（drain 超时）', probe: 'skipped', checkedAt: this.now() },
+            probe: {
+              available: false, latencyMs: 0, reason: '未执行（drain 超时）', probe: 'skipped',
+              checkedAt: this.now(), judgedBy: 'provider.healthCheck',
+            },
             waitedMs: this.now() - t0, state: 'timeout', drained, aborted: [], resumed: [],
             admissionPaused, stillRunning: still, rolledBack: false, notes,
           };

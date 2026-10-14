@@ -565,7 +565,7 @@ def main() -> int:
             ok("引擎列表来自 /capabilities.sandbox.engines（含不可用项及原因）",
                len(engines) >= 2 and any(not e.get("available") and e.get("reason") for e in engines),
                json.dumps(engines, ensure_ascii=False)[:200])
-            eq("数据集数量", len(rep.get("datasets") or []), 3)
+            eq("数据集数量（真后端默认 sc + 我保留的 3 套）", len(rep.get("datasets") or []), 4)
             ok("方言显著标注", "SQLite" in str(rep.get("dialect")))
             ok("maxRows 声明在页面上", has(lab_dom, r'data-testid="limits"') and "maxRows=" in lab_dom)
             ok("方言差异表（诚实标注 SQLite ≠ MySQL）",
@@ -588,18 +588,38 @@ def main() -> int:
                json.dumps(j, ensure_ascii=False))
             a = c.get("agg") or {}
             ok("GROUP BY 聚合", len(a.get("rows") or []) == 3, json.dumps(a, ensure_ascii=False))
-            ok("reset 回到初始 schema（student 5 行）",
-               any("student(5)" == str(t) for t in (c.get("reset_tables") or [])), json.dumps(c.get("reset_tables"), ensure_ascii=False))
+            ok("reset 回到初始 schema（默认数据集 sc：students/courses/enrollments 行数 >0）",
+               sum(1 for t in (c.get("reset_tables") or []) if "(" in str(t) and str(t).split("(")[1].rstrip(")").isdigit()
+                   and int(str(t).split("(")[1].rstrip(")")) > 0) >= 2,
+               json.dumps(c.get("reset_tables"), ensure_ascii=False))
             # 安全红线
-            ok("ATTACH 被拒（E_SANDBOX_FORBIDDEN）", (c.get("attach_blocked") or {}).get("code") == "E_SANDBOX_FORBIDDEN")
-            ok("多语句拼接被拒", (c.get("multi_blocked") or {}).get("code") == "E_SANDBOX_MULTI")
-            ok("报错文本是 SQL 原生错误（no such table）", "no such table" in str((c.get("bad_table_error") or {}).get("msg")))
+            ok("ATTACH 被拒（E_SQL_FORBIDDEN）", (c.get("attach_blocked") or {}).get("code") == "E_SQL_FORBIDDEN")
+            ok("多语句拼接被拒（E_SQL_MULTI）", (c.get("multi_blocked") or {}).get("code") == "E_SQL_MULTI")
+            ok("报错文本是 SQL 原生错误（no such table + E_SQL_NO_OBJECT）",
+               "no such table" in str((c.get("bad_table_error") or {}).get("msg"))
+               and (c.get("bad_table_error") or {}).get("code") == "E_SQL_NO_OBJECT",
+               json.dumps(c.get("bad_table_error"), ensure_ascii=False)[:160])
             # ★ 答疑
             ask = c.get("ask") or {}
             ok("答疑流式返回（>40 字）", int(ask.get("len") or 0) > 40, json.dumps(ask, ensure_ascii=False)[:160])
             ok("答疑看到学生的真实报错", "no such table" in str((ask.get("context") or {}).get("error")))
             ok("答疑是「先问后引」而不是直接给答案", "先别急着" in str(ask.get("head")))
             ok("答疑引用知识库卡片（≥1）", int(ask.get("citations") or 0) > 0)
+            # ★ 错误归因三档（Lead 硬要求：三种不能长得一样）
+            w1, w2, w3 = c.get("who_student") or {}, c.get("who_rules") or {}, c.get("who_system") or {}
+            ok("学生的错：who=student + E_SQL_SYNTAX", w1.get("kind") == "student" and w1.get("code") == "E_SQL_SYNTAX",
+               json.dumps(w1, ensure_ascii=False)[:180])
+            ok("规则限制：who=rules + E_SQL_FORBIDDEN", w2.get("kind") == "rules" and w2.get("code") == "E_SQL_FORBIDDEN",
+               json.dumps(w2, ensure_ascii=False)[:180])
+            ok("系统/超时：E_SQL_TIMEOUT + killedBy 归因", w3.get("kind") == "system" and w3.get("code") == "E_SQL_TIMEOUT",
+               json.dumps(w3, ensure_ascii=False)[:180])
+            ok("三档视觉色调互不相同", len({w1.get("tone"), w2.get("tone"), w3.get("tone")}) == 3,
+               f"{w1.get('tone')}/{w2.get('tone')}/{w3.get('tone')}")
+            ok("三档文案互不相同（规则/系统话术各就其位）",
+               len({w1.get("text"), w2.get("text"), w3.get("text")}) == 3
+               and "规则限制" in str(w2.get("text")) and ("系统" in str(w3.get("text")) or "中断" in str(w3.get("text"))),
+               json.dumps([w1.get("text"), w2.get("text"), w3.get("text")], ensure_ascii=False)[:300])
+            ok("超时显示 killedBy/hardKilled 归因", "killedBy=" in str(c.get("kill_attribution")), str(c.get("kill_attribution"))[:120])
             ok("引用链接可跳原文（#/wiki?...&card=）",
                str(c.get("citation_anchor", "")).startswith("#/wiki?") and "card=" in str(c.get("citation_anchor")),
                str(c.get("citation_anchor")))
@@ -614,7 +634,7 @@ def main() -> int:
             # 走页面里的真实执行链路：填 SQL → 点「运行」→ 断言"仅显示前 N 行"提示
             driver.ch.evaluate(
                 "(() => { const t=document.querySelector('[data-testid=\"sql-input\"]');"
-                " t.value='SELECT * FROM sc'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                " t.value='SELECT * FROM enrollments'; t.dispatchEvent(new Event('input',{bubbles:true}));"
                 " setTimeout(() => document.querySelector('[data-testid=\"btn-run\"]').click(), 80); return 1 })()"
             )
             driver.ch.wait_for("!!document.querySelector('[data-testid=\"truncate-note\"]')", timeout=60, interval=0.2)

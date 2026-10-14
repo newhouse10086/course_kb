@@ -649,7 +649,30 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       }
 
       // ---------- 学生虚拟数据库沙箱（SETTINGS §3） ----------
-      if (api === '/sandbox/datasets') return json({ datasets: DATASETS.map(({ id, label, note, schema, seed }) => ({ id, label, note, tables: splitTables(schema), schema, seed })) })
+      // 真形状：`{default, datasets:[{id,label,description,tables,teachingPoints,dialectNotes}]}`
+      // 真后端 `GET /settings/llm`：切换相关的只读视图（switchedFrom/switchedAt/busy 在这里，不在 /models）
+      if (api === '/settings/llm' && req.method === 'GET') {
+        return json({
+          activeModel: STATE.activeModel,
+          fallbacks: MODELS.filter((x) => x.fallback).map((x) => x.id),
+          concurrency: 1,
+          switchedFrom: STATE.switchedFrom ?? null,
+          switchedAt: STATE.switchedAt ?? null,
+          busy: STATE.runningLlmTask
+            ? { busy: true, runningLlm: [STATE.running.kind], runningAll: 1, pending: 0, llmKinds: ['extract', 'rollup', 'translate'], source: 'queue.runningSummary' }
+            : { busy: false, runningLlm: [], runningAll: 0, pending: 0, llmKinds: ['extract', 'rollup', 'translate'], source: 'queue.runningSummary' },
+        })
+      }
+
+      if (api === '/sandbox/datasets') {
+        return json({
+          default: DATASET.id,
+          datasets: DATASETS.map(({ id, label, note, description, schema, seed, tables, teachingPoints, dialectNotes }) => ({
+            id, label, description: description || note || '', tables: tables || splitTables(schema),
+            teachingPoints: teachingPoints || [], dialectNotes: dialectNotes || [],
+          })),
+        })
+      }
 
       if (api === '/sandbox/session' && req.method === 'POST') {
         if (degraded) return err(503, 'E_SANDBOX_UNAVAILABLE', STATE.sandbox.engines[0].reason, '见 docs/LAB_DB_DEPLOY.md')
@@ -664,8 +687,16 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
           STATE.dataset = ds.id
           STATE.session = { sessionId: `sbx_${ds.id}_${Math.random().toString(36).slice(2, 8)}`, user: 'student01', engine: 'sqlite', dialect: 'SQLite 3.x' }
           const tables = db.snapshot()
-          json({ ...STATE.session, dataset: ds.id, datasetLabel: ds.label, schema: ds.schema, seed: ds.seed, tables,
-            limits: STATE.sandbox.limits, dialectNotes: DIALECT_NOTES })
+          // 真形状：`{sessionId,engine,dataset,created,dbBytes,schema:{dialect,tables:[{name,columns:[{name,…}],rows}]},limits}`
+          // `tables` 是我早期自造字段 —— 保留它只为兼容旧断言，前端已改为读 schema.tables
+          json({ sessionId: STATE.session.sessionId, engine: 'sqlite', dataset: ds.id, created: true,
+            dbBytes: 20480,
+            schema: { dialect: 'sqlite', tables: tables.map((x) => ({
+              name: x.name, rows: x.rowCount,
+              columns: x.columns.map((c) => ({ name: c, type: 'TEXT' })),
+            })) },
+            tables, limits: STATE.sandbox.limits,
+            dialectNotes: ds.dialectNotes?.length ? ds.dialectNotes : DIALECT_NOTES })
         })
       }
 
@@ -678,28 +709,61 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
           try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch { /* ignore */ }
           if (!STATE.db) return err(409, 'E_SANDBOX_NO_SESSION', '还没有沙箱会话：先 POST /sandbox/session')
           const sql = String(body.sql || '')
+          // ⚠️ sandboxError 把 code 放在 `e.sandbox.code`（真后端形状），不是 `e.code`
+          const killExtra = (e) => ((e.sandbox?.code ?? e.code) === 'E_SQL_TIMEOUT'
+            ? { killedBy: 'progress', hardKilled: false } : {})
           try {
             const r = STATE.db.execute(sql, { maxRows: STATE.sandbox.limits.maxRows })
             STATE.lastSql.unshift({ sql, at: Date.now(), ok: true, rowCount: r.rowCount, elapsedMs: r.elapsedMs })
             STATE.audit.push({ at: Date.now(), action: 'sandbox_execute', sql: sql.slice(0, 200), ok: true })
-            json({ ...r, sessionId: STATE.session.sessionId, engine: 'sqlite', dialect: 'SQLite 3.x',
-              limits: STATE.sandbox.limits, tables: STATE.db.snapshot() })
+            json({ ...r, ok: true, sessionId: STATE.session.sessionId, engine: 'sqlite',
+              statementKind: r.statementKind || null, hints: [],
+              schema: { dialect: 'sqlite', tables: STATE.db.snapshot().map((x) => ({
+                name: x.name, rows: x.rowCount, columns: x.columns.map((c) => ({ name: c, type: 'TEXT' })),
+              })) },
+              limits: STATE.sandbox.limits })
           } catch (e) {
             STATE.lastSql.unshift({ sql, at: Date.now(), ok: false, error: e.message })
             STATE.audit.push({ at: Date.now(), action: 'sandbox_execute', sql: sql.slice(0, 200), ok: false, code: e.code })
-            // 执行失败用 200 + error 字段（前端要显示 SQL 报错，不是把它当网络错误）
-            json({ columns: [], rows: [], rowCount: 0, elapsedMs: 0, truncated: false,
-              maxRows: STATE.sandbox.limits.maxRows, error: { code: e.code || 'E_SANDBOX_SQL', msg: e.message },
-              sessionId: STATE.session.sessionId, engine: 'sqlite', dialect: 'SQLite 3.x', tables: STATE.db.snapshot() })
+            // ★ 真形状：HTTP 200 + ok:false + error（分类器对象：code/raw/message/hint/localReading/who/who_label/who_source）
+            const errObj = e.sandbox || { code: e.code || 'E_SQL_SYNTAX', raw: e.message, message: e.message,
+              hint: '', localReading: e.message, localMatched: false, who: 'system', who_label: '系统侧问题', who_source: 'fallback' }
+            json({ ok: false, columns: [], rows: [], rowCount: 0, elapsedMs: 0, truncated: false,
+              sessionId: STATE.session.sessionId, engine: 'sqlite', statementKind: null,
+              error: errObj, ...killExtra(e) })
           }
         })
       }
 
       if (api === '/sandbox/reset' && req.method === 'POST') {
         if (degraded) return err(503, 'E_SANDBOX_UNAVAILABLE', STATE.sandbox.engines[0].reason)
-        const ds = DATASETS.find((d) => d.id === STATE.dataset) || DATASET
-        STATE.db = new SandboxDb(ds.schema, ds.seed)
-        return json({ ok: true, dataset: ds.id, tables: STATE.db.snapshot(), resetPolicy: STATE.sandbox.resetPolicy })
+        const chunks2 = []
+        req.on('data', (c) => chunks2.push(c))
+        return req.on('end', () => {
+          let body = {}
+          try { body = JSON.parse(Buffer.concat(chunks2).toString('utf8') || '{}') } catch { /* ignore */ }
+          const ds = DATASETS.find((d) => d.id === (body.dataset || STATE.dataset)) || DATASET
+          STATE.db = new SandboxDb(ds.schema, ds.seed)
+          STATE.dataset = ds.id
+          const snap = STATE.db.snapshot()
+          // 真形状：`{sessionId, reset:true, engine, schema}`（**没有 tables 顶层字段**）
+          return json({ sessionId: STATE.session?.sessionId, reset: true, engine: 'sqlite', dataset: ds.id,
+            schema: { dialect: 'sqlite', tables: snap.map((x) => ({ name: x.name, rows: x.rowCount,
+              columns: x.columns.map((c) => ({ name: c, type: 'TEXT' })) })) } })
+        })
+      }
+
+      if (api === '/sandbox/history') {
+        return json({ sessionId: STATE.session?.sessionId, entries: STATE.lastSql.slice(0, 30).map((e) => ({
+          at: e.at, sql: e.sql, ok: e.ok, error: e.error || null, rowCount: e.rowCount ?? 0, elapsedMs: e.elapsedMs ?? 0,
+          kind: String(e.sql).trim().split(/\s+/)[0].toUpperCase(),
+        })) })
+      }
+      if (api === '/sandbox/schema') {
+        const snap = STATE.db ? STATE.db.snapshot() : []
+        return json({ sessionId: STATE.session?.sessionId, dialect: 'sqlite', tables: snap.map((x) => ({
+          name: x.name, rows: x.rowCount, columns: x.columns.map((c) => ({ name: c, type: 'TEXT' })),
+        })) })
       }
 
       // ---------- ★ AI 答疑（SETTINGS §3：先问后引 + 必须引用知识库卡片） ----------
