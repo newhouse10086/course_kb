@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知识库浏览 · 课程知识平台</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div>
+    <div class="brand">课程知识平台</div>
+    <div class="brand-sub" id="doc-stats">加载中…</div>
+  </div>
+  <nav class="nav-links">
+    <a class="nav-link active" href="index.html">知识库</a>
+    <a class="nav-link" href="graph.html">知识图谱</a>
+    <a class="nav-link" href="video.html">视频课堂</a>
+    <a class="nav-link" id="nav-chat" href="chat.html">AI 助教</a>
+  </nav>
+  <div class="search-box">
+    <form id="search-form" style="display:flex;gap:6px;align-items:center">
+      <input type="search" id="search-input" placeholder="搜索知识点 / 章节（中文 bigram）" autocomplete="off">
+      <button type="submit">搜索</button>
+    </form>
+  </div>
+  <select id="doc-select" title="选择文档"></select>
+  <div class="caps" id="caps"></div>
+</header>
+
+<div id="offline" class="note bad hidden" style="margin:14px 20px 0"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="tree-tools">
+      <input type="text" id="tree-filter" placeholder="过滤章节…" autocomplete="off">
+      <button id="tree-expand" type="button" title="展开可见层">展开</button>
+      <button id="tree-collapse" type="button" title="全部收起">收起</button>
+    </div>
+    <nav class="tree" id="tree"></nav>
+  </aside>
+
+  <main class="content">
+    <div id="search-results" class="hidden"></div>
+    <div id="view"><div class="loading">加载知识库…</div></div>
+  </main>
+</div>
+
+<!-- 无构建链：原生 ES module。boot() 在 wiki.js 末尾 / DOMContentLoaded 触发（坑 9）。 -->
+<script type="module" src="assets/wiki.js"></script>
+</body>
+</html>

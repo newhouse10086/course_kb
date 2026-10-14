@@ -1,0 +1,186 @@
+# 模型 Provider 配置样例
+#
+# 用法：复制为 `config/providers.yaml` 并按需填写。
+# ⚠️ **凭据只写 `${环境变量名}` 占位**，真实值放 `course-kb/.env`（已在 .gitignore）。
+#
+# 设计文档：`docs/PROVIDERS.md`
+#
+# ─────────────────────────────────────────────────────────────
+# 三条铁律（实现与配置都要遵守）
+#   R1 `configured`（有凭据）与 `available`（真能用）**分开报**
+#   R2 降级链**每一跳都真探测**，只看配置会给假绿
+#   R3 全链失败 → **如实报错 + 可读 reason，绝不假装成功**
+# ─────────────────────────────────────────────────────────────
+
+# 选择策略：local-first | cloud-first | cost | quality | explicit
+# 决定降级链顺序；链上每一跳都会真探测，失败自动降级下一跳。
+policy:
+  asr: local-first
+  tts: cloud-first
+  translate: cloud-first
+  llm: local-first
+  ocr: local-first
+
+providers:
+
+  # ═══════════════════════════════════════════════════════════
+  # LLM —— 结构化输出（抽卡片、图谱边、分章、摘要、思维导图）
+  # ═══════════════════════════════════════════════════════════
+  # ⚠️ 本项目硬要求：并发 = 1；结构化输出必须 json_schema + strict
+  #    （`json_object` 不强制 enum，实测模型会输出 "etype":"常用实现"）
+  llm:
+    - id: amr
+      type: openai_compatible
+      label: AMR（deepseek-v4.1-flash）
+      vendor: AMR
+      priority: 1
+      base_url: ${AMR_BASE}          # → https://amr-link.open-design.ai/v1
+      api_key: ${AMR_KEY}
+      model: ${LLM_MODEL}            # → deepseek-v4.1-flash
+      enabled: true
+
+    # 备用：任何 OpenAI 兼容端点（换 base_url / model 即可）
+    # - id: openai-backup
+    #   type: openai_compatible
+    #   base_url: https://api.openai.com/v1
+    #   api_key: ${OPENAI_API_KEY}
+    #   model: gpt-4o-mini
+    #   priority: 2
+
+  # ═══════════════════════════════════════════════════════════
+  # ASR —— 语音转文字
+  # ═══════════════════════════════════════════════════════════
+  # 本机实测（docs/PROVIDERS.md §2.3）：
+  #   · 本地 faster-whisper 1.2.1 可用，tiny 模型已缓存
+  #   · **RTF ≈ 2x**（真实人声）→ 1 小时课 ≈ 25–30 分钟
+  #   · ⚠️ 5 秒纯正弦波曾测出 9x —— 那是假象，不要用来估时长
+  asr:
+    - id: local-fw
+      type: local_worker             # 走 Python worker（faster-whisper）
+      label: 本地 faster-whisper
+      vendor: 本地
+      priority: 1
+      model: tiny                    # tiny(已缓存) → base → small
+      compute_type: int8             # CPU 推荐
+      device: cpu
+      # hf_endpoint: https://hf-mirror.com   # 模型下载慢时用镜像
+      enabled: true
+
+    - id: aliyun-asr
+      type: aliyun_nls
+      label: 阿里云智能语音交互
+      vendor: 阿里云
+      priority: 2
+      access_key_id: ${ALIYUN_AK}
+      access_key_secret: ${ALIYUN_SK}
+      app_key: ${ALIYUN_APPKEY}
+      enabled: false                 # 未配置凭据 → 如实报 configured:false
+
+    - id: openai-asr
+      type: openai_asr
+      label: OpenAI Whisper API
+      vendor: OpenAI
+      priority: 3
+      api_key: ${OPENAI_API_KEY}
+      # ⚠️ 能力如实声明：OpenAI **只有段级时间戳，没有字级**
+      #    → 当请求 requireWordTimestamps=true 时，它会被降级链**跳过**（不产残缺数据）
+      enabled: false
+
+  # ═══════════════════════════════════════════════════════════
+  # TTS —— 文字转语音（项目新增能力）
+  # ═══════════════════════════════════════════════════════════
+  # ⚠️ 各厂**单次字符上限不同**（300 / 150 / 4096）→ 实现内自动按**句子边界**分段再拼接
+  tts:
+    - id: aliyun-tts
+      type: aliyun_nls_tts
+      label: 阿里云语音合成
+      vendor: 阿里云
+      priority: 1
+      access_key_id: ${ALIYUN_AK}
+      access_key_secret: ${ALIYUN_SK}
+      app_key: ${ALIYUN_APPKEY}
+      voice: zhixiaobai              # 统一参数名；各 provider 内部映射
+      enabled: false
+
+    - id: local-sapi
+      type: local_sapi
+      label: 本地 SAPI（仅测试）
+      vendor: 本地
+      priority: 9
+      # ⚠️ 音质不适合交付，仅用于开发/测试（v1 曾用它合成 ASR 测试音频）
+      enabled: true
+
+  # ═══════════════════════════════════════════════════════════
+  # 翻译
+  # ═══════════════════════════════════════════════════════════
+  # ⚠️ 本项目**不是通用翻译**（docs/PROVIDERS.md §4.2）：
+  #   1. **术语表必须注入** —— 不注入会把 index 译成"指标"、view 译成"看法"
+  #   2. **标识符保留英文** —— InnoDB / SELECT / sql_mode 译了就**无法检索**
+  #   3. **证据句不意译** —— 证据是**可核查的引用**
+  #   4. 实测领域特征：414 实体名中 **56% 译中文 / 44% 保留英文**（71% 是标识符）
+  #      → **这是正确行为，不是失败**
+  translate:
+    - id: llm-mt
+      type: openai_compatible        # 复用 LLM 凭据 + 内置数据库术语表
+      label: LLM 翻译（术语表）
+      vendor: LLM
+      priority: 1
+      base_url: ${AMR_BASE}
+      api_key: ${AMR_KEY}
+      model: ${LLM_MODEL}
+      batch_size: 20                 # 每批条数（便于断点续跑）
+      # 术语表：内置 DEFAULT_DB_GLOSSARY（60+ 数据库术语），此处可覆盖/追加
+      glossary:
+        index: 索引
+        clustered index: 聚簇索引
+        materialized view: 物化视图
+      enabled: true
+
+    - id: deepl
+      type: deepl
+      label: DeepL
+      vendor: DeepL
+      priority: 2
+      api_key: ${DEEPL_KEY}
+      # ⚠️ DeepL 术语表能力有限、中文技术术语一致性弱于带术语表的 LLM
+      #    → 定位为**第二跳**（第一跳失败才用）
+      enabled: false
+
+  # ═══════════════════════════════════════════════════════════
+  # OCR —— 幻灯片帧识别（**可选**）
+  # ═══════════════════════════════════════════════════════════
+  # ⚠️ 产品预期（docs/PROVIDERS.md §6）：视频里"抽出的 PPT"**是图片帧，不是可编辑 PPT**。
+  #    · 有 OCR → 出 ocr_text
+  #    · **无 OCR → 只出帧图 + 时间点，UI 标注"图片帧"**（这是**正常降级**，不是故障）
+  #    · **绝不承诺**还原版式/动画/可编辑
+  ocr:
+    - id: baidu-ocr
+      type: baidu_ocr
+      label: 百度 OCR
+      vendor: 百度
+      priority: 1
+      api_key: ${BAIDU_OCR_API_KEY}
+      secret_key: ${BAIDU_OCR_SECRET_KEY}
+      enabled: false
+
+    - id: local-tess
+      type: local_tesseract
+      label: 本地 Tesseract
+      vendor: 本地
+      priority: 9
+      enabled: false
+      # 中文需额外语言包，精度一般
+
+# ═══════════════════════════════════════════════════════════
+# 需要的环境变量（写进 course-kb/.env）
+# ═══════════════════════════════════════════════════════════
+# AMR_BASE=https://amr-link.open-design.ai/v1
+# AMR_KEY=<你的 key>
+# LLM_MODEL=deepseek-v4.1-flash
+#
+# ── 以下按需（未配置时 /capabilities 会如实报 configured:false + 缺哪个变量）──
+# ALIYUN_AK=            ALIYUN_SK=            ALIYUN_APPKEY=
+# TENCENT_SECRET_ID=    TENCENT_SECRET_KEY=
+# OPENAI_API_KEY=
+# DEEPL_KEY=
+# BAIDU_OCR_API_KEY=    BAIDU_OCR_SECRET_KEY=

@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 助教 · 课程知识平台</title>
+<!--
+  web/chat.html —— pi AI 助教对话页（T4 独占文件，契约 §7.2 的浏览器端）
+
+  设计要点（每条都有对应的契约/坑）：
+  1. **流式逐字**：text_delta 到达即追加渲染（不是等 message_end 一次性出完）。
+  2. **工具调用可见**：tool_start / tool_update / tool_end 渲染成可折叠卡片
+     （工具名 + 参数 + 部分输出 + 结果 + 耗时 + 成功/失败）。
+  3. **可中断**：运行中"停止"→ 发 {"type":"abort"}，等 settled 才回空闲。
+  4. **一轮结束的唯一信号是 settled**，不是 prompt 的响应（坑 13）。
+     所以发送后按钮进"运行中"，收到 settled 才恢复。
+  5. **诚实降级**：先 GET /api/v1/capabilities，pi.available=false → 禁用输入框、
+     显示 reason（不让人点了才报错，契约 §5.1）。
+  6. **错误必须看得懂**：error 帧把 code/msg/hint 原样显示。
+     关键区分——E_LLM = "pi 桥是好的，模型/凭据侧失败"（例如 403 无订阅），
+     与 E_PI_EXIT/E_PI_UNAVAILABLE = "桥/进程不可用" 是两回事。
+  7. 纯前端、零外部依赖（不加载 CDN），file:// 打开会给出提示。
+-->
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ee; --dim: #9aa3b2; --accent: #4c8dff; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --think: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg); font: 15px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; background: var(--panel2); border: 1px solid var(--line); color: var(--dim); }
+  .pill.ok { color: var(--ok); border-color: #1f6f33; }
+  .pill.busy { color: var(--accent); border-color: #1f4a8f; }
+  .pill.err { color: var(--err); border-color: #7d2620; }
+  .grow { flex: 1; }
+  .meta { font-size: 12px; color: var(--dim); }
+  .meta b { color: var(--fg); font-weight: 600; }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { color: var(--err); border-color: #7d2620; }
+  #sessionId { width: 150px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel2); color: var(--fg); font-size: 12px; }
+  #banner { padding: 10px 16px; background: #3a2a12; border-bottom: 1px solid #7a5a1a; color: #ffd88a; font-size: 13px; display: none; }
+  #banner.show { display: block; }
+  #banner code { background: rgba(0,0,0,.3); padding: 1px 5px; border-radius: 4px; }
+  main { flex: 1; overflow-y: auto; padding: 18px 16px 8px; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  .msg { margin-bottom: 16px; display: flex; gap: 10px; }
+  .who { flex: 0 0 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; background: var(--panel2); border: 1px solid var(--line); }
+  .msg.user .who { background: #1f3a6d; border-color: #2b56a8; }
+  .msg.bot .who { background: #17351f; border-color: #1f6f33; }
+  .body { flex: 1; min-width: 0; }
+  .text { white-space: pre-wrap; word-break: break-word; }
+  .text.empty::after { content: "▍"; color: var(--dim); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .think { margin: 6px 0; border-left: 2px solid var(--think); padding: 4px 10px; color: var(--dim); font-size: 13px; }
+  .think > summary { cursor: pointer; color: var(--think); font-size: 12px; }
+  .think .t { white-space: pre-wrap; margin-top: 4px; }
+  details.tool { margin: 6px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  details.tool > summary { cursor: pointer; padding: 6px 10px; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  details.tool .tname { font-weight: 600; color: var(--accent); }
+  details.tool .targs { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
+  details.tool .tstate { margin-left: auto; font-size: 12px; color: var(--dim); }
+  details.tool .tstate.ok { color: var(--ok); }
+  details.tool .tstate.bad { color: var(--err); }
+  details.tool pre { margin: 0; padding: 8px 10px; border-top: 1px solid var(--line); background: #0d0f13; font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }
+  .errbox { margin: 6px 0; border: 1px solid #7d2620; background: #2d1412; border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+  .errbox .code { font-family: Consolas, monospace; color: var(--err); font-weight: 700; }
+  .errbox .hint { color: #ffb4ae; margin-top: 4px; font-size: 12px; }
+  .errbox .detail { color: var(--dim); margin-top: 4px; font-size: 12px; font-family: Consolas, monospace; word-break: break-all; }
+  .sysnote { color: var(--dim); font-size: 12px; text-align: center; margin: 10px 0; }
+  a.cardref { display: inline-block; background: #1f3a6d; border: 1px solid #2b56a8; color: #cfe0ff; border-radius: 4px; padding: 0 6px; margin: 0 1px; font-size: 13px; text-decoration: none; }
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 16px 14px; }
+  footer .inner { max-width: 900px; margin: 0 auto; }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: vertical; min-height: 44px; max-height: 180px; padding: 9px 12px;
+    border-radius: 8px; border: 1px solid var(--line); background: var(--panel2); color: var(--fg);
+    font: inherit; font-size: 14px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  textarea:disabled { opacity: .5; }
+  .opts { display: flex; gap: 14px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--dim); }
+  .opts label { display: flex; gap: 5px; align-items: center; cursor: pointer; }
+  kbd { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>AI 助教</h1>
+  <span id="status" class="pill">连接中…</span>
+  <span id="meta" class="meta"></span>
+  <span class="grow"></span>
+  <label class="meta" for="sessionId">会话</label>
+  <input id="sessionId" spellcheck="false" autocomplete="off">
+  <button id="switchBtn" title="切换到该会话（同 id 会复用同一个 pi 进程）">切换</button>
+  <button id="newBtn" title="新建一个浏览器会话（新的 pi 进程）">新会话</button>
+  <button id="resetCtxBtn" title="让 pi 丢掉当前上下文（new_session），保留本页面">重置上下文</button>
+</header>
+
+<div id="banner"></div>
+
+<main><div class="wrap" id="messages"></div></main>
+
+<footer>
+  <div class="inner">
+    <div class="row">
+      <textarea id="input" rows="1" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="sendBtn" class="primary">发送</button>
+      <button id="abortBtn" class="danger" disabled>停止</button>
+    </div>
+    <div class="opts">
+      <label><input type="checkbox" id="steerChk"> 运行中插话（steer）</label>
+      <span id="hint">就绪</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// 端点推导：on http(s) 用同源；file:// 下退到本地默认端口（并提示用 http 打开）
+// ---------------------------------------------------------------------------
+const FILE_MODE = location.protocol === "file:" || !location.host;
+const HOST = FILE_MODE ? "127.0.0.1:8787" : location.host;
+const API = `${location.protocol === "https:" ? "https" : "http"}://${HOST}/api/v1`;
+const WS_BASE = `${location.protocol === "https:" ? "wss" : "ws"}://${HOST}/api/v1/chat/`;
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  status: $("status"), meta: $("meta"), banner: $("banner"), messages: $("messages"),
+  input: $("input"), send: $("sendBtn"), abort: $("abortBtn"), steer: $("steerChk"),
+  hint: $("hint"), sessionId: $("sessionId"), switchBtn: $("switchBtn"),
+  newBtn: $("newBtn"), resetCtxBtn: $("resetCtxBtn"),
+};
+
+const SESSION_RE = /^[A-Za-z0-9._-]{1,64}$/;   // 与后端 validate_session_id 一致
+
+const state = {
+  ws: null, sessionId: "", running: false, connected: false,
+  caps: null, piAvailable: false, model: null, persistence: null,
+  attempt: 0, closingOnPurpose: false, cur: null, cards: {},
+};
+
+// ---------------------------------------------------------------------------
+// 工具函数
+// ---------------------------------------------------------------------------
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+// [[card:crd_0001]] → 可点链接（F7：让 pi 返回引用、前端渲染为可点链接）
+// 目标用契约 §5.3 的 REST 端点（不猜 T3 的页面路由）
+function renderRich(text) {
+  return esc(text).replace(/\[\[card:([A-Za-z0-9_-]+)\]\]/g,
+    (_m, id) => `<a class="cardref" href="/api/v1/cards/${encodeURIComponent(id)}" target="_blank" rel="noopener">卡片 ${esc(id)}</a>`);
+}
+function setStatus(text, cls) {
+  els.status.textContent = text;
+  els.status.className = "pill" + (cls ? " " + cls : "");
+}
+function setHint(text) { els.hint.textContent = text; }
+function scrollDown() { els.messages.parentElement.scrollTop = els.messages.parentElement.scrollHeight; }
+function newSessionId() {
+  const rnd = Math.random().toString(36).slice(2, 10);
+  return `web-${Date.now().toString(36)}-${rnd}`;
+}
+
+// ---------------------------------------------------------------------------
+// 渲染
+// ---------------------------------------------------------------------------
+function addNode(html) {
+  const div = document.createElement("div");
+  div.innerHTML = html;
+  els.messages.appendChild(div.firstElementChild || div);
+  scrollDown();
+  return els.messages.lastElementChild;
+}
+function addUser(text) {
+  addNode(`<div class="msg user"><div class="who">我</div><div class="body"><div class="text">${renderRich(text)}</div></div></div>`);
+}
+function addSys(text) {
+  const el = addNode(`<div class="sysnote">${esc(text)}</div>`);
+  return el;
+}
+// 开一个助手气泡：文字区 + 思考区 + 工具区
+function openAssistant() {
+  const root = addNode(
+    `<div class="msg bot"><div class="who">AI</div><div class="body">
+       <details class="think" hidden><summary>思考过程</summary><div class="t"></div></details>
+       <div class="tools"></div>
+       <div class="text empty"></div>
+     </div></div>`);
+  state.cur = {
+    root,
+    think: root.querySelector("details.think"),
+    thinkText: root.querySelector("details.think .t"),
+    tools: root.querySelector(".tools"),
+    text: root.querySelector(".text"),
+    buffer: "", thinkBuffer: "", frames: {},
+  };
+  return state.cur;
+}
+function cur() { return state.cur || openAssistant(); }
+function paint(node) {
+  if (node.buffer) node.text.innerHTML = renderRich(node.buffer);
+  node.text.classList.toggle("empty", node.buffer.length === 0);
+  scrollDown();
+}
+function appendDelta(delta) { const n = cur(); n.buffer += delta; paint(n); }
+function appendThinking(delta) {
+  const n = cur();
+  n.thinkBuffer += delta;
+  n.thinkText.textContent = n.thinkBuffer;
+  n.think.hidden = false;
+  scrollDown();
+}
+function toolCard(id, tool, args) {
+  const n = cur();
+  let card = n.frames[id];
+  if (card) return card;
+  const el = document.createElement("details");
+  el.className = "tool";
+  el.open = true;
+  const argsStr = args == null ? "" : (typeof args === "string" ? args : JSON.stringify(args));
+  el.innerHTML =
+    `<summary><span class="tname">${esc(tool || "tool")}</span>` +
+    `<span class="targs">${esc(argsStr)}</span>` +
+    `<span class="tstate">运行中…</span></summary>` +
+    `<pre class="targs-full"></pre><pre class="tout" hidden></pre>`;
+  el.querySelector(".targs-full").textContent = argsStr;
+  n.tools.appendChild(el);
+  card = { el, out: el.querySelector(".tout"), state: el.querySelector(".tstate") };
+  n.frames[id] = card;
+  scrollDown();
+  return card;
+}
+function toolUpdate(id, tool, partial) {
+  const card = toolCard(id, tool, null);
+  if (partial) {
+    card.out.hidden = false;
+    card.out.textContent = partial;
+    scrollDown();
+  }
+}
+function toolEnd(id, tool, ok, durationMs, resultText) {
+  const card = toolCard(id, tool, null);
+  card.state.textContent = (ok ? "✓ 完成" : "✗ 失败") + (durationMs != null ? ` · ${durationMs}ms` : "");
+  card.state.className = "tstate " + (ok ? "ok" : "bad");
+  if (resultText) { card.out.hidden = false; card.out.textContent = resultText; }
+  card.el.open = false;   // 完成后折叠，保持界面清爽（可点开）
+  scrollDown();
+}
+function addError(code, msg, hint, detail) {
+  const box = addNode(
+    `<div class="errbox"><div><span class="code">${esc(code)}</span> ${esc(msg)}</div>` +
+    (hint ? `<div class="hint">${esc(hint)}</div>` : "") +
+    (detail ? `<div class="detail">${esc(detail)}</div>` : "") + `</div>`);
+  return box;
+}
+
+// ---------------------------------------------------------------------------
+// 能力协商（诚实降级：不可用就禁用入口并说明原因）
+// ---------------------------------------------------------------------------
+async function loadCapabilities() {
+  let pi = null;
+  try {
+    const resp = await fetch(`${API}/capabilities`, { cache: "no-store" });
+    if (resp.ok) pi = (await resp.json()).pi || null;
+  } catch (_e) { /* 下面再试独立端点 */ }
+  if (!pi) {
+    try {
+      const resp = await fetch(`${API}/pi/capabilities`, { cache: "no-store" });
+      if (resp.ok) pi = await resp.json();
+    } catch (_e) { /* 保持 null：既不知道可用也不知道不可用 */ }
+  }
+  state.caps = pi;
+  state.piAvailable = !!(pi && pi.available === true);
+  applyCapabilities();
+}
+function applyCapabilities() {
+  const pi = state.caps;
+  if (!pi) {
+    els.banner.className = "show";
+    els.banner.innerHTML =
+      `无法读取能力接口（<code>${esc(API)}/capabilities</code>）。` +
+      (FILE_MODE ? `本页是通过 <code>file://</code> 打开的，浏览器会拦 fetch；请改用 <code>http://127.0.0.1:8787/web/chat.html</code>。` : `请确认服务已启动。`);
+    setInputEnabled(false);
+    return;
+  }
+  if (!pi.available) {
+    els.banner.className = "show";
+    els.banner.innerHTML =
+      `<b>pi 不可用，对话已禁用。</b>${esc(pi.reason || "未检测到可用的 pi")}` +
+      (pi.mode === "none" ? ` <span class="meta">（档位 C：源码未构建且未全局安装）</span>` : "") +
+      (Array.isArray(pi.rejected) && pi.rejected.length
+        ? `<div class="meta" style="margin-top:4px">探测详情：${esc(pi.rejected.map(r => r.tier + " → " + r.reason).join("；"))}</div>`
+        : "");
+    setInputEnabled(false);
+    setStatus("已禁用", "err");
+    return;
+  }
+  els.banner.className = "";
+  setInputEnabled(true);
+  setStatus("就绪", "ok");
+  const bits = [];
+  if (pi.version) bits.push(`pi <b>${esc(pi.version)}</b>`);
+  if (pi.tier) bits.push(`档位 <b>${esc(pi.tier)}</b>`);
+  if (pi.mode) bits.push(`方式 <b>${esc(pi.mode)}</b>`);
+  els.meta.innerHTML = bits.join(" · ");
+}
+function setInputEnabled(on) {
+  els.input.disabled = !on;
+  els.send.disabled = !on || state.running;
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+function connect() {
+  if (state.ws) { state.closingOnPurpose = true; try { state.ws.close(); } catch (_e) {} }
+  state.closingOnPurpose = false;
+  const url = WS_BASE + encodeURIComponent(state.sessionId);
+  setStatus("连接中…");
+  let ws;
+  try { ws = new WebSocket(url); } catch (e) { setStatus("连接失败", "err"); setHint(String(e)); return; }
+  state.ws = ws;
+
+  ws.onopen = () => { state.connected = true; state.attempt = 0; setStatus("已连接"); };
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_e) { return; }
+    handleFrame(msg);
+  };
+
+  ws.onclose = (ev) => {
+    state.connected = false;
+    state.running = false;
+    els.abort.disabled = true;
+    if (state.closingOnPurpose) return;
+    if (ev.code === 1013) { setStatus("已禁用", "err"); setInputEnabled(false); return; }
+    if (ev.code === 1008) { setStatus("会话 id 非法", "err"); return; }
+    // 断线重连（指数退避，最多 6 次）
+    state.attempt += 1;
+    if (state.attempt > 6) { setStatus("连接断开", "err"); setHint("重连次数用尽，请刷新页面"); return; }
+    const delay = Math.min(8000, 500 * Math.pow(2, state.attempt - 1));
+    setStatus(`重连中…(${state.attempt})`, "err");
+    setTimeout(() => { if (!state.connected) connect(); }, delay);
+  };
+
+  ws.onerror = () => { setHint("WebSocket 出错（详见浏览器控制台）"); };
+}
+
+function handleFrame(msg) {
+  switch (msg.type) {
+    case "ready": {
+      state.model = msg.model || null;
+      state.persistence = msg.persistence || null;
+      const bits = [];
+      if (msg.model) bits.push(`模型 <b>${esc(msg.model)}</b>`);
+      if (msg.thinking_level) bits.push(`思考 <b>${esc(msg.thinking_level)}</b>`);
+      if (msg.persistence === "native") bits.push(`历史 <b>pi 原生</b>`);
+      else bits.push(`历史 <b>不落盘</b>`);
+      els.meta.innerHTML = bits.join(" · ");
+      els.meta.title = [msg.persistence_reason, msg.session_file, "tools_source=" + msg.tools_source]
+        .filter(Boolean).join("\n");
+      if (msg.persistence !== "native") {
+        addSys(`注意：本轮不落盘（${msg.persistence_reason || "回落到 --no-session"}）`);
+      }
+      if (msg.restarted) { addSys("pi 进程已自动重启，连接恢复"); state.running = false; }
+      setStatus(state.running ? "运行中" : "就绪", state.running ? "busy" : "ok");
+      setInputEnabled(state.piAvailable);
+      break;
+    }
+    case "text_delta":
+      if (!state.running) { state.running = true; setBusy(true); }
+      appendDelta(msg.delta || "");
+      break;
+    case "thinking_delta":
+      appendThinking(msg.delta || "");
+      break;
+    case "tool_start":
+      toolCard(msg.id, msg.tool, msg.args);
+      break;
+    case "tool_update":
+      toolUpdate(msg.id, msg.tool, msg.partial);
+      break;
+    case "tool_end":
+      toolEnd(msg.id, msg.tool, msg.ok, msg.duration_ms, msg.result_text);
+      break;
+    case "message_end": {
+      // json.md：以 message_end.message 为权威完整消息替换流式拼接（仅助手消息）
+      const m = msg.message;
+      if (m && m.role === "assistant") {
+        const text = blocksToText(m.content);
+        const node = state.cur;
+        if (node) {
+          if (text) { node.buffer = text; paint(node); }
+          if (!text && m.stopReason === "error") {
+            // 空回复 + 错误：马上会有 error(E_LLM) 帧解释原因，这里先给个占位说明
+            node.text.classList.remove("empty");
+            node.text.innerHTML = `<span style="color:var(--dim)">（本轮没有产出内容，失败原因见下方错误提示）</span>`;
+          }
+        }
+      }
+      break;
+    }
+    case "settled":
+      state.running = false;
+      setBusy(false);
+      if (msg.aborted) addSys("已中断");
+      if (msg.synthetic) addSys(`本轮没有启动运行（disposition=${msg.disposition || "handled"}）`);
+      setStatus("就绪", "ok");
+      break;
+    case "error":
+      addError(msg.code, msg.msg, msg.hint, msg.detail);
+      if (msg.code === "E_PI_UNAVAILABLE" || msg.code === "E_PI_EXIT") {
+        state.running = false; setBusy(false); setStatus("连接异常", "err");
+      }
+      break;
+    default:
+      break;   // 未知帧忽略（前向兼容：pi/桥加了新帧不该把页面弄崩）
+  }
+}
+
+function blocksToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter(b => b && b.type === "text" && typeof b.text === "string")
+                .map(b => b.text).join("");
+}
+
+function setBusy(busy) {
+  els.abort.disabled = !busy;
+  els.send.disabled = busy && !els.steer.checked ? true : !state.piAvailable;
+  els.input.placeholder = busy
+    ? (els.steer.checked ? "运行中插话（steer）…" : "运行中：勾选『运行中插话』可插话")
+    : "问点什么…（Enter 发送，Shift+Enter 换行）";
+  setStatus(busy ? "运行中" : "就绪", busy ? "busy" : "ok");
+  setHint(busy ? "收到 settled 才会回到空闲（prompt 响应 ≠ 完成）" : "就绪");
+}
+
+// ---------------------------------------------------------------------------
+// 发送 / 中断
+// ---------------------------------------------------------------------------
+function send() {
+  const text = els.input.value.trim();
+  if (!text) return;
+  if (!state.piAvailable) { setHint("pi 不可用，已禁用发送"); return; }
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { setHint("未连接，正在重连…"); connect(); return; }
+
+  addUser(text);
+  els.input.value = "";
+  const steer = state.running && els.steer.checked;
+  state.ws.send(JSON.stringify(steer
+    ? { type: "steer", message: text }
+    : { type: "prompt", message: text, steer: false }));
+  if (!state.running) {
+    state.running = true;          // 乐观置忙；settled 才回空闲
+    setBusy(true);
+  }
+  state.cur = null;                 // 下一个 assistant 事件开新气泡
+  openAssistant();
+}
+function abort() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  state.ws.send(JSON.stringify({ type: "abort" }));
+  setHint("已发送中断请求，等待 pi 结束本轮…");
+}
+
+// ---------------------------------------------------------------------------
+// 会话切换
+// ---------------------------------------------------------------------------
+function setSession(id, { reset = true } = {}) {
+  if (!SESSION_RE.test(id)) { setHint("非法会话 id（只允许字母/数字/. _ -，≤64 字符）"); return; }
+  state.sessionId = id;
+  els.sessionId.value = id;
+  try { localStorage.setItem("coursekb.pi.session", id); } catch (_e) {}
+  if (reset) { els.messages.innerHTML = ""; state.cur = null; addSys(`会话 ${id}`); }
+  connect();
+}
+
+function init() {
+  let saved = null;
+  try { saved = localStorage.getItem("coursekb.pi.session"); } catch (_e) {}
+  state.sessionId = (saved && SESSION_RE.test(saved)) ? saved : newSessionId();
+  els.sessionId.value = state.sessionId;
+  addSys(`会话 ${state.sessionId}`);
+
+  els.send.onclick = send;
+  els.abort.onclick = abort;
+  els.steer.onchange = () => setBusy(state.running);
+  els.input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  els.switchBtn.onclick = () => setSession(els.sessionId.value.trim());
+  els.newBtn.onclick = () => setSession(newSessionId());
+  els.resetCtxBtn.onclick = () => {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ type: "new_session" }));
+      addSys("已请求重置 pi 上下文");
+    }
+  };
+
+  if (FILE_MODE) { applyCapabilities(); addSys("file:// 模式：无法读取能力接口，请用 http 打开"); }
+  loadCapabilities().then(() => {
+    if (state.piAvailable) connect();
+    else if (state.caps) addSys("pi 不可用：对话入口已禁用（原因见上方横幅）");
+  });
+}
+
+init();
+</script>
+</body>
+</html>

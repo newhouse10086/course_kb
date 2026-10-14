@@ -1,0 +1,244 @@
+/**
+ * 契约类型 —— 字段唯一权威：docs/API_PROTOCOL.md §2（数据模型）/ §5（REST）
+ * 写域：apps/web/**（T-FRONTEND）
+ *
+ * 说明：这里只写前端**确实会读**的字段；未用到的服务端字段用索引签名兜住，
+ * 避免契约增删字段时前端整体报错（契约 §9：新增枚举值是兼容，前端未知值降级显示）。
+ */
+
+export type DocKind = 'pdf' | 'pptx' | 'docx' | 'video' | 'epub' | 'web' | 'text'
+export type DocStatus = 'uploading' | 'parsing' | 'extracting' | 'ready' | 'failed'
+export type SpanKind = 'page' | 'slide' | 'time' | 'char'
+export type XrefRel = 'typed' | 'mention' | 'also_in' | 'same_unit'
+
+export interface Span {
+  kind: SpanKind
+  start: number
+  end: number
+}
+
+export interface DocumentInfo {
+  id: string
+  title: string
+  kind: DocKind | string
+  source_path?: string
+  size_bytes?: number
+  page_count?: number
+  lang?: string
+  status: DocStatus | string
+  meta?: Record<string, unknown>
+  created_at?: number
+  updated_at?: number
+}
+
+/** §2.2 Unit */
+export interface Unit {
+  id: string
+  doc_id: string
+  order?: number
+  title: string
+  level?: number
+  parent_id?: string | null
+  span?: Span
+  text?: string
+  text_len?: number
+}
+
+/** §5.2 /outline 的节点（含 F3 要求的所有层级 intro/why） */
+export interface OutlineNode {
+  id: string
+  title: string
+  level: number
+  span?: Span
+  children: string[]
+  n_cards: number
+  n_units: number
+  intro?: string
+  why?: string
+  /** 扩展字段（F3）：学习目标 / 要点 / 体裁 —— 后端给了就渲染 */
+  objectives?: string[]
+  learning_objectives?: string[]
+  key_takeaways?: string[]
+  section_role?: string
+  intro_source?: string
+}
+
+export interface Outline {
+  document_id: string
+  roots: string[]
+  nodes: Record<string, OutlineNode>
+}
+
+/** §2.3 知识卡片（22 种 kind 见 contracts/schema/knowledge_card.json） */
+export interface Card {
+  id: string
+  doc_id?: string
+  unit_id?: string
+  name: string
+  kind?: string
+  one_line?: string
+  purpose?: string
+  usage_mode?: string
+  operational_role?: string
+  lifecycle?: string
+  example?: string | null
+  example_explained?: string | null
+  prerequisites?: string[]
+  cautions?: string[]
+  evidence_quote?: string
+  evidence_span?: Span
+  /** SQLite 里是扁平列，REST 可能给扁平字段（两种都要能吃） */
+  span_kind?: SpanKind | string
+  span_start?: number
+  span_end?: number
+  confidence?: number
+  name_key?: string
+}
+
+/** §2.4 图谱 */
+export interface GraphNode {
+  id: string
+  name: string
+  name_zh?: string
+  type?: string
+  layer?: string
+  degree?: number
+  unit_ids?: string[]
+  [k: string]: unknown
+}
+
+export interface GraphEdge {
+  id?: string
+  src: string
+  dst: string
+  etype: string
+  evidence?: string
+  span?: Span | null
+  confidence?: number
+  /** 因果可疑：**只标记不删除**（契约 §2.4），前端画虚线 */
+  flagged?: boolean | number
+  [k: string]: unknown
+}
+
+export interface GraphData {
+  document_id?: string
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  stats?: { nodes?: number; edges?: number; types?: number; verify_rate?: number }
+}
+
+/** §2.5 交叉引用 */
+export interface Xref {
+  from_card_id: string
+  to_card_id: string
+  rel: XrefRel | string
+  weight?: number
+}
+
+export interface CardDetail {
+  card: Card
+  unit?: { id: string; title: string }
+  source?: { kind?: string; file?: string; page?: number; url?: string }
+  xrefs?: Array<{ id: string; name?: string; rel?: string }>
+  backlinks?: Array<{ id: string; name?: string; rel?: string }>
+}
+
+/** §2.6 任务 */
+export interface TaskInfo {
+  id: string
+  doc_id?: string
+  kind?: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | string
+  progress?: number
+  stage?: string
+  detail?: Record<string, unknown>
+  error?: string | null
+  code?: string
+  created_at?: number
+  finished_at?: number | null
+}
+
+export interface UploadAccepted {
+  document_id: string
+  task_id?: string
+  status?: string
+  events_url?: string
+}
+
+/** §2.7 视频产物 */
+export interface VideoSegment {
+  i: number
+  start: number
+  end: number
+  text: string
+  confidence?: number
+}
+
+export interface TranscriptChapter {
+  title: string
+  start: number
+  end: number
+  text?: string
+  summary?: string
+}
+
+export interface VideoSlide {
+  index: number
+  at_ms: number
+  image?: string
+  ocr_text?: string
+  title?: string
+}
+
+export interface VideoArtifact {
+  id?: string
+  doc_id?: string
+  duration_ms?: number
+  asr_model?: string
+  asr_lang?: string
+  segments?: VideoSegment[]
+  subtitles?: { srt?: string; vtt?: string }
+  transcript?: TranscriptChapter[]
+  mindmap?: { format?: string; content?: string }
+  slides?: VideoSlide[]
+  summary?: string
+  overall_summary?: string
+  transcript_summary?: string
+  [k: string]: unknown
+}
+
+/** §5.4 检索 */
+export interface SearchHit {
+  kind: 'card' | 'unit' | string
+  ref_id: string
+  title?: string
+  snippet?: string
+  score?: number
+  doc_id?: string
+}
+
+export interface SearchResult {
+  q: string
+  total: number
+  hits: SearchHit[]
+}
+
+/** 分页响应：契约 §1.1 只规定含 total；列表键名后端可能是 items/xxx（两种都兼容） */
+export interface Paged<T> {
+  total?: number
+  offset?: number
+  limit?: number
+  items?: T[]
+  [k: string]: unknown
+}
+
+/** §6 SSE 事件名 */
+export type TaskEventName = 'progress' | 'log' | 'artifact' | 'done' | 'failed'
+
+export interface TaskProgressEvent {
+  task_id: string
+  progress?: number
+  stage?: string
+  done?: number
+  total?: number
+}

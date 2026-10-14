@@ -1,0 +1,49 @@
+﻿# ═══════════════ 课程知识平台 · 仓库排除规则 ═══════════════
+# ⚠️ 提交前务必跑： python tools/precommit_secret_scan.py
+
+# ── 凭据（最重要）──
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# ── 运行期数据（体积大 / 含学生数据）──
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# ── 依赖 ──
+node_modules/
+.pnpm-store/
+
+# ── 构建产物 ──
+dist/
+build/
+*.tsbuildinfo
+vite.config.ts.timestamp-*
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ── 截图（体积大，需要时单独放）──
+apps/web/test/screenshots/*.png
+
+# ── 临时 ──
+*.log
+*.tmp
+_*.py

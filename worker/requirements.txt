@@ -1,0 +1,29 @@
+# 课程知识平台 · Python worker 依赖
+# 安装：python -m pip install -r worker/requirements.txt
+#
+# 边界（架构 v2 §3）：worker 只做「成熟库不可替代」的事 ——
+# 文档解析（PDF/PPTX/DOCX）与本地 ASR；**不含** web 框架、ORM、HTTP 服务。
+# 因此没有 fastapi/uvicorn/sqlalchemy 之类（那些归 TS/Node 层）。
+
+# ── 文档解析（T-WORKER）─────────────────────────────────────────────────
+pymupdf>=1.24            # PDF 解析 + TOC 书签（PyMuPDF/fitz；Node 生态弱）
+python-pptx>=1.0         # PPTX（含备注页）
+python-docx>=1.1         # DOCX（按 Heading N 切层级）
+
+# ── LLM 结构化输出（T-WORKER，凭据由 Node 下发；并发=1）──────────────────
+httpx>=0.27              # OpenAI 兼容 HTTP 调用（json_schema + strict）
+
+# ── 本地 ASR（worker/video/**，T2 video-pipeline）───────────────────────
+faster-whisper>=1.0      # 本地转写（CPU/int8；Docker 不可用 → 不用 FunASR）
+numpy>=1.26              # ASR 音频 float32 处理
+
+# ── 测试与自检 ─────────────────────────────────────────────────────────
+pytest>=8.0              # python -m pytest worker/tests
+
+# 说明：
+# * 不再需要 openai 官方 SDK —— 直接用 httpx 打 OpenAI 兼容端点，
+#   少一层依赖且能精确控制 response_format（契约 C2）。
+# * 不再需要 python-multipart / uvicorn / fastapi —— v1 的 FastAPI 层已废弃
+#   （见 worker/_legacy/README.md）。
+# * 云 ASR/TTS/翻译 provider 的凭据与调用归 Node 层（docs/PROVIDERS.md），
+#   所以这里不装各云厂商 SDK。

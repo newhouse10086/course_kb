@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知识图谱 · 课程知识平台</title>
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div>
+    <div class="brand">知识图谱</div>
+    <div class="brand-sub" id="g-meta">加载中…</div>
+  </div>
+  <nav class="nav-links">
+    <a class="nav-link" href="index.html">知识库</a>
+    <a class="nav-link active" href="graph.html">知识图谱</a>
+    <a class="nav-link" href="video.html">视频课堂</a>
+    <a class="nav-link" href="chat.html">AI 助教</a>
+  </nav>
+  <select id="g-doc" title="选择文档"></select>
+  <div class="caps" id="caps"></div>
+</header>
+
+<div class="gc-bar">
+  <div class="search-box">
+    <input type="text" id="g-nodefilter" placeholder="找节点（名字 / id）" autocomplete="off">
+  </div>
+  <label class="small">分层 <select id="g-layer"><option value="">全部层</option></select></label>
+  <label class="small">着色 <select id="g-colorby">
+    <option value="type">按实体类型</option>
+    <option value="layer">按 L0–L3 层</option>
+  </select></label>
+  <label class="small">标签 <select id="g-labels">
+    <option value="auto">自动（重要的才标）</option>
+    <option value="all">全部</option>
+    <option value="none">不显示</option>
+  </select></label>
+  <label class="small">最小 degree <input type="range" id="g-mindeg" min="0" max="20" value="0" step="1"></label>
+  <label class="small etype-check"><input type="checkbox" id="g-flagged"> 只看 flagged 边</label>
+  <button id="g-relayout" type="button">重新布局</button>
+  <button id="g-fit" type="button">适应画布</button>
+  <span class="small muted" id="g-stats">—</span>
+  <span class="small muted" id="g-settle">—</span>
+</div>
+
+<div class="etype-filters" id="etype-filters"></div>
+
+<div class="g-main">
+  <div class="gp-canvas-wrap" id="g-canvas-wrap">
+    <canvas id="g-canvas" height="560"></canvas>
+  </div>
+  <aside class="gp-side">
+    <div class="small muted">节点详情 / 证据（点击画布节点或下面列表）</div>
+    <div id="g-detail" style="margin-top:6px"><div class="detail-empty">点击画布中的节点（或右侧列表）查看它的边与证据。</div></div>
+    <div id="g-evidence" class="hidden" style="margin-top:10px"></div>
+    <div class="small muted" style="margin-top:12px">节点列表（按 degree）</div>
+    <div id="g-top"></div>
+    <div class="small muted" style="margin-top:12px">命中节点</div>
+    <div class="g-search-results" id="g-search-results"></div>
+  </aside>
+</div>
+
+<div class="gp-legend" id="g-legend" data-flagged-legend="1"></div>
+
+<div class="gc-bar">
+  <span class="small muted">图例说明：</span>
+  <span class="small">节点大小 ∝ degree；节点颜色按实体类型或层次；边颜色按 12 种 etype；</span>
+  <span class="small"><b>flagged 边画虚线</b>（因果可疑，只标记不删除，见契约 §2.4）；</span>
+  <span class="small muted" id="g-perf">—</span>
+  <span class="small faint" id="g-selftest"></span>
+</div>
+
+<script type="module" src="assets/graph-page.js"></script>
+</body>
+</html>

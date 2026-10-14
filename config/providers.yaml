@@ -1,0 +1,100 @@
+# 模型 Provider 配置（契约：docs/ARCHITECTURE_V2.md §4.3 / docs/PROVIDERS.md §8）
+#
+# ⚠️ 铁律：**凭据只从环境变量读**。本文件里只写 ${NAME} 占位，真实值放 `.env`（已 gitignore）。
+# ⚠️ `${X}` 缺失 **不会** 让服务起不来：该 provider 上报 `configured:false` + 缺哪个变量（PROVIDERS §0 R1）。
+# ⚠️ `configured:true` 只代表凭据齐备，**不代表可用** —— `available` 由 provider 的 healthCheck() 真探测给出。
+
+policy:
+  # ⚠️ LLM 不要用 explicit：registry 在 explicit 下必须拿到 explicitId，
+  #    而 provider 门面的 completeJson(req) 不带 id → 实测抛
+  #    「policy='explicit' 但未提供 explicitId」，抽取**静默产出 0 张卡片**。
+  #    quality = 按注册顺序选（只有一个 amr 时就是它）。
+  llm: quality
+  asr: local-first        # local-first | cloud-first | cost | quality | explicit
+  tts: cloud-first
+  translate: cloud-first
+  ocr: local-first
+  embedding: cost
+
+providers:
+  # ── LLM（本机现有凭据：AMR，OpenAI 兼容）────────────────────────────
+  llm:
+    - id: amr
+      type: openai_compatible
+      label: AMR（OpenAI 兼容）
+      vendor: AMR
+      runtime: cloud
+      base_url: ${AMR_BASE}
+      api_key: ${AMR_KEY}
+      model: ${LLM_MODEL}
+      priority: 1
+
+  # ── ASR（本地 faster-whisper 优先；云端如实报未配置）──────────────────
+  asr:
+    - id: local-fw
+      type: local_worker          # → Python worker（worker/video/asr.py）
+      label: 本地 faster-whisper
+      vendor: 本地
+      runtime: local
+      model: tiny
+      priority: 1
+    - id: aliyun-asr
+      type: aliyun_nls
+      label: 阿里云智能语音交互
+      vendor: 阿里云
+      runtime: cloud
+      access_key_id: ${ALIYUN_AK}
+      access_key_secret: ${ALIYUN_SK}
+      app_key: ${ALIYUN_APPKEY}
+      priority: 2
+
+  # ── TTS ────────────────────────────────────────────────────────────
+  tts:
+    - id: aliyun-tts
+      type: aliyun_nls_tts
+      label: 阿里云语音合成
+      vendor: 阿里云
+      runtime: cloud
+      access_key_id: ${ALIYUN_AK}
+      access_key_secret: ${ALIYUN_SK}
+      app_key: ${ALIYUN_APPKEY}
+      voice: zhixiaobai
+      priority: 1
+
+  # ── 翻译（LLM 带术语表优先）─────────────────────────────────────────
+  #
+  # ⚠️ `llm-mt` 的 `type` 必须是 **`llm`**，不能写 `openai_compatible`：
+  #    provider 层的工厂表是**按 `type` 分派**的（src/providers/index.ts:277-299）——
+  #    `openai_compatible` → createOpenAiCompatible（`info.kind` 硬编码为 `'llm'`），
+  #    而 `llm` → createTranslateProvider（`info.kind = 'translate'`）。
+  #    实测踩到：写 `openai_compatible` 会让它在 `providers.llm` 里出现第 2 条
+  #    （与 amr 指向同一端点），UI 会显示"两个 LLM provider"，且 translate 少一条。
+  #    （契约 §4.3 的示例里写的是 `openai_compatible` —— 示例与实现不一致，已报 Lead。）
+  translate:
+    - id: llm-mt
+      type: llm
+      label: LLM 翻译（术语表注入）
+      vendor: AMR
+      runtime: cloud
+      base_url: ${AMR_BASE}
+      api_key: ${AMR_KEY}
+      model: ${LLM_MODEL}
+      priority: 1
+    - id: deepl
+      type: deepl
+      label: DeepL
+      vendor: DeepL
+      runtime: cloud
+      api_key: ${DEEPL_KEY}
+      priority: 2
+
+  # ── OCR（可选；无凭据时如实 false，UI 只出图片帧，见 PROVIDERS §6）──
+  ocr:
+    - id: baidu-ocr
+      type: baidu_ocr
+      label: 百度通用文字识别
+      vendor: 百度
+      runtime: cloud
+      api_key: ${BAIDU_OCR_KEY}
+      secret_key: ${BAIDU_OCR_SECRET}
+      priority: 1
