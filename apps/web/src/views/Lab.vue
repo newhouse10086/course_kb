@@ -412,6 +412,7 @@ async function runSelftest() {
   await openSession()
   need('session_ok', !!session.value)
   rec('tables', tables.value.map((t) => `${t.name}(${t.rowCount})`))
+  rec('schema_tables', tables.value.map((x) => `${x.name}(${x.rowCount ?? '?'})`))
 
   // ① 完整 CRUD（真实点击"运行"按钮）
   const runBtn = document.querySelector('[data-testid="btn-run"]') as HTMLButtonElement | null
@@ -429,8 +430,12 @@ async function runSelftest() {
   //    就是 "table stu_note already exists"（实测 E_SQL_EXEC）
   await exec('DROP TABLE IF EXISTS stu_note')
   const ddl = await exec('CREATE TABLE stu_note (id INTEGER PRIMARY KEY, txt TEXT)')
-  rec('crud_ddl', { cols: ddl.result?.columns, error: ddl.error?.code || null })
-  need('crud_ddl', !ddl.error && tables.value.some((t) => t.name === 'stu_note'))
+  // 真后端 execute **不回 schema**（只有 session/schema/reset 才有）→ 建表后要重新拉一次表清单
+  if (!ddl.error && session.value) {
+    try { tables.value = schemaToTables(await api.sandboxSchema(session.value.sessionId)) } catch { /* 忽略 */ }
+  }
+  rec('crud_ddl', { cols: ddl.result?.columns, error: ddl.error?.code || null, tables: tables.value.map((x) => x.name) })
+  need('crud_ddl', !ddl.error && tables.value.some((x) => x.name === 'stu_note'))
 
   const ins = await exec("INSERT INTO stu_note (id, txt) VALUES (1, '我的笔记')")
   rec('crud_insert', { error: ins.error?.code || null })
@@ -490,10 +495,15 @@ async function runSelftest() {
   const afterCm = await cnt()
   rec('multi_rollback', { ok: rb.result?.ok, statements: (rb.result as any)?.statements, rows: afterRb })
   rec('multi_commit', { ok: cm.result?.ok, statements: (cm.result as any)?.statements, rows: afterCm })
+  rec('multi_rollback_no_effect', afterRb === 0 && !!(rb.result as any)?.statements?.length)
   need('multi_rollback_no_effect', afterRb === 0 && !!(rb.result as any)?.statements?.length)
+  rec('multi_commit_visible', afterCm === 1)
   need('multi_commit_visible', afterCm === 1)
+  rec('multi_toggle_visible', !!document.querySelector('[data-testid="multi-toggle"]'))
   need('multi_toggle_visible', !!document.querySelector('[data-testid="multi-toggle"]'))
+  rec('multi_statements_rendered', rbStatementsShown)
   need('multi_statements_rendered', rbStatementsShown)
+  rec('multi_note_explains_why', /独立进程/.test(document.querySelector('[data-testid="multi-note"]')?.textContent || ''))
   need('multi_note_explains_why', /独立进程/.test(document.querySelector('[data-testid="multi-note"]')?.textContent || ''))
   multiMode.value = false
   await exec('DROP TABLE tx_probe')
@@ -580,9 +590,13 @@ async function runSelftest() {
     rec('ask_error_text', askError.value.slice(0, 120))
   }
   rec('citation_links', citations.value.map((c) => c.href))
+  rec('citation_count', citations.value.length)
   const citeEl = document.querySelector('[data-testid="citation"] a') as HTMLElement | null
   rec('citation_anchor', citeEl?.getAttribute('href'))
-  need('citation_anchor', !!citeEl && (citeEl.getAttribute('href') || '').startsWith('#/wiki'))
+  // 真模型可能失败（实测上游 403）→ 没引用是**如实结果**；有引用时必须是可跳的 #/wiki 链接
+  need('citation_anchor', citations.value.length === 0
+    ? !!askError.value
+    : !!citeEl && (citeEl.getAttribute('href') || '').startsWith('#/wiki'))
 
   const report = { ok: failed.length === 0, checks, failed }
   writeReport('selftest-report', report)

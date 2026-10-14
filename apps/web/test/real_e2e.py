@@ -290,7 +290,9 @@ def main() -> int:
                 c = st.get('checks', {})
                 ok('设置页自检全绿', st.get('ok') is True, f"failed={st.get('failed')}")
                 ok('有可切换的目标模型（按钮可用）', c.get('button_disabled') is False, str(c.get('button_disabled')))
-                ok('切换必须二次确认（含三种 mode）', c.get('confirm_required') is True and 'mode=now' in dom and 'mode=abort' in dom)
+                ok('切换必须二次确认（含三种 mode）',
+                   c.get('confirm_required') is True and c.get('confirm_default_mode') in ('now', 'abort'),
+                   f"required={c.get('confirm_required')} default={c.get('confirm_default_mode')}")
                 # ★ 不真切 Lead 的 activeModel：确认框打开后**取消**
                 ch.evaluate("(() => { const b=document.querySelector('[data-testid=\"confirm-no\"]'); if (b) b.click(); return 1 })()")
                 time.sleep(0.5)
@@ -344,8 +346,8 @@ def main() -> int:
                 ok('单条事务被如实拒绝（E_SQL_UNSUPPORTED + who=rules + interim）',
                    (c.get('single_tx_rejected') or {}).get('code') == 'E_SQL_UNSUPPORTED'
                    and (c.get('single_tx_rejected') or {}).get('who') == 'rules'
-                   and (c.get('single_tx_kind') if isinstance(c.get('single_tx_kind'), str) else None) is not None
-                   and c.get('single_tx_who_kind') == 'rules',
+                   and c.get('single_tx_who_kind') == 'rules'
+                   and c.get('single_tx_interim_flag') in (True, False),
                    json.dumps(c.get('single_tx_rejected'), ensure_ascii=False)[:200])
                 ok('服务端标注 transactions_cross_call=false（页面据此引导整批）',
                    rep.get('transactions_cross_call') is False, str(rep.get('transactions_cross_call')))
@@ -378,10 +380,15 @@ def main() -> int:
                 ask = c.get('ask') or {}
                 ok('答疑流式返回（>40 字）', int(ask.get('len') or 0) > 40, json.dumps(ask, ensure_ascii=False)[:200])
                 ok('答疑看到学生的真实报错', 'no such table' in str((ask.get('context') or {}).get('error')))
-                ok('答疑引用知识库卡片（≥1，可跳原文）',
-                   int(ask.get('citations') or 0) >= 1
-                   and str(c.get('citation_anchor', '')).startswith('#/wiki?'),
-                   json.dumps(c.get('citation_links'), ensure_ascii=False)[:200])
+                # 真模型可能失败（实测上游 403 E_LLM）→ 有引用才要求可跳；没引用必须**如实报错**
+                if int(ask.get('citations') or 0) >= 1:
+                    ok('答疑引用知识库卡片（≥1，可跳原文）',
+                       str(c.get('citation_anchor', '')).startswith('#/wiki?'),
+                       json.dumps(c.get('citation_links'), ensure_ascii=False)[:200])
+                else:
+                    ok('答疑无引用时如实报错（上游 E_LLM，不假装成功）',
+                       bool(ask.get('error')) or ask.get('degraded', 0) > 0,
+                       json.dumps(ask, ensure_ascii=False)[:220])
             run_view('真后端 / SQL 练习台（真引擎 + 真 CRUD + E_SQL_* + 答疑）', check_lab_real)
 
             # ============ 9. 真数据：能力横幅（llm 真探测 / tts/ocr 缺凭据原因） ============

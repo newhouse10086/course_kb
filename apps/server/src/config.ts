@@ -486,9 +486,11 @@ export function loadConfig(opts: { root?: string; env?: Record<string, string | 
   };
 }
 
-/** 物化结果（`models.json` 已写盘 → pi 能用**项目配置的模型**，而不是它自己的全局默认）。 */
+/** 物化结果（`models.json` + `auth.json` 已写盘 → pi 能用**项目配置的模型与凭据**）。 */
 export interface PiModelsMaterialization {
-  /** pi 格式的 `models.json` 路径（传给 `AgentSessionManager({ modelsPath })`） */
+  /** pi 的 agent 目录（传给 `AgentSessionManager({ agentDir })` → 它会用 `<dir>/auth.json` 与 `<dir>/models.json`） */
+  agentDir: string;
+  /** pi 格式的 `models.json` 路径 */
   modelsPath: string;
   /** `provider/model` 引用（pi 的 `getModel(provider, model)` 用） */
   modelRef: string;
@@ -519,8 +521,9 @@ export function materializePiModels(cfg: ServerConfig): PiModelsMaterialization 
   if (!llm || !llm.configured || !llm.apiKey || !llm.baseUrl || !llm.model) return null;
   const dir = path.join(cfg.dataDir, 'pi-agent');
   const modelsPath = path.join(dir, 'models.json');
-  const payload = {
-    // pi 的形状（pi-bridge 实测可用）：providers.<id>.{baseUrl, api, apiKey, models[]}
+  const authPath = path.join(dir, 'auth.json');
+  const modelsPayload = {
+    // pi 的形状（实测可用）：providers.<id>.{baseUrl, api, apiKey, models[]}
     providers: {
       [llm.providerId]: {
         baseUrl: llm.baseUrl,
@@ -530,28 +533,51 @@ export function materializePiModels(cfg: ServerConfig): PiModelsMaterialization 
       },
     },
   };
-  const text = `${JSON.stringify(payload, null, 2)}\n`;
+  /**
+   * ★ `auth.json` —— **pi 的凭据来源，与 `models.json` 是两件事**。
+   *
+   * 实测（`data/tmp/probe_auth_shape.mjs` 四种候选形状对照）：
+   * ```
+   * 只有 models.json（含 apiKey），无 auth.json → ❌ "No API key found for amr"（8ms 就报错）
+   * auth.json = {"<id>":{"type":"api_key","key":"…"}}        → ❌ 形状不对：**静默挂死**（25s 无帧，即 E_PI_TIMEOUT）
+   * auth.json = {"<id>":{"type":"api_key","apiKey":"…"}}     → ❌ "No API key found for amr"
+   * auth.json = {"<id>":"<key>"}                            → ⚠️ 不报错但零内容
+   * auth.json = {"providers":{"<id>":{"type":"api_key","key":"…"}}} → ✅ 正常回答（70 个 delta）
+   * ```
+   * 即"180s 零帧"的静默挂死，正是**形状不对的 auth.json**（不是缺 key 那种快速报错）——
+   * 所以这里必须写对形状，否则症状是"什么都不发生"，极难查。
+   */
+  const authPayload = {
+    providers: { [llm.providerId]: { type: 'api_key', key: llm.apiKey } },
+  };
   let wrote = false;
   try {
     fs.mkdirSync(dir, { recursive: true });
-    const prev = fs.existsSync(modelsPath) ? fs.readFileSync(modelsPath, 'utf8') : '';
-    if (prev !== text) {
-      fs.writeFileSync(modelsPath, text, { encoding: 'utf8', mode: 0o600 });
-      wrote = true;
-    }
-    try {
-      fs.chmodSync(modelsPath, 0o600);
-    } catch {
-      /* Windows 上通常是 no-op */
+    for (const [file, payload] of [
+      [modelsPath, modelsPayload],
+      [authPath, authPayload],
+    ] as const) {
+      const text = `${JSON.stringify(payload, null, 2)}\n`;
+      const prev = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+      if (prev !== text) {
+        fs.writeFileSync(file, text, { encoding: 'utf8', mode: 0o600 });
+        wrote = true;
+      }
+      try {
+        fs.chmodSync(file, 0o600);
+      } catch {
+        /* Windows 上通常是 no-op */
+      }
     }
   } catch (err) {
     // 物化失败 → 如实返回 null（agent 会回落 pi 全局并在 ready 帧给出 warning），不假装成功
     process.stderr.write(
-      `[agent] pi models.json 物化失败（${err instanceof Error ? err.message : String(err)}）→ 将回落 pi 全局默认\n`,
+      `[agent] pi 凭据/模型目录物化失败（${err instanceof Error ? err.message : String(err)}）→ 将回落 pi 全局默认\n`,
     );
     return null;
   }
   return {
+    agentDir: dir,
     modelsPath,
     modelRef: `${llm.providerId}/${llm.model}`,
     providerId: llm.providerId,

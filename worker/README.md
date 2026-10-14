@@ -48,6 +48,57 @@ stderr: 日志（**不是协议**）
 
 ---
 
+### 2.1 ★ 输入编码：三条路径都**显式 UTF-8**（不看语言环境）
+
+| 路径 | 实现 | 说明 |
+|---|---|---|
+| `--in '<内联 JSON>'`（argv） | Python 在 Windows 用宽字符 API 取 argv | 中文安全 |
+| `--in <文件>` | `worker/stdio.py::read_text_file` | **按 BOM 判编码**，无 BOM 则 UTF-8 **strict** |
+| stdin（大 payload 的推荐通道，坑 18） | `worker/stdio.py::read_stdin_text`（读 `sys.stdin.buffer`） | **绝不**用 `sys.stdin.read()` |
+
+**为什么必须显式**：`sys.stdin.read()` 按**语言环境编码**解码 —— Windows 中文机是 **GBK**。
+于是"我们推荐的 stdin 大 payload 通道"在中文内容下**必然乱码**，而且**看起来成功**：
+坏字节被解成 `任?` / `?务`，JSON 照样能解析 → 一路写进库。
+实测对照（同一份 UTF-8 字节喂 stdin）：
+
+```
+默认（GBK 解码）          terms = ['任?', '?务']      ← 静默错
+PYTHONIOENCODING=utf-8   terms = ['任务']            ← 对
+```
+
+**`errors=` 策略：`strict`（不是 `replace`）** —— 这是有意的取舍：
+
+* `replace` 把坏字节变成 `?`/U+FFFD **而不报错**。若坏字节落在 JSON 字符串值里，
+  `json.loads` **照样成功** → 内容被悄悄改坏、零信号（正是上面那个 bug 的表现）。
+* 若坏字节落在 JSON 结构里，报的是"JSON 语法错"，把**编码问题**误诊成**格式问题**，排查方向全错。
+* 编码错误几乎总是上游真的错了（非 UTF-8 写入 / 流被截断 / 二次编码）→
+  **明确失败 + 指出第几字节**才可修。
+
+所以坏字节 → `E_PAYLOAD`（退出码 2）+ 精确信息：
+
+```jsonc
+{"type":"error","code":"E_PAYLOAD",
+ "msg":"stdin 不是合法 UTF-8：第 21 字节起解码失败（invalid continuation byte）—— 常见原因：上游用系统默认编码写的（Windows 中文机是 GBK），或字节流被截断",
+ "detail":"坏字节：b'\\xc8\\xce'（hex c8ce）；总长度 26 字节。修法：以 UTF-8 写入（Node 用 Buffer.from(json,'utf8')…）"}
+```
+
+**BOM**：按 BOM 判编码（`utf-8-sig` / `utf-16-le` / `utf-16-be` / `utf-32-*`）——
+Windows 编辑器与 `Set-Content -Encoding Unicode` 常写 BOM。
+**无 BOM 的 UTF-16 不做猜测**（猜编码会引入更隐蔽的错误）→ 明确失败并提示。
+（实现细节：用显式 codec 解 UTF-16 时 BOM 会留在文本里变成 U+FEFF、`json.loads` 会报
+"Unexpected UTF-8 BOM" → `stdio.decode_payload_bytes` 统一剥一次。）
+
+**stderr**：`main()` 调 `stdio.configure_stdio_utf8()` 把日志流设为 UTF-8
+（`errors="backslashreplace"`：日志宁可出现转义也不能因编码崩）。**stdout 不动** ——
+协议输出是 `sys.stdout.buffer` 的纯 ASCII 字节（见 §3）。
+
+> ⚠️ **测试必须造敌意环境**：历史上这个 bug 之所以长期没被发现，是因为开发机的 shell
+> 设了 `PYTHONIOENCODING=utf-8` → 测试进程继承它 → 在"恰好正确"的环境里全绿。
+> `worker/tests/test_cli.py::_hostile_env()` 现在**清掉** `PYTHONIOENCODING`/`PYTHONUTF8`
+> 并设 `PYTHONUTF8=0`，全量套件在该环境下也必须全绿（实测 499 passed）。
+> 同一类 bug 还有**第二处**：`worker/sandbox/runner.py` 也从 stdin 读 payload ——
+> 已一并修为显式 UTF-8（`test_runner_stdin_is_explicit_utf8` 在敌意环境下直连 runner 验证）。
+
 ## 3. stdout 协议（**硬约束**）
 
 一行一个 JSON，**行尾 `\n`**，5 种事件：

@@ -276,13 +276,16 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       if (piModels && typeof sessionMod.mod?.AgentSessionManager === 'function') {
         try {
           const manager = new sessionMod.mod.AgentSessionManager({
-            modelsPath: piModels.modelsPath,
+            // ★ 必须给 `agentDir`（而不是只给 `modelsPath`）：pi 的**凭据**读的是 `<agentDir>/auth.json`，
+            //   与 `models.json`（模型目录）是两件事。只给 modelsPath 会得到
+            //   "No API key found for <provider>"；而 auth.json 形状不对时更糟 —— **静默挂死**（180s 零帧）。
+            agentDir: piModels.agentDir,
             model: piModels.modelRef,
           });
           chatFactory = (connOpts) => createConn({ ...connOpts, manager } as never);
           process.stderr.write(
-            `[agent] 模型已绑定项目配置：${piModels.modelRef}` +
-              `（models.json → ${path.relative(cfg.root, piModels.modelsPath)}，apiKey 只写 data/，不回显）\n`,
+            `[agent] 模型与凭据已绑定项目配置：${piModels.modelRef}` +
+              `（agentDir → ${path.relative(cfg.root, piModels.agentDir)}，apiKey 只写 data/，不回显）\n`,
           );
         } catch (err) {
           chatFactory = createConn;
