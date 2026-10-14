@@ -20,6 +20,7 @@ import {
   auditCitations,
   createAskHandler,
   createSerialGate,
+  describeKill,
   detectDirectAnswer,
   explainDbError,
   extractCitations,
@@ -778,4 +779,115 @@ test('outcome 形状：可 JSON 序列化（要能直接进 HTTP/日志）', asy
   assert.equal(typeof parsed.elapsedMs, 'number');
   assert.equal(parsed.logAccess.status, 'empty');
   assert.equal(Array.isArray(parsed.contextWarnings), true);
+});
+
+// ===========================================================================
+// 7. ★ 超时/被杀语义（backend-core 的 `killedBy`/`hardKilled`）
+// ===========================================================================
+
+test('★ 超时**不是语法错**：E_SQL_TIMEOUT 的本地解读要明确这一点', () => {
+  const real = '执行超过 1000ms 被中断（SQLite progress_handler；父进程 0.75s 后硬杀）';
+  const reading = explainDbError(real);
+  assert.ok(reading, '必须能认出来（否则模型只能猜）');
+  assert.match(reading!.zh, /不是语法错/);
+  assert.match(reading!.zh, /递归 CTE|终止条件|LIMIT/);
+  assert.ok(!/语法错误/.test(reading!.zh), '绝不能读成语法错');
+  // backend-core 的 code 形式
+  assert.equal(explainDbError('E_SQL_TIMEOUT')!.kind, '执行超时');
+  assert.equal(explainDbError('interrupted')!.kind, '执行超时');
+  assert.equal(explainDbError('hardKilled=true')!.kind, '执行超时');
+  // 假日志源用例：先加 LIMIT 的建议要在里面
+  assert.match(explainDbError('E_SQL_TIMEOUT')!.zh, /LIMIT/);
+});
+
+test('★ describeKill：progress=中断、process=硬杀，两者都说"不是语法错"', () => {
+  assert.match(describeKill('progress', false)!, /中断/);
+  assert.match(describeKill('progress', false)!, /不是语法错/);
+  assert.match(describeKill('process', true)!, /强制终止|硬杀/);
+  assert.match(describeKill('process', true)!, /不是语法错/);
+  // 只给了 hardKilled 也要能说清楚
+  assert.match(describeKill(undefined, true)!, /硬杀/);
+  // 非超时场景返回 null（不污染提示词）
+  assert.equal(describeKill(undefined, undefined), null);
+  assert.equal(describeKill(undefined, false), null);
+});
+
+test('★ 提示词里带上 killedBy/hardKilled/timeoutMs 与终止解读（照抄 backend-core 的真形状）', async () => {
+  const session = new FakeAskSession();
+  session.answer = '**问题归类**：执行超时';
+  const handler = createAskHandler(
+    baseDeps({
+      manager: fakeManager(session),
+      logSource: makeLogSource({
+        entries: [
+          {
+            source: 'L1',
+            level: 'error',
+            sessionId: 's1',
+            code: 'E_SQL_TIMEOUT',
+            message: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断（SQLite progress_handler；父进程 0.75s 后硬杀）',
+            hint: '给学生看的提示：递归 CTE 需要终止条件（WHERE 里的递归约束），先加 LIMIT 试小范围',
+            sql: 'WITH RECURSIVE c(x) AS (…)',
+            context: {
+              localReading: '执行被中断（通常是超时）',
+              localMatched: true,
+              elapsedMs: 1000,
+              kind: 'WITH',
+              killedBy: 'progress',
+              hardKilled: false,
+              timeoutMs: 1000,
+            },
+          },
+        ],
+      }),
+      getRecentExecutions: async () => [
+        {
+          at: Date.now(),
+          sql: 'WITH RECURSIVE c(x) AS (…)',
+          ok: false,
+          error: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断（…）',
+          rowCount: 0,
+          elapsedMs: 1000,
+          kind: 'WITH',
+          killedBy: 'progress',
+          hardKilled: false,
+          timeoutMs: 1000,
+        },
+      ],
+    }),
+  );
+  const { sink } = collectFrames();
+  await handler.handle(
+    { sessionId: 's1', userId: 'u1', sql: 'WITH RECURSIVE c(x) AS (…)', error: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断' },
+    sink,
+  );
+  const message = session.promptCalls[0] ?? '';
+  assert.match(message, /killedBy=progress hardKilled=false/, '超时字段必须进提示词');
+  assert.match(message, /timeoutMs=1000/);
+  assert.match(message, /终止解读=/, '要有确定性话术');
+  assert.match(message, /本地解读=执行被中断/, 'backend-core 的 localReading 也要在');
+  assert.match(message, /不是语法错/);
+  // 最近执行记录段也要有
+  assert.match(message, /killedBy=progress hardKilled=false/);
+});
+
+test('★ 系统提示词明确要求：超时不得当语法错，且要告诉学生"不是你语法写错了"', () => {
+  assert.match(ASK_SYSTEM_PROMPT, /不要把所有报错都当语法错/);
+  assert.match(ASK_SYSTEM_PROMPT, /killedBy=progress/);
+  assert.match(ASK_SYSTEM_PROMPT, /killedBy=process/);
+  assert.match(ASK_SYSTEM_PROMPT, /不是语法错/);
+});
+
+test('★ 超时场景会带上 L2 摘要（报错疑似超时/锁 → §8.4 第 4 项）', async () => {
+  const ctx = await assembleAskContext(
+    { sessionId: 's1', userId: 'u1', error: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断' },
+    baseDeps({
+      logSource: makeLogSource({
+        info: () => ({ id: 'sqlite', layers: ['L1', 'L2'], available: true }),
+        entries: [{ source: 'L2', level: 'warning', message: '慢查询 1.2s', sessionId: 's1' }],
+      }),
+    }),
+  );
+  assert.ok(ctx.sections.some((s) => s.id === 'l2_summary'), '超时错误应带 L2');
+  assert.match(ctx.sections[0]!.text, /不是语法错/);
 });

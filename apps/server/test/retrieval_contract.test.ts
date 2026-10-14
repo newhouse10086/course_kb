@@ -292,3 +292,22 @@ test('anchorLabel：四种 span 类型都能读（页码/幻灯片/毫秒/偏移
   assert.equal(anchorLabel({ kind: 'time', start: 12480, end: 12480 }), '时间 00:12.480');
   assert.equal(anchorLabel({ kind: 'char', start: 1024, end: 1024 }), '偏移 #1024');
 });
+
+test('★ formatContext 门面：外部构造的**假锚点**同样被挡（不许有 as never 后门）', async () => {
+  const { db, repo } = seed();
+  const f = facadeFor(db, repo);
+  const text = f.formatContext(
+    [
+      { refKind: 'card', refId: 'a', title: '真锚点', snippet: 'x', evidence: { kind: 'page', start: 5, end: 5 }, why: 'w' },
+      // 假锚点：page 0/0（DB 默认值的形状）—— 必须被挡
+      { refKind: 'card', refId: 'b', title: '假锚点', snippet: 'y', evidence: { kind: 'page', start: 0, end: 0 }, why: 'w' },
+      // 非法 kind
+      { refKind: 'card', refId: 'c', title: '非法锚点', snippet: 'z', evidence: { kind: 'bogus', start: 1, end: 1 }, why: 'w' },
+    ],
+    'wiki',
+  );
+  assert.match(text, /真锚点/, '合法锚点必须保留');
+  assert.doesNotMatch(text, /假锚点/, '★ page 0/0 必须被挡（这正是 as never 强转会放行的）');
+  assert.doesNotMatch(text, /非法锚点/, '非法 kind 必须被挡');
+  db.close();
+});

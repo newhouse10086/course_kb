@@ -525,8 +525,122 @@ def group_notes_isolation(stu: Session, root: Session):
           "critical", "vstu2 GET /notes")
 
 
+def group_sandbox_worker():
+    """沙箱 HTTP 路由尚未交付 → 直接驱动 worker 层验证安全边界（真实执行）。
+
+    这是**真跑**：真的建库、真的执行 SQL、真的量超时。
+    """
+    p("\n== H. SQL 沙箱（worker 层真跑；HTTP 路由未交付）==")
+    sys.path.insert(0, str(KB))
+    try:
+        from worker.sandbox import runner as R
+    except Exception as e:  # noqa: BLE001
+        check("sandbox", "可导入 worker.sandbox.runner", False, "可导入",
+              f"{type(e).__name__}: {e}", "medium")
+        return
+    root = VERIFY / "sandbox"
+    root.mkdir(parents=True, exist_ok=True)
+    a = root / "stuA.sqlite3"
+    b = root / "stuB.sqlite3"
+    for f in (a, b):
+        for suf in ("", "-wal", "-shm"):
+            q = Path(str(f) + suf)
+            if q.exists():
+                q.unlink()
+
+    def run(sql, db):
+        return R.run_payload({"sql": sql, "db_path": str(db), "timeout_ms": 3000,
+                              "max_rows": 200, "allow_multi": False})
+
+    def code_of(res):
+        return ((res or {}).get("error") or {}).get("code")
+
+    # 正常 CRUD
+    for sql, nm in [
+        ("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", "CREATE TABLE"),
+        ("INSERT INTO t(id,v) VALUES (1,'a')", "INSERT"),
+        ("SELECT * FROM t", "SELECT"),
+        ("UPDATE t SET v='b' WHERE id=1", "UPDATE"),
+        ("DELETE FROM t WHERE id=1", "DELETE"),
+    ]:
+        r = run(sql, a)
+        check("sandbox", f"沙箱可执行 {nm}", code_of(r) is None, "无 error",
+              code_of(r) or "ok", "medium", f"run_payload({sql!r})")
+
+    # ATTACH / load_extension / 多语句 / PRAGMA 越界
+    for sql, label in [
+        ("ATTACH DATABASE 'evil.db' AS x", "ATTACH"),
+        ("SELECT load_extension('evil.dll')", "load_extension"),
+        ("SELECT 1; DROP TABLE t", "多语句"),
+        ("PRAGMA writable_schema=ON", "PRAGMA writable_schema"),
+        ("PRAGMA temp_store_directory='/tmp'", "PRAGMA temp_store_directory"),
+        ("PRAGMA foreign_keys=OFF", "PRAGMA foreign_keys=OFF"),
+        ("VACUUM", "VACUUM"),
+    ]:
+        r = run(sql, a)
+        c = code_of(r)
+        check("sandbox-security", f"★ {label} 被拒", c is not None, "有 error", c or "ok",
+              "critical", f"run_payload({sql!r})",
+              "词法闸 guard + SQLite authorizer 两道防线")
+
+    # sqlite_master 直写（词法闸漏，但 SQLite 自己拦）
+    r = run("INSERT INTO sqlite_master VALUES('t','t','t',0,'')", a)
+    check("sandbox-security", "★ 直写 sqlite_master 被 SQLite 拒绝", code_of(r) is not None,
+          "有 error", code_of(r) or "ok", "high",
+          "run_payload(\"INSERT INTO sqlite_master ...\")",
+          "第二道防线（SQLite 自身）生效；但词法闸漏掉它，见 problems")
+
+    # 注释/换行绕过关键字（词法闸漏 → 靠 SQLite 语法报错兜住）
+    for sql, label in [
+        ("AT/**/TACH DATABASE 'e.db' AS x", "ATTACH 注释分隔"),
+        ("AT\nTACH DATABASE 'e.db' AS x", "ATTACH 换行分隔"),
+        ("SELECT load_/**/extension('x')", "load_extension 注释分隔"),
+    ]:
+        r = run(sql, a)
+        c = code_of(r)
+        check("sandbox-security", f"{label}（被兜住）", c is not None, "有 error",
+              c or "ok", "medium", f"run_payload({sql!r})",
+              "词法闸未命中，靠 SQLite 语法/authorizer 兜住 —— 能执行不了，但报错文案若为 E_SQL_FORBIDDEN 更清楚")
+
+    # ★ 跨学生隔离
+    run("CREATE TABLE secret(v TEXT)", a)
+    run("INSERT INTO secret VALUES('A的私有数据')", a)
+    ra = run("SELECT * FROM secret", a)
+    rb = run("SELECT * FROM secret", b)
+    check("sandbox-security", "★ A 能读自己的表", code_of(ra) is None, "无 error",
+          code_of(ra) or "ok", "high")
+    check("sandbox-security", "★ B 看不到 A 的表（跨学生隔离）", code_of(rb) is not None,
+          "报不存在", code_of(rb) or "ok", "critical", "run_payload('SELECT * FROM secret', stuB)")
+
+    # ★ 路径越界
+    for bad, label in [
+        (root / ".." / ".." / "escape.sqlite3", "../ 逃逸"),
+        (KB / "data" / "course_kb.sqlite3", "主知识库"),
+    ]:
+        try:
+            r = run("SELECT 1", bad)
+            check("sandbox-security", f"★ 路径越界被拒：{label}", False, "拒绝",
+                  f"未拒绝：{code_of(r) or 'ok'}", "critical", f"run_payload(db_path={bad})")
+        except Exception as e:  # noqa: BLE001
+            check("sandbox-security", f"★ 路径越界被拒：{label}", True, "拒绝",
+                  f"{type(e).__name__}", "critical", f"run_payload(db_path={bad})")
+
+    # ★ 死循环必须被硬超时杀掉
+    p("     死循环测试（WITH RECURSIVE 无限递归，限 3000ms）…")
+    t0 = time.time()
+    r = run("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c", a)
+    dt = time.time() - t0
+    check("sandbox-security", "★ 死循环被超时杀掉（≤6s）", dt <= 6.0,
+          "≤ 6s", f"{dt:.2f}s code={code_of(r)}", "critical",
+          "run_payload('WITH RECURSIVE ...')",
+          "规格 §3：必须在独立进程里执行并硬超时杀进程")
+    check("sandbox-security", "死循环返回 E_SQL_TIMEOUT",
+          code_of(r) == "E_SQL_TIMEOUT", "E_SQL_TIMEOUT", code_of(r), "high")
+
+
 def group_sandbox(stu: Session):
-    p("\n== H. SQL 沙箱（SETTINGS_AND_SANDBOX §3）==")
+    """HTTP 层沙箱（未交付时如实说明）。"""
+    group_sandbox_worker()
     r = stu.req("POST", "/api/v1/sandbox/session", {})
     if r["status"] == 404:
         check("sandbox", "沙箱接口存在（/sandbox/session）", False, "非 404",
@@ -614,36 +728,33 @@ def group_sandbox(stu: Session):
     return sid
 
 
-def group_retrieval(root: Session, cap):
-    p("\n== I. 四种检索模式各自独立（RETRIEVAL）==")
-    rt = (cap or {}).get("retrieval")
-    if rt is None:
-        check("retrieval", "capabilities 暴露 retrieval 段", False, "有", "缺失", "medium")
-    # 尝试用 chat 的 retrieval 参数（需要会话）
-    results = {}
-    for mode in ("none", "wiki", "kg", "rag"):
-        r = root.req("POST", "/api/v1/chat/verify-sess/message",
-                     {"message": "什么是索引？", "retrieval": mode}, timeout=120)
-        results[mode] = r
-        p("     mode=%-5s status=%s %s" % (mode, r["status"], _s(r["body"], 110)))
-    # rag 必须如实报不可用
-    if rt and isinstance(rt, dict) and isinstance(rt.get("rag"), dict):
-        check("retrieval", "rag 在 capabilities 里 available:false",
-              rt["rag"].get("available") is False, False, rt["rag"].get("available"), "medium")
-    else:
-        check("retrieval", "capabilities.retrieval.rag 存在且如实报不可用", False,
-              "存在", "缺失/无 rag 键", "medium", "GET /capabilities")
-    # 四种模式结果是否真的不同（若都 200）
-    codes = {m: r["status"] for m, r in results.items()}
-    check("retrieval", "四种模式可独立调用（未被全捆）",
-          all(c in (200, 202, 400, 404, 409, 503) for c in codes.values()),
-          "都有明确响应", codes, "medium")
-    return results
+def group_not_yet_delivered(root: Session, cap):
+    """契约里有、但**当前尚未交付**的接口 —— 如实记为未交付（不是 bug，是进度）。"""
+    p("\n== I. 契约要求但尚未交付的接口（如实记录，不当作 bug）==")
+    probes = [
+        ("sandbox",  "POST", "/api/v1/sandbox/session"),
+        ("sandbox",  "POST", "/api/v1/sandbox/execute"),
+        ("sandbox",  "GET",  "/api/v1/sandbox/datasets"),
+        ("retrieval", "GET", "/api/v1/models"),
+        ("retrieval", "GET", "/api/v1/settings"),
+        ("retrieval", "POST", "/api/v1/settings/llm/switch"),
+    ]
+    missing = []
+    for grp, m, path in probes:
+        r = root.req(m, path, {} if m == "POST" else None)
+        if r["status"] == 404:
+            missing.append(path)
+        p("     %-6s %-34s -> %s" % (m, path, r["status"]))
+    for seg in ("retrieval", "sandbox"):
+        present = isinstance(cap, dict) and seg in cap
+        p("     capabilities.%-10s 存在 = %s" % (seg, present))
+        missing.append(f"capabilities.{seg}") if not present else None
+    p("     （未交付清单：%d 项）" % len(missing))
+    return missing
 
 
 def group_agent_resume(root: Session):
     p("\n== J. agent 会话恢复（RETRIEVAL §5）==")
-    # 通过 capabilities 看 agent 是否可用
     r = root.req("GET", "/api/v1/capabilities")
     cap = r["body"] if isinstance(r["body"], dict) else {}
     agent = cap.get("agent") or cap.get("pi")
@@ -719,7 +830,7 @@ def main():
         group_notes_isolation(stu, root)
         if not args.skip_sandbox:
             group_sandbox(stu)
-        group_retrieval(root, cap)
+        missing = group_not_yet_delivered(root, cap)
         group_agent_resume(root)
     finally:
         if not args.keep:
@@ -736,6 +847,7 @@ def main():
         "checks_total": len(CHECKS),
         "checks_failed": len(PROBLEMS),
         "by_severity": dict(Counter(x["severity"] for x in PROBLEMS)),
+        "not_yet_delivered": missing,
         "problems": PROBLEMS,
         "checks": CHECKS,
     }

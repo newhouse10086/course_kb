@@ -217,8 +217,10 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
                 statements=result.get("statements"),
                 # ★ 超时信息一并落审计：S4 的 `sandbox.logs`/`sandbox.history` 要能
                 #   告诉学生"是被超时停掉的，不是你语法错"（progress=SQLite 层中断，
-                #   process=父进程硬杀）
-                **({"killed_by": result.get("killedBy"), "hard_killed": True,
+                #   process=父进程硬杀）。⚠️ hardKilled 必须取**实际结果**，
+                #   不能一律写 True —— progress 路径并没有杀进程（实测抓出过这个不一致）
+                **({"killed_by": result.get("killedBy"),
+                    "hard_killed": bool(result.get("hardKilled")),
                     "timeout_ms": timeout_ms} if err_code == "E_SQL_TIMEOUT" else {}))
     return result
 

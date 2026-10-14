@@ -106,6 +106,23 @@ export interface ExecutionRecord {
   elapsedMs?: number;
   /** 语句类型（SELECT/INSERT/…；backend-core 额外给的） */
   kind?: string;
+  /**
+   * 被谁终止（backend-core 的 `sandbox.exec`/`sandbox.history` 都带）：
+   * - `progress` = SQLite 在**语句层**中断（超时）；`hardKilled` 恒为 false
+   * - `process`  = 父进程 `kill()` **硬杀**（最终兜底）；`hardKilled` 恒为 true
+   * 两者都**不是语法错** —— 话术必须区分（否则学生会以为自己写错了语法）。
+   */
+  killedBy?: 'progress' | 'process';
+  hardKilled?: boolean;
+  timeoutMs?: number;
+}
+
+/** `killedBy`/`hardKilled` 的确定性中文话术（与 backend-core 的语义约定一致）。 */
+export function describeKill(killedBy: string | undefined, hardKilled: boolean | undefined): string | null {
+  if (killedBy === 'process') return '查询被沙箱**强制终止**（进程级硬杀，最终兜底）——不是语法错';
+  if (killedBy === 'progress') return '查询被**中断**（超时，SQLite 语句层中断）——不是语法错';
+  if (hardKilled === true) return '查询被沙箱强制终止（进程级硬杀）——不是语法错';
+  return null;
 }
 
 /** 知识库检索命中（`/search` 的 hits） */
@@ -296,6 +313,13 @@ export const DELIM = {
 // ===========================================================================
 
 const SQLITE_ERROR_READINGS: { re: RegExp; zh: string; kind: string }[] = [
+  // ★ 超时/被杀必须**先于**通用语法规则匹配：学生最常遇到"递归 CTE 被停了"，
+  //   而我们绝不能让它被读成"语法错"（他会白折腾半天语法）。
+  {
+    re: /E_SQL_TIMEOUT|执行超过\s*\d+\s*ms\s*被中断|interrupted|hardKilled|killedBy/i,
+    zh: '查询被沙箱**中断/强制终止**（超时）——**不是语法错**。常见原因：递归 CTE 没有终止条件、笛卡尔积/自连接把结果集放大了几个数量级、或缺少 LIMIT。建议先加 LIMIT 试小范围，再补终止条件',
+    kind: '执行超时',
+  },
   { re: /no such table:\s*(\S+)/i, zh: '表不存在 —— 表名拼错，或还没建表，或建在了别的库/别的连接里', kind: '对象不存在' },
   { re: /no such column:\s*(\S+)/i, zh: '列不存在 —— 列名拼错，或该列不在你查询的表里（多表连接时注意用 表.列 限定）', kind: '对象不存在' },
   { re: /no such function:\s*(\S+)/i, zh: '函数不存在 —— SQLite 内建函数比 MySQL 少；也可能是名字写错', kind: '对象不存在' },
@@ -393,10 +417,19 @@ function formatLogs(entries: DbLogEntry[], redact: (s: string) => string): strin
       if (e.code) parts.push(`code=${e.code}`);
       parts.push(redact(e.message));
       if (e.hint) parts.push(`hint=${redact(e.hint)}`);
-      // backend-core 在 context.localReading 里给了**确定性中文解读**（18 类 SQLite 报错）——
+      // backend-core 在 context.localReading 里给了**确定性中文解读**（18+ 类 SQLite 报错）——
       // 这是"看懂报错"最有用的一行，别丢。
       const localReading = e.context?.localReading;
       if (typeof localReading === 'string' && localReading !== '') parts.push(`本地解读=${redact(localReading)}`);
+      // 超时/被杀：`progress`=语句层中断、`process`=进程硬杀；两者都**不是语法错**
+      const killedBy = typeof e.context?.killedBy === 'string' ? e.context.killedBy : undefined;
+      const hardKilled = typeof e.context?.hardKilled === 'boolean' ? e.context.hardKilled : undefined;
+      if (killedBy !== undefined || hardKilled !== undefined) {
+        parts.push(`killedBy=${killedBy ?? '?'} hardKilled=${String(hardKilled ?? '?')}`);
+      }
+      const killReading = describeKill(killedBy, hardKilled);
+      if (killReading) parts.push(`终止解读=${killReading}`);
+      if (typeof e.context?.timeoutMs === 'number') parts.push(`timeoutMs=${e.context.timeoutMs}`);
       if (e.sql) parts.push(`sql=${e.sql}`);
       return parts.join(' ');
     })
@@ -523,8 +556,10 @@ export async function assembleAskContext(req: AskRequest, deps: AskDeps = {}): P
       return `[${when}] ${r.kind ? `${r.kind} ` : ''}${r.ok ? 'OK' : '失败'}${
         r.rowCount !== undefined ? ` rows=${r.rowCount}` : ''
       }${r.elapsedMs !== undefined ? ` ${r.elapsedMs}ms` : ''}${
-        r.error ? ` error=${sanitizeUntrusted(r.error, { maxLen: 200 }).text}` : ''
-      }\n  SQL: ${san.text}`;
+        r.killedBy !== undefined || r.hardKilled !== undefined
+          ? ` killedBy=${r.killedBy ?? '?'} hardKilled=${String(r.hardKilled ?? '?')}`
+          : ''
+      }${r.error ? ` error=${sanitizeUntrusted(r.error, { maxLen: 200 }).text}` : ''}\n  SQL: ${san.text}`;
     });
     sections.push({
       id: 'recent_sql',
@@ -737,6 +772,11 @@ export const ASK_SYSTEM_PROMPT = `你是一位数据库课程的助教，正在�
 2. **先归类问题**，再分析。问题类型只用这几类：
    语法错 / 对象不存在 / 类型不匹配 / 约束冲突 / 权限不足 / 锁超时 / 逻辑错（能跑但结果不对）/ 方言差异。
    第一句就点明属于哪一类。
+   ⚠️ **不要把所有报错都当语法错**。特别地：
+   - 上下文里出现 \`killedBy=progress\` → 查询**被中断（超时）**；\`killedBy=process\` → 被**进程级强制终止**。
+     两者都**不是语法错**，多数属于"逻辑错"（递归 CTE 缺终止条件、结果集过大、缺 LIMIT）。
+     请明确告诉学生"这不是你语法写错了"，并指出真正的原因方向。
+   - \`E_SQL_TIMEOUT\`、\`interrupted\`、\`执行超过 N ms 被中断\` 同理。
 3. **必须引用知识库卡片**。上下文会给出"知识库检索命中"，里面每条都有 \`[[card:xxx]]\`。
    你在回答里引用卡片时，**只能照抄这些 id**（写 \`[[card:crd_0001]]\`），
    **绝不允许编造 id**，也不要在没有命中时说"参见某卡片"。

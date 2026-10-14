@@ -416,6 +416,12 @@ worker 外壳统一保证协议格式与退出码。
   * `localReading`/`hint` 是**本地确定性解读**（模型不可用时也能诚实降级）。
 * **超时**：`E_SQL_TIMEOUT`；`killedBy: "progress"`（SQLite 层先中断）或 `"process"`
   （**父进程硬杀**，`hardKilled:true`）；两种情况都不阻塞后续执行。
+  * 这条信息**也落进审计**：`sandbox.history` 的记录带 `killedBy`/`hardKilled`/`timeoutMs`，
+    `sandbox.logs` 的 `entry.context` 同样带 —— S4 才能准确说"你的递归 CTE 是被超时
+    停掉的，不是语法错"。**`hardKilled` 与 `killedBy` 恒自洽**（`progress` ⇒ `false`，
+    `process` ⇒ `true`，有断言）。
+  * 超时条目的 `hint` 是**确定性**文案（递归要有终止条件 + 先加 LIMIT 试小范围），
+    不靠正则去匹配人话文本。
 * **入参/路径类** → exit **2**（`E_SANDBOX_PATH` / `E_PAYLOAD`）；
   **引擎不可用** → exit **1** + `E_ENGINE_UNAVAILABLE`（reason 指向部署文档）。
 
