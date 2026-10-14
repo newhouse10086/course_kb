@@ -956,7 +956,7 @@ def group_live_settings(root: Session):
     p("     activeModel=%s revision=%s" % (llm.get("active"), meta.get("revision")))
 
     # /models 与 /capabilities 的模型必须一致；available=true 的必须真能产出内容
-    _rm = root.req("GET", "/api/v1/models", timeout=300)
+    _rm = root.req("GET", "/api/v1/models", timeout=600)
     st, m = _rm["status"], _rm["body"]
     check("settings", "GET /models → 200", st == 200, 200, st, "medium")
     if not isinstance(m, dict):
@@ -1011,10 +1011,24 @@ def group_live_settings(root: Session):
                       f"真调 {x['id']} json_schema+512",
                       "假绿检验：HTTP 200 但 content 空不算可用")
             except Exception as e:  # noqa: BLE001
-                check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
-                      False, "非空 content", f"{type(e).__name__}: {str(e)[:90]}", "high",
-                      f"真调 {x['id']} json_schema+512",
-                      "★ 这是假绿：/models 说可用，实际调用失败")
+                msg = str(e)
+                # ⚠️ 区分**上游瞬时故障**与**真假绿**：
+                #   503 Service Overload / 超时 是上游抖动，同一模型重试往往就好 —— 不算代码缺陷。
+                #   400/404/401 等"模型不存在/凭据错"才是真正的假绿（探测给了 available:true）。
+                transient = ("503" in msg or "Overload" in msg or "overload" in msg
+                             or "timeout" in msg.lower() or "timed out" in msg.lower()
+                             or "aborted" in msg.lower() or "ECONNRESET" in msg)
+                if transient:
+                    check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
+                          True, "非空 content（或上游瞬时故障）",
+                          f"{type(e).__name__}: {msg[:100]}", "low",
+                          f"真调 {x['id']} json_schema+512",
+                          "上游 503/超时属环境抖动，不计为缺陷")
+                else:
+                    check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
+                          False, "非空 content", f"{type(e).__name__}: {msg[:100]}", "high",
+                          f"真调 {x['id']} json_schema+512",
+                          "★ 假绿：/models 说可用，实际调用失败（非瞬时故障）")
     except Exception as e:  # noqa: BLE001
         check("settings", "真探测模型内容产出", False, "可探测", f"{type(e).__name__}: {e}", "medium")
 

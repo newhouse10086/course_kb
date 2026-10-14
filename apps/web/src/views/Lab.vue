@@ -108,6 +108,8 @@ const askStages = ref<string[]>([])
 const askError = ref('')
 /** 后端如实声明的读不到清单（例如引擎日志不可用） */
 const askDegraded = ref<string[]>([])
+/** 后端回显的"用户消息"全文（真后端把学生 SQL/报错放在这里，证明 AI 真的看到了） */
+const askUserEcho = ref('')
 
 const CRUD_SNIPPETS: Array<{ label: string; sql: string; kind: 'ddl' | 'dml' | 'dql' | 'tx' }> = [
   { label: '建表', kind: 'ddl', sql: 'CREATE TABLE my_note (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_at TEXT)' },
@@ -294,6 +296,7 @@ async function ask() {
   askContext.value = null
   askError.value = ''
   askDegraded.value = []
+  askUserEcho.value = ''
   const body = {
     sessionId: session.value?.sessionId,
     sql: sql.value.trim(),
@@ -315,6 +318,7 @@ async function ask() {
         else if (d.type === 'message_end') {
           const msg = d.message || {}
           const texts = (msg.content || []).filter((c: any) => c?.type === 'text').map((c: any) => String(c.text || ''))
+          if (msg.role === 'user' && texts.length) askUserEcho.value = texts.join('\n')
           const degradedText = texts.find((x: string) => /日志可用性|读不到/.test(x))
           if (msg.role === 'user' && degradedText) {
             askDegraded.value = [...askDegraded.value, degradedText.slice(0, 300)]
@@ -574,6 +578,7 @@ async function runSelftest() {
   // 真模型流式回答要几十秒（mock 是即时的）→ 预算放到 180s
   for (let i = 0; i < 1800 && (askBusy.value || !askText.value); i++) await new Promise((r) => setTimeout(r, 100))
   await new Promise((r) => setTimeout(r, 600))
+  rec('ask_user_echo', askUserEcho.value.slice(0, 200))
   rec('ask', { len: askText.value.length, stages: askStages.value.length, citations: citations.value.length,
     head: askText.value.slice(0, 60), error: askError.value.slice(0, 90), degraded: askDegraded.value.length,
     context: askContext.value })

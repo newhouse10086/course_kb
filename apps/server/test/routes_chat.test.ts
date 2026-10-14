@@ -41,6 +41,47 @@ const ADMIN_USER = 'admin';
 const ADMIN_PASS = 'chat-pass-12345';
 let authCookie: string | null = null;
 
+/**
+ * 回归：**连接就绪前到达的客户端帧不许丢**。
+ *
+ * 原 bug（polysemy-prober 的"180s 零帧"）：`socket.on('message')` 在
+ * `await chatFactory(...)` **之后**才注册，而建连接要 ~2.7s（解析模型、开 pi 会话）；
+ * 浏览器习惯在 `onopen` 后**立刻**发 prompt → 帧到达时没有监听器 → 被 EventEmitter 丢弃 → 永远沉默。
+ * 这里用一个**故意慢**（250ms）的工厂复现那个窗口。
+ */
+test('★ 连接就绪前发出的帧必须被缓冲并回放（慢工厂 250ms 复现竞态）', async () => {
+  const slowFactory: ChatConnectionFactory = async ({ send }) => {
+    await new Promise((r) => setTimeout(r, 250)); // 模拟"解析模型 + 开 pi 会话"的耗时
+    return {
+      async handleClientMessage(raw) {
+        await send({ type: 'echo', got: String(raw) });
+        await send({ type: 'settled' });
+      },
+      async close() {
+        /* noop */
+      },
+    };
+  };
+  const built = await makeApp(slowFactory);
+  const wsBase = await listen(built);
+  try {
+    // connect() 在 `open` 事件里立刻发送 —— 正好落在工厂还没 resolve 的窗口内
+    // ⚠️ 给足超时：全量套件并行时机器很慢（默认 5s 会误报"没关闭"）
+    const c = connect(`${wsBase}/api/v1/chat/slow-1`, {
+      send: JSON.stringify({ type: 'prompt', message: '早到的帧' }),
+      timeoutMs: 30_000,
+    });
+    const closed = await c.closed;
+    assert.equal(closed.code, 1000, `连接应正常关闭，实际 ${closed.code}`);
+    const echo = c.frames.find((f) => f.type === 'echo');
+    assert.ok(echo, `★ 早到的帧被丢了：收到 ${JSON.stringify(c.frames)}`);
+    assert.equal(echo.got, JSON.stringify({ type: 'prompt', message: '早到的帧' }), '回放的内容必须与客户端发的**逐字相同**');
+    assert.ok(c.frames.some((f) => f.type === 'settled'), 'settled 也要到达');
+  } finally {
+    await built.close();
+  }
+});
+
 /** 起服务 + 登录（WS 也要带 cookie —— 我的鉴权钩子对 WS 握手同样生效）。 */
 async function loginFor(base: string): Promise<string> {
   const res = await fetch(`${base}/api/v1/auth/login`, {

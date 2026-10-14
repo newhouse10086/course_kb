@@ -379,7 +379,10 @@ def main() -> int:
                 # ★ 答疑：真模型流式 + 真引用
                 ask = c.get('ask') or {}
                 ok('答疑流式返回（>40 字）', int(ask.get('len') or 0) > 40, json.dumps(ask, ensure_ascii=False)[:200])
-                ok('答疑看到学生的真实报错', 'no such table' in str((ask.get('context') or {}).get('error')))
+                # 真后端没有 progress 帧（上下文在"回显的用户消息"里）→ 两条路都算证据
+                seen = str((ask.get('context') or {}).get('error') or '') + ' ' + str(c.get('ask_user_echo') or '')
+                ok('答疑确实看到了学生的真实报错（SQL/报错进了提示词）', 'no such table' in seen,
+                   seen[:200])
                 # 真模型可能失败（实测上游 403 E_LLM）→ 有引用才要求可跳；没引用必须**如实报错**
                 if int(ask.get('citations') or 0) >= 1:
                     ok('答疑引用知识库卡片（≥1，可跳原文）',

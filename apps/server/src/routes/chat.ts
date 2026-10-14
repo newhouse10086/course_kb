@@ -42,6 +42,36 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
     let chat: ChatConnectionLike | null = null;
     let closed = false;
 
+    /**
+     * ★ 早到的客户端帧必须**缓冲**，不能丢。
+     *
+     * 原实现的真 bug（polysemy-prober 看到的"180s 零帧"就是它 + 模型未绑定叠加）：
+     * `socket.on('message', …)` 在 `await deps.chatFactory(...)` **之后**才注册，而建连接要
+     * ~2.7s（解析模型、开 pi 会话）。浏览器习惯在 `onopen` 后**立刻**发 prompt →
+     * 那些帧到达时**还没有监听器** → 被 EventEmitter 直接丢弃 → 客户端只看到 `ready`，之后永远沉默。
+     *
+     * 所以：监听器**立刻**注册，连接就绪前把帧排队，就绪后按序回放。
+     */
+    const earlyFrames: string[] = [];
+    const toPayload = (raw: unknown): string =>
+      typeof raw === 'string' ? raw : Buffer.isBuffer(raw) ? raw.toString('utf8') : raw instanceof Uint8Array ? Buffer.from(raw).toString('utf8') : String(raw);
+
+    socket.on('message', (raw: unknown) => {
+      const payload = toPayload(raw);
+      if (!chat) {
+        earlyFrames.push(payload); // 连接还没建好 → 排队（**不丢**）
+        return;
+      }
+      void chat.handleClientMessage(payload).catch((err: unknown) => {
+        const msg = redact(err instanceof Error ? err.message : String(err));
+        try {
+          socket.send(safeJsonStringify({ type: 'error', code: 'E_INTERNAL', msg }));
+        } catch {
+          /* 已断开 */
+        }
+      });
+    });
+
     try {
       chat = await deps.chatFactory!({
         sessionId,
@@ -106,19 +136,17 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
       return;
     }
 
-    socket.on('message', (raw: unknown) => {
-      if (!chat) return;
-      const payload =
-        typeof raw === 'string' ? raw : Buffer.isBuffer(raw) ? raw : raw instanceof Uint8Array ? raw : String(raw);
+    // ★ 回放连接就绪前收到的帧（见上方 `earlyFrames` 注释）
+    for (const payload of earlyFrames.splice(0)) {
       void chat.handleClientMessage(payload).catch((err: unknown) => {
         const msg = redact(err instanceof Error ? err.message : String(err));
         try {
-          socket.send(JSON.stringify({ type: 'error', code: 'E_INTERNAL', msg }));
+          socket.send(safeJsonStringify({ type: 'error', code: 'E_INTERNAL', msg }));
         } catch {
           /* 已断开 */
         }
       });
-    });
+    }
 
     socket.on('close', () => {
       closed = true;
