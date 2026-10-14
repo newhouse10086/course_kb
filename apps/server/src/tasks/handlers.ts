@@ -43,6 +43,17 @@ export const EXTRACT_STATUS = {
   none: 'none',
   running: 'running',
   done: 'done',
+  /**
+   * ★ 全部成功但**零卡片**（内容不足）—— 后端 core 新增的 `status:"done_empty"`。
+   *
+   * 为什么必须单列：真链路实测过"`task.status=done`、`llm_calls=1`、`llm_failures=0`、`cards=0`"，
+   * 调用方**无法分辨**"内容不足 / 输出不合规 / 管线丢卡"。若把它当 `done`，
+   * 前端会显示"已抽取 0 张卡片"——**看起来成功、其实什么都没产出**。
+   * 前端应显示"本节内容不足以生成卡片"（并展示模型给的 `model_note`）。
+   */
+  done_empty: 'done_empty',
+  /** 部分成功（有卡片也有失败） */
+  partial: 'partial',
   failed: 'failed',
   /** 抽取能力不可用（**不是**"抽取了但没结果"） */
   unavailable: 'unavailable',
@@ -220,6 +231,12 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
         units,
         ...(repo.getDocumentRow(docId)?.title ? { title: String(repo.getDocumentRow(docId)?.title) } : {}),
         pagesTotal: repo.getDocumentRow(docId)?.page_count ?? 0,
+        // ★ 断点续跑透传（模型热切换 `mode:"abort"`：存断点 → 终止 → 换模型 → **跳过已完成单元**）
+        //   契约名见 `worker/README.md` §7：`checkpoint_file` + `resume`
+        ...(typeof ctx.params.checkpoint_file === 'string' && ctx.params.checkpoint_file
+          ? { checkpointFile: ctx.params.checkpoint_file }
+          : {}),
+        ...(ctx.params.resume === true ? { resume: true } : {}),
         ...(opts.limit && opts.limit > 0 ? { limit: opts.limit } : {}),
         signal: ctx.signal,
         onProgress: ({ stage, done, total }) => {
@@ -254,13 +271,33 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
     indexDocument(db, repo, docId);
 
     // worker convert 自报 ok=false（部分成功）→ 如实标 failed，但已转出的卡片照常入库
+    //
+    // ★ 三态区分（backend-core 新增 `status`/`warnings`，见 worker/README §6 与他们的通知）：
+    //   - 有卡片 + 有失败 → `partial`（**不是** failed：已产出的卡片是有效的）
+    //   - 全部成功但**零卡片** → `done_empty`（内容不足；**绝不能报 done**，
+    //     否则前端显示"已抽取 0 张卡片"，看起来成功、实际什么都没产出）
+    //   - 全失败 → `failed`
+    //   - 否则 → `done`
+    const workerStatus = typeof result.status === 'string' ? result.status : '';
+    const cardCount = result.cards.length;
     const status =
-      failures.length > 0 || result.stats.ok === false ? EXTRACT_STATUS.failed : EXTRACT_STATUS.done;
+      workerStatus === 'failed' || (failures.length > 0 && cardCount === 0 && result.stats.ok === false)
+        ? EXTRACT_STATUS.failed
+        : cardCount === 0 && failures.length === 0
+          ? EXTRACT_STATUS.done_empty
+          : failures.length > 0 || result.stats.ok === false || workerStatus === 'partial'
+            ? EXTRACT_STATUS.partial
+            : EXTRACT_STATUS.done;
     repo.mergeDocumentMeta(docId, {
       extract_status: status,
       extract_error: failures.join(' | '),
       extract_done_at: Date.now(),
       extract_used_provider: result.usedProvider ?? '',
+      // 零卡片时把 worker 的告警（含**模型自己的解释** `model_note`）带给前端：
+      // 学生/教师看到的是"本节内容不足以生成卡片：<模型原话>"，而不是一个空列表
+      ...(Array.isArray(result.warnings) && result.warnings.length > 0
+        ? { extract_warnings: result.warnings }
+        : {}),
       ...(result.degradedFrom
         ? { extract_degraded_from: result.degradedFrom, extract_degraded_reason: result.degradedReason ?? '' }
         : {}),

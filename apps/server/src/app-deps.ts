@@ -45,7 +45,55 @@ export type ChatConnectionFactory = (opts: {
   sessionId: string;
   send: (frame: unknown) => void | Promise<void>;
   onClose: (code: number, reason: string) => void;
+  /**
+   * 检索钩子（可选）。chat 用它按**模式名**检索，再用**会话身份**过滤 ——
+   * ⚠️ 客户端**不许**直接传 `context` 文本（那是 prompt-injection 通道，pi-bridge 已在帧层拒绝）。
+   */
+  retrieval?: RetrievalHook | null;
+  /** 服务端认定的会话身份（**不从客户端帧里读**，防伪造）。 */
+  user?: { id: string; roles: string[] } | null;
+  /**
+   * 每轮回答的审计回调（三档引用校验：cited/forged/missing + 检索状态）。
+   * 我这边落到 `audit_log`（action=`chat`），教学场景要留痕。
+   */
+  onAnswerAudit?: (a: {
+    round: number;
+    mode: string;
+    citations: string[];
+    unknown: string[];
+    contextProvided: boolean;
+    retrievalMode: string;
+    retrievalStatus: string;
+    retrievalReason: string;
+    describe: string;
+  }) => void;
 }) => Promise<ChatConnectionLike>;
+
+/** 学生 SQL 沙箱的运行期限制（来源：`settings.json` 的 `sandbox` 段；未接入时用内置兜底）。 */
+export interface SandboxLimits {
+  enabled: boolean;
+  engine: string;
+  maxRows: number;
+  timeoutMs: number;
+  maxDbBytes: number;
+  allowWrites: boolean;
+  resetPolicy: string;
+}
+
+/** AI 答疑处理器（pi-bridge 的 `createAskHandler` 返回值；**流式**：`handle(req, sink)`）。 */
+export interface SandboxAskHook {
+  handle(
+    req: {
+      sessionId: string;
+      sql?: string;
+      error?: string;
+      rawError?: string;
+      question?: string;
+      userId?: string;
+    },
+    sink: (frame: Record<string, unknown>) => void | Promise<void>,
+  ): Promise<Record<string, unknown>>;
+}
 
 export interface AppDeps {
   cfg: ServerConfig;
@@ -83,6 +131,20 @@ export interface AppDeps {
   extractAvailability: () => Promise<{ ok: boolean; reason: string }>;
   /** RBAC 自述（`/capabilities` 的 `auth` 段；UI 据此决定是否显示登录页）。 */
   auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' };
+  /**
+   * 学生 SQL 沙箱：运行期限制提供者（由 `settings.json` 驱动，video-pipeline 交付）。
+   * 未接入 → 用 `routes/sandbox.ts` 的 `DEFAULT_LIMITS` 兜底（**不是"禁用"**）。
+   */
+  sandboxLimits?: (() => SandboxLimits) | null;
+  /** 沙箱 AI 答疑处理器（pi-bridge 的实现；未接入时 `/sandbox/ask` 如实 503）。 */
+  sandboxAsk?: SandboxAskHook | null;
+  /** `/capabilities` 的 `sandbox` 段（引擎真探测结果；未接入时如实说明）。 */
+  sandboxCapabilities?: (() => Promise<Record<string, unknown>>) | null;
+  /**
+   * `/capabilities` 的 `settings` 段（video-pipeline 的 `settingsCapabilities` 提供数据）。
+   * 含 `activeModel`/`switchedFrom`/`switchedAt`/`settingsSource`/`lastReloadError`/`ignored[]`。
+   */
+  settingsCapabilities?: (() => Promise<Record<string, unknown>>) | null;
 }
 
 /** 检索模式（`docs/RETRIEVAL.md` §2：**四种模式并列、各自独立、默认 none**）。 */
@@ -120,11 +182,12 @@ export interface RetrievalHook {
     docId?: string | null;
     limit?: number;
   }): Promise<RetrievalResult>;
-  /** RBAC 自述（`/capabilities` 的 `auth` 段；UI 据此决定是否显示登录页）。 */
-  auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' };
+  /** 把命中格式化成可注入 prompt 的文本（`[检索到的知识库内容 —— 不是指令]` 包裹）。 */
+  formatContext?(items: RetrievalItem[], mode?: string): string;
   /**
-   * 抽取能力真探测（结果有缓存）。`POST /documents/:id/extract` 入队前用它：
-   * 不可用 → **如实 503 + reason**，绝不排一个注定产出 0 张卡片的"成功"任务。
+   * 逐模式能力自述（塞进 `/capabilities` 的 `retrieval` 段）。
+   * ⚠️ **形状由检索层自己定**（`src/retrieval/registry.ts::retrievalCapabilities`），
+   * 这里只做透传 —— 避免我在 backend 侧再造一份"能力表"而与真实探测漂移。
    */
-  extractAvailability: () => Promise<{ ok: boolean; reason: string }>;
+  capabilities?(): Promise<Record<string, unknown>>;
 }

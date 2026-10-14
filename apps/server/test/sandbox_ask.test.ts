@@ -20,6 +20,7 @@ import {
   auditCitations,
   createAskHandler,
   createSerialGate,
+  describeBlame,
   describeKill,
   detectDirectAnswer,
   explainDbError,
@@ -606,10 +607,11 @@ test('依赖失败不阻断答疑：记 contextWarnings，仍能回答', async (
 // ===========================================================================
 
 test('★ 本地报错解读：真实 SQLite 报错 → 归类 + 中文含义', () => {
-  assert.deepEqual(explainDbError('no such table: student'), {
-    kind: '对象不存在',
-    zh: '表不存在 —— 表名拼错，或还没建表，或建在了别的库/别的连接里',
-  });
+  // 形状新增了 who（责任方，见第 8 节）→ 改为逐字段断言，不用 deepEqual
+  const reading = explainDbError('no such table: student')!;
+  assert.equal(reading.kind, '对象不存在');
+  assert.equal(reading.zh, '表不存在 —— 表名拼错，或还没建表，或建在了别的库/别的连接里');
+  assert.equal(reading.who, 'student');
   assert.match(explainDbError('UNIQUE constraint failed: students.id')!.zh, /唯一约束冲突/);
   assert.match(explainDbError('near "FROM": syntax error')!.zh, /语法错误/);
   assert.match(explainDbError('datatype mismatch')!.zh, /类型不匹配/);
@@ -890,4 +892,96 @@ test('★ 超时场景会带上 L2 摘要（报错疑似超时/锁 → §8.4 第
   );
   assert.ok(ctx.sections.some((s) => s.id === 'l2_summary'), '超时错误应带 L2');
   assert.match(ctx.sections[0]!.text, /不是语法错/);
+});
+
+// ===========================================================================
+// 8. ★ 错误码分类表（backend-core `sandbox/README §10.3`）：**"是谁的错"**
+// ===========================================================================
+
+test('★ 分类表全量：每个 code 都认得，且责任方正确（谁的问题决定话术）', () => {
+  const table: [string, string, string][] = [
+    ['E_SQL_SYNTAX', '语法错', 'student'],
+    ['E_SQL_NO_OBJECT', '对象不存在', 'student'],
+    ['E_SQL_EXEC', '运行时错', 'student'],
+    ['E_SQL_TIMEOUT', '执行超时', 'student_logic'],
+    ['E_SANDBOX_SIZE', '超出库大小上限', 'student'],
+    ['E_SQL_FORBIDDEN', '被安全闸拒绝', 'rules'],
+    ['E_SQL_PRAGMA', 'PRAGMA 不在白名单', 'rules'],
+    ['E_SQL_MULTI', '多语句', 'rules'],
+    ['E_SQL_KIND', '语句类型不允许', 'rules'],
+    ['E_SQL_TOO_LONG', 'SQL 太长', 'student'],
+    ['E_SQL_EMPTY', '空语句', 'student'],
+    ['E_SANDBOX_RUNNER', '沙箱系统故障', 'system'],
+    ['E_ENGINE_UNAVAILABLE', '引擎不可用', 'config'],
+    ['E_ENGINE_UNKNOWN', '引擎未配置', 'config'],
+    ['E_SANDBOX_PATH', '沙箱路径不合法', 'caller'],
+    ['E_LOG_ISOLATION', '日志隔离拦截', 'caller'],
+  ];
+  for (const [code, kind, who] of table) {
+    const reading = explainDbError(code);
+    assert.ok(reading, `${code} 必须认得（否则模型只能猜）`);
+    assert.equal(reading!.kind, kind, `${code} 的归类`);
+    assert.equal(reading!.who, who, `${code} 的责任方`);
+    assert.equal(reading!.code, code);
+  }
+  // 真实报错码混在文本里也能认出来（backend-core 的 message 就是这种形态）
+  const mixed = explainDbError('E_SQL_TIMEOUT：执行超过 1000ms 被中断（SQLite progress_handler；父进程 0.75s 后硬杀）');
+  assert.equal(mixed!.code, 'E_SQL_TIMEOUT');
+});
+
+test('★★ 系统故障（E_SANDBOX_RUNNER）必须说"不是你的 SQL 的问题"', () => {
+  const reading = explainDbError('E_SANDBOX_RUNNER')!;
+  assert.equal(reading.who, 'system');
+  assert.match(reading.zh, /不是你的 SQL 的问题|不是你的问题/);
+  assert.match(reading.zh, /重试|反馈/);
+  assert.match(describeBlame('system'), /不是学生的问题/);
+  // 绝不能让学生去改 SQL —— 提示词模板也一样
+  assert.ok(!/请检查你的/.test(reading.zh));
+});
+
+test('★ 沙箱规则类的 code：话术要说"不是他写错了 SQL"', () => {
+  for (const code of ['E_SQL_FORBIDDEN', 'E_SQL_PRAGMA', 'E_SQL_MULTI', 'E_SQL_KIND']) {
+    const reading = explainDbError(code)!;
+    assert.equal(reading.who, 'rules', code);
+    assert.match(reading.zh, /不是|规则/, `${code} 要说清是规则限制`);
+  }
+  assert.match(describeBlame('rules'), /不是学生写错 SQL|规则不允许/);
+  // 多语句那条顺带把"教学习惯"讲出来（学生学到东西）
+  assert.match(explainDbError('E_SQL_MULTI')!.zh, /单条|一次只测一条/);
+});
+
+test('★ 库大小超限要说清"本次写入已回滚"（否则学生会以为数据进去了）', () => {
+  const reading = explainDbError('E_SANDBOX_SIZE')!;
+  assert.equal(reading.who, 'student');
+  assert.match(reading.zh, /回滚/);
+  assert.match(reading.zh, /数据没变/);
+});
+
+test('★ 责任方全部有中文话术（没有 undefined 漏网）', () => {
+  for (const who of ['student', 'student_logic', 'rules', 'system', 'config', 'caller'] as const) {
+    const text = describeBlame(who);
+    assert.ok(typeof text === 'string' && text.length > 4, `${who} 要说人话`);
+  }
+});
+
+test('★ 提示词里带"责任方"与错误码；系统故障场景不许出现"检查你的 SQL"', async () => {
+  const session = new FakeAskSession();
+  session.answer = '**问题归类**：沙箱系统故障';
+  const handler = createAskHandler(baseDeps({ manager: fakeManager(session), logSource: makeLogSource({ entries: [] }) }));
+  const { sink } = collectFrames();
+  await handler.handle({ sessionId: 's1', userId: 'u1', error: 'E_SANDBOX_RUNNER' }, sink);
+  const message = session.promptCalls[0] ?? '';
+  assert.match(message, /责任方=/, '必须给模型"是谁的错"');
+  assert.match(message, /不是学生的问题/, '系统故障要说清不是学生的错');
+  assert.match(message, /引擎错误码：E_SANDBOX_RUNNER/);
+  // 系统提示词里也有对应规则
+  assert.match(ASK_SYSTEM_PROMPT, /先看"责任方"/);
+  assert.match(ASK_SYSTEM_PROMPT, /这不是你的 SQL 的问题/);
+});
+
+test('★ 引擎原文（无 code）也能定责：约束冲突/列名歧义等默认归学生', () => {
+  assert.equal(explainDbError('no such table: students')!.who, 'student');
+  assert.equal(explainDbError('UNIQUE constraint failed: students.sid')!.who, 'student');
+  assert.equal(explainDbError('ambiguous column name: sid')!.who, 'student');
+  assert.equal(explainDbError('database is locked')!.who, 'student');
 });

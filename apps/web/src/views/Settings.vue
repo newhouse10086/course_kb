@@ -15,9 +15,9 @@
 import { computed, nextTick, onMounted, ref } from 'vue'
 import { api, ApiError } from '../api/client'
 import { queryFlag, testBarrier, testBarrierDone, writeReport } from '../utils/report'
-import type { ModelInfo, SettingsPayload } from '../api/types'
+import type { BusyInfo, MeResponse, ModelInfo, SettingsPayload } from '../api/types'
 
-const me = ref<{ user?: { username: string; display_name?: string }; roles?: string[]; permissions?: string[] } | null>(null)
+const me = ref<MeResponse | null>(null)
 const meError = ref('')
 const models = ref<ModelInfo[]>([])
 const activeModel = ref('')
@@ -26,7 +26,7 @@ const switchedAt = ref<number | null>(null)
 const concurrency = ref(1)
 const concurrencyNote = ref('固定=1（系统约束）')
 const settings = ref<SettingsPayload | null>(null)
-const running = ref<{ taskId: string; kind: string; done: number; total: number } | null>(null)
+const running = ref<{ taskId: string; kind: string; done: number; total: number; stage?: string; progress?: number } | null>(null)
 const picked = ref('')
 const busy = ref(false)
 const note = ref('')
@@ -37,12 +37,13 @@ const switchResult = ref<any>(null)
 const ignored = ref<Array<{ field: string; requested: unknown; applied: unknown; reason: string }>>([])
 const errs = ref<string[]>([])
 
+/** 角色：真后端 `{user:{roles}}`；mock 顶层 `{roles}` → 两处都读 */
 const isStaff = computed(() => {
-  const roles = me.value?.roles || []
-  const perms = me.value?.permissions || []
-  return roles.includes('teacher') || roles.includes('admin') || perms.includes('settings:write') || perms.includes('settings:read')
+  const rs = roles.value.length ? roles.value : (me.value?.user?.roles || [])
+  const perms = realPerms.value.length ? realPerms.value : (me.value?.permissions || [])
+  return rs.includes('teacher') || rs.includes('admin') || perms.includes('settings:write') || perms.includes('settings:read')
 })
-const roleLabel = computed(() => (me.value?.roles || []).join(', ') || '未上报')
+const roleLabel = computed(() => (roles.value.length ? roles.value : (me.value?.user?.roles || [])).join(', ') || '未上报')
 const activeInfo = computed(() => models.value.find((m) => m.id === activeModel.value) || null)
 const progressPct = computed(() => {
   if (!running.value || !running.value.total) return 0
@@ -53,43 +54,102 @@ const switchLabel = computed(() => (running.value ? '终止并切换' : '切换�
 const defaultMode = computed<'now' | 'drain' | 'abort'>(() => (running.value ? 'abort' : 'now'))
 const timeText = (ts: number | null) => (ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '—')
 
-async function loadModels() {
-  const r = await api.models()
-  models.value = r.models || []
-  activeModel.value = r.activeModel
-  switchedFrom.value = r.switchedFrom ?? null
-  switchedAt.value = r.switchedAt ?? null
-  concurrency.value = Number(r.concurrency ?? 1)
-  if (!picked.value) picked.value = activeModel.value
-}
+/**
+ * 后端是否实现了这两个接口？
+ * 实测（2026-10-15，apps/server v1.0.0）：`/api/v1/models` 与 `/api/v1/settings` 都还是 **404 E_NOTFOUND**。
+ * 这种情况下**不能装作能切**：如实显示"未实现 + 需求出处"，并把控件收起来。
+ */
+const missing = ref<Array<{ path: string; code: string; msg: string }>>([])
+/** 真后端 `/models.busy`（队列忙状态；权威来源） */
+const busyInfo = ref<BusyInfo | null>(null)
+const roles = ref<string[]>([])
+const realPerms = ref<string[]>([])
 
-async function loadSettings() {
-  const s = await api.settings()
-  settings.value = s
-  concurrencyNote.value = s.llm?.concurrencyNote || '固定=1（系统约束）'
-  if (s.llm?.concurrency && Number(s.llm.concurrency) !== 1) {
-    errs.value.push(`后端上报 concurrency=${s.llm.concurrency}（应为 1）—— 系统约束被违反，请报给 Lead`)
+const LLM_TASK_KINDS = new Set(['parse', 'extract', 'rollup', 'translate', 'ask', 'index'])
+
+async function loadModels() {
+  try {
+    const r = await api.models()
+    models.value = r.models || []
+    // 真后端有 activeModel；万一没有就用模型上的 `active` 标记（两种都吃）
+    activeModel.value = r.activeModel || (models.value.find((m) => (m as any).active)?.id ?? '')
+    busyInfo.value = (r as any).busy || null
+    concurrency.value = Number(r.concurrency ?? 1)
+    if (!picked.value) picked.value = activeModel.value
+  } catch (e) {
+    const err = e as ApiError
+    missing.value = [...missing.value, { path: 'GET /api/v1/models', code: err.code, msg: err.message }]
   }
 }
 
-/** 运行中的 LLM 任务（决定"能否直接热切"） */
-async function loadRunning() {
+async function loadSettings() {
   try {
-    const t = await api.task('tsk_rollup0001')
-    if (t && (t.status === 'running' || t.status === 'queued')) {
-      const d = (t.detail || {}) as any
-      // ⚠️ 先定 total 再算 done：写成 `progress * d.total` 时 d.total 缺失 → done 恒为 0
-      //    （实测踩到：页面显示 0/368，进度条永远 0%）
-      const total = Number(d.total ?? 0) || 368
-      const done = d.done != null ? Number(d.done) : Math.round(Number(t.progress ?? 0) * total)
-      running.value = { taskId: t.id, kind: String(d.kind || 'rollup'), done, total }
+    const s = await api.settings()
+    settings.value = s
+    concurrencyNote.value = s.llm?.concurrencyNote || '固定=1（系统约束）'
+    if (s.llm?.concurrency && Number(s.llm.concurrency) !== 1) {
+      errs.value.push(`后端上报 concurrency=${s.llm.concurrency}（应为 1）—— 系统约束被违反，请报给 Lead`)
+    }
+  } catch (e) {
+    const err = e as ApiError
+    missing.value = [...missing.value, { path: 'GET /api/v1/settings', code: err.code, msg: err.message }]
+  }
+}
+
+/** 切换相关的只读视图（真后端 `/settings/llm` 才有 switchedFrom/switchedAt） */
+async function loadSwitchInfo() {
+  try {
+    const r = await api.settingsLlm()
+    if (r.activeModel) activeModel.value = r.activeModel
+    switchedFrom.value = r.switchedFrom ?? null
+    switchedAt.value = r.switchedAt ?? null
+    if (r.busy) busyInfo.value = r.busy
+    if (r.concurrency != null) concurrency.value = Number(r.concurrency)
+  } catch { /* 老后端没有这个接口 → 用 /models 的字段（没有就不显示） */ }
+}
+
+/**
+ * 运行中的 LLM 任务（决定"能否直接热切"）
+ * ⚠️ 真后端有 `GET /api/v1/tasks` 列表（实测），**不是**只有单个任务查询；
+ *    第一版我写死了 mock 的任务 id `tsk_rollup0001` —— 对真后端必然 404（自己给自己造了个假前提）。
+ */
+async function loadRunning() {
+  // ★ 真后端直接给了队列忙状态（`/models.busy` + `/settings/llm.busy`）——比前端猜准
+  const b = busyInfo.value
+  if (b && typeof b.busy === 'boolean') {
+    running.value = b.busy
+      ? {
+          taskId: (b.runningLlm || []).join(',') || 'queue',
+          kind: (b.runningLlm || [])[0] || 'llm',
+          done: 0, total: 0,
+          stage: `队列忙：running ${b.runningAll ?? 0} / pending ${b.pending ?? 0}`,
+          progress: 0,
+        }
+      : null
+    return
+  }
+  try {
+    const r = await api.tasks()
+    const list = (r.tasks || r.items || []) as Array<Record<string, any>>
+    const busy = list.find((t) => (t.status === 'running' || t.status === 'queued') && LLM_TASK_KINDS.has(String(t.kind)))
+    if (busy) {
+      const d = (busy.detail || {}) as any
+      const total = Number(d.total ?? 0) || 0
+      // 真后端的 progress 是 0–1 的比例 + stage 文案；mock 给 done/total
+      const done = d.done != null ? Number(d.done) : (total ? Math.round(Number(busy.progress ?? 0) * total) : 0)
+      running.value = {
+        taskId: String(busy.id), kind: String(busy.kind),
+        done, total: total || Math.round(Number(busy.progress ?? 0) * 100),
+        stage: String(busy.stage || ''), progress: Number(busy.progress ?? 0),
+      }
     } else {
       running.value = null
     }
-  } catch {
-    // 任务接口拿不到 → 不编造"空闲"（宁可显示"未知"也不假装空闲可热切）
+  } catch (e) {
+    const err = e as ApiError
+    // 拿不到任务列表 → 不编造"空闲"（宁可显示"未知"也不假装可以热切）
     running.value = null
-    errs.value.push('未能读取运行中任务（/tasks）→ 无法确认是否空闲，切换前请人工确认')
+    errs.value.push(`未能读取任务列表（${err.code}）：无法确认是否空闲，切换前请人工确认`)
   }
 }
 
@@ -98,7 +158,7 @@ function askSwitch() {
   confirmMode.value = defaultMode.value
   confirmOpen.value = true
   note.value = running.value
-    ? `⚠️ 有批量推理在跑（${running.value.kind} ${running.value.done}/${running.value.total}）。直接热切会被拒绝，请选择处理方式。`
+    ? `⚠️ 有批量推理在跑（${running.value.stage || running.value.kind}）。直接热切会被拒绝，请选择处理方式。`
     : `空闲：切换 ${activeModel.value} → ${picked.value}，将立即生效。`
   noteKind.value = 'warn'
 }
@@ -110,6 +170,13 @@ async function doSwitch() {
   try {
     const r = await api.switchModel(picked.value, confirmMode.value)
     switchResult.value = r
+    // ★ drain 超时：HTTP 200 但 **state='timeout' 表示没切**（后端注释明确写了）→ 不能当成功
+    if ((r as any).state === 'timeout') {
+      note.value = `等待超时：**没有切换**（state=timeout，仍在 ${activeModel.value}）。可改用 mode=abort 存断点后终止并续推。`
+      noteKind.value = 'warn'
+      await loadSwitchInfo()
+      return
+    }
     note.value = `已切换：${r.from} → ${r.to}`
       + (r.checkpoint ? `；断点 ${r.checkpoint.done}/${r.checkpoint.total}` : '')
       + (r.resume?.state === 'resuming' ? `；正在从第 ${r.resume.from_checkpoint} 个单元续推` : '')
@@ -165,20 +232,25 @@ onMounted(async () => {
   try {
     me.value = await api.me()
   } catch (e) {
-    meError.value = (e as Error).message
+    const err = e as ApiError
+    meError.value = `${err.code}: ${err.message}`
   }
+  // 真后端把 roles 放在 user 里（实测）→ 两处都读；都读不到就如实显示"未上报"
+  const realRoles = (me.value as any)?.user?.roles || me.value?.roles || []
+  realPerms.value = me.value?.permissions || []
+  roles.value = realRoles
   if (isStaff.value) {
-    try {
-      await loadModels()
-      await loadSettings()
-      await loadRunning()
-    } catch (e) {
-      errs.value.push(`加载失败：${(e as Error).message}`)
+    await loadModels()
+    await loadSettings()
+    await loadSwitchInfo()
+    await loadRunning()
+    if (missing.value.length && models.value.length === 0) {
+      errs.value.push('后端未实现 /models 或 /settings → 本页按"未实现"如实显示，不伪造可切换的模型列表')
     }
   }
   await nextTick()
   writeReport('settings-report', {
-    ok: errs.value.length === 0,
+    ok: errs.value.length === 0 && missing.value.length === 0,
     role: roleLabel.value,
     is_staff: isStaff.value,
     me_error: meError.value,
@@ -189,7 +261,10 @@ onMounted(async () => {
     concurrency: concurrency.value,
     concurrency_locked: !!settings.value?.llm?.concurrencyLocked,
     settings_source: settings.value?.source || '',
+    missing: missing.value,
+    backend_implemented: missing.value.length === 0,
     running: running.value,
+    busy: busyInfo.value,
     errors: errs.value,
   })
 
@@ -304,7 +379,21 @@ const staffChecklist = [
     </div>
 
     <template v-else>
-      <div class="note info" data-testid="settings-source">
+      <!-- ★ 后端还没实现这两个接口时：如实说清楚，**不摆出可以切换的假界面** -->
+      <div v-if="missing.length" class="note bad" data-testid="backend-missing">
+        <b>后端尚未实现本页所需的接口</b>（本页按"未实现"如实显示，不伪造模型列表）：
+        <ul style="margin: 4px 0 0; padding-left: 18px">
+          <li v-for="(m, i) in missing" :key="i">
+            <code>{{ m.path }}</code> → <code>{{ m.code }}</code>：{{ m.msg }}
+          </li>
+        </ul>
+        <div class="small" style="margin-top: 6px">
+          需求出处：<code>docs/SETTINGS_AND_SANDBOX.md §1/§2</code>（`settings.json` 热重载 + `GET/PUT /api/v1/settings` +
+          `POST /api/v1/settings/llm/switch`）。接口就绪后本页无需改动即可用（前端已按文档形状实现）。
+        </div>
+      </div>
+
+      <div v-if="!missing.length" class="note info" data-testid="settings-source">
         配置来源：<b>{{ settings?.source === 'file' ? 'settings.json' : settings?.source }}</b>
         <span v-if="settings?.source === 'default'">（文件缺失，正在用内置默认 —— 这不是正常状态）</span>
         · 模型端点：<code>AMR / llm-api.x-aio.com</code>（实测只有 8 个 LLM，无 ASR/TTS/OCR）
@@ -331,7 +420,7 @@ const staffChecklist = [
         <div v-else class="small muted" data-testid="idle-state">空闲：切换立即生效。</div>
       </section>
 
-      <section class="panel">
+      <section v-if="!missing.length" class="panel">
         <h2 style="margin-top: 0">切换模型</h2>
         <div class="row">
           <label class="small">目标模型
@@ -368,7 +457,7 @@ const staffChecklist = [
         </div>
       </section>
 
-      <section class="panel">
+      <section v-if="!missing.length" class="panel">
         <h2 style="margin-top: 0">系统约束</h2>
         <div class="row">
           <label class="small">LLM 并发
@@ -390,7 +479,7 @@ const staffChecklist = [
         </ul>
       </section>
 
-      <section class="panel">
+      <section v-if="!missing.length" class="panel">
         <h2 style="margin-top: 0">热切换状态机</h2>
         <table class="table">
           <thead><tr><th>环节</th><th>行为</th></tr></thead>
@@ -453,4 +542,9 @@ const staffChecklist = [
 .modal-box { background: var(--panel); border: var(--hair) solid var(--rule-strong); border-top: 2px solid var(--accent); padding: 16px 18px; max-width: 560px; box-shadow: var(--shadow-2); }
 .modes { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; font-size: 13px; }
 </style>
+
+
+
+
+
 

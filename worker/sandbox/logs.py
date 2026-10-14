@@ -81,10 +81,16 @@ class SqliteLogSource:
              "L1 = 引擎原文报错 + 本系统 audit_log（§8.3）",
     ))
 
-    def fetch(self, req: dict[str, Any]) -> list[dict[str, Any]]:
+    def fetch(self, req: dict[str, Any], *, include_audit: bool = False) -> list[dict[str, Any]]:
         """``req = {session_id, user_id, since?, limit?, layers?}``。
 
         隔离：``user_id`` 必须与记录所属会话一致（跨会话读 → 抛异常）。
+
+        ``include_audit=False``（默认）会**过滤掉"谁读了日志"这条审计记录** ——
+        否则一次**空会话**的 ``sandbox.logs`` 会返回 1 条"（agent 读取了本会话日志）"，
+        调用方与模型就会以为**有执行历史**（把"没有记录"说成"有记录"）。
+        这与 pi-bridge 真机抓到的"empty 被说成 unavailable"是同一类事实错误：
+        **状态说不准，模型就会编**。审计照写，只是不作为日志内容返回。
         """
         roots = self.root or SandboxRoots.resolve()
         session_id = str(req.get("session_id") or req.get("sessionId") or "")
@@ -105,11 +111,13 @@ class SqliteLogSource:
         entries: list[dict[str, Any]] = []
         for row in records:
             if row.get("action") == "log_read":
-                entries.append({
-                    "at": row.get("at"), "level": "info", "source": "L1",
-                    "sessionId": session_id, "message": "（agent 读取了本会话日志）",
-                    "context": {"action": "log_read"},
-                })
+                if include_audit:
+                    entries.append({
+                        "at": row.get("at"), "level": "info", "source": "L1",
+                        "sessionId": session_id, "kind": "log_read",
+                        "message": "（agent 读取了本会话日志）",
+                        "context": {"action": "log_read"},
+                    })
                 continue
             err = row.get("error")
             code = row.get("code")
@@ -225,6 +233,26 @@ class _UnavailableLogSource:
         return []
 
 
+def status_fact(entries: list[dict[str, Any]], *, engine_id: str = "sqlite",
+                reason: str = "") -> tuple[str, str]:
+    """把"日志状态"变成**中文事实句** —— 直接给调用方/模型用。
+
+    为什么不能只给一个英文状态词（``ok``/``empty``/``unavailable``）：
+    pi-bridge 真机实测到模型把 ``empty``（**可读但没记录**）说成
+    "我暂时读不到该实例的引擎日志" —— **事实说错**，学生会以为系统坏了。
+    给中文事实句 + 明确的"≠ 读不到"，模型才不容易编。
+
+    :return: ``(status, fact)``，``status ∈ {"ok","empty","unavailable"}``
+    """
+    if engine_id != "sqlite":
+        return "unavailable", (f"读不到该引擎的日志（原因：{reason or '该引擎的日志源 adapter 尚未接入'}）"
+                              "——请如实说明，不要假装看过")
+    if not entries:
+        return "empty", ("**日志可读**，但本会话目前还没有执行记录"
+                         "（≠ 读不到日志；**不要说**「读不到日志」）")
+    return "ok", f"**读到了**本会话的 {len(entries)} 条 L1 记录"
+
+
 def summarize_for_prompt(entries: list[dict[str, Any]], *, max_entries: int = 5,
                          max_chars: int = 1200) -> str:
     """把日志压成"喂提示词用的摘要"（§8.5.4：只放摘要 + 关键行）。
@@ -232,7 +260,7 @@ def summarize_for_prompt(entries: list[dict[str, Any]], *, max_entries: int = 5,
     读不到时**如实**写在摘要里（供 agent 说明"我读不到引擎日志"）。
     """
     if not entries:
-        return "（本会话暂无 L1 日志：学生还没执行过语句，或日志已被重置）"
+        return "（日志可读，但本会话暂无 L1 记录：学生还没执行过语句，或日志已被重置；这不等于读不到日志）"
     lines: list[str] = []
     for e in entries[-max_entries:]:
         at = e.get("at")

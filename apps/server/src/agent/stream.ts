@@ -36,6 +36,7 @@ import {
   extractCitations,
   formatRetrievalContext,
   normalizeRetrievalMode,
+  safeJsonStringify,
   validateAnswerCitations,
   type CitationMode,
   type RetrievalMode,
@@ -501,10 +502,17 @@ export function makeReadyFrame(opts: {
 // SSE 格式化（契约 §6：单行 JSON + keepalive）
 // ---------------------------------------------------------------------------
 
-/** 把帧变成一条 SSE 事件（`data:` 必须是**单行** JSON）。 */
+/**
+ * 把帧变成一条 SSE 事件（`data:` 必须是**单行** JSON）。
+ *
+ * ⚠️ 必须用 `safeJsonStringify`：`JSON.stringify` **不转义** U+2028/U+2029
+ * （它们在 JSON 里合法、**不报错**），而按行切帧的读取器会把它当行分隔符 →
+ * 一帧裂成两帧、第二段解析失败 → **静默丢事件**（看起来流还正常结束了）。
+ * 这是 AGENTS.md ⚠️坑 17；原实现直接 `JSON.stringify(frame)`，被独立验收抓出。
+ */
 export function formatSse(frame: AgentFrame, eventName?: string): string {
   const name = eventName ?? frame.type;
-  return `event: ${name}\ndata: ${JSON.stringify(frame)}\n\n`;
+  return `event: ${name}\ndata: ${safeJsonStringify(frame)}\n\n`;
 }
 
 /** 契约 §6：每 15 秒一次的 keepalive 注释帧。 */

@@ -48,6 +48,11 @@ export const ERROR_HTTP = {
    * **RBAC 章节引入的新码**（契约错误表尚未收录，已在交付说明里如实上报）。
    */
   E_BADREQUEST: 400,
+  // ── 模型热切换（docs/SETTINGS_AND_SANDBOX.md §2）──
+  /** `mode:"now"` 但**有 LLM 任务在跑** → 拒绝直接热切（提示走 drain/abort）。 */
+  E_MODEL_BUSY: 409,
+  /** 切换后**真探测新模型失败** → 已回滚到旧模型（502：上游不可用，可重试/换模型）。 */
+  E_MODEL_PROBE: 502,
   // ── 内部 ──
   E_INTERNAL: 500,
 } as const;

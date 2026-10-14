@@ -543,6 +543,34 @@ def build_graph(doc_id: str, pu: "units_mod.PickedUnit", data: dict[str, Any]) -
     return out
 
 
+def note_no_cards(outcome: "ExtractOutcome", pu: "units_mod.PickedUnit",
+                  raw_cards: Any, section: dict[str, Any]) -> None:
+    """记录"LLM 输出合法但零卡片" —— **必须可区分，不能静默**。
+
+    三种情况在返回值上要分得开（polysemy-prober 的独立验收发现）：
+    ① 内容确实不足 → 行为正确，但调用方应提示"本节内容不足以建档"；
+    ② 模型输出不合规/被截断 → 走 ``errors``（E_LLM_SCHEMA）；
+    ③ 管线丢卡（历史真 bug ``E_PICK_KEY``）→ 走 ``errors``。
+    本函数负责把 ① 从 ②③ 里**摘出来**，并保留模型自己给的说明
+    （``section_summary`` 往往正好解释了"为什么抽不出知识点"，直接给前端用）。
+    """
+    reason = str(section.get("section_summary") or "").strip()
+    missing = raw_cards is None
+    outcome.stats["units_no_cards"] = int(outcome.stats.get("units_no_cards") or 0) + 1
+    outcome.warnings.append({
+        "code": "W_NO_CARDS",
+        "unit_id": pu.unit_id,
+        "title": pu.title,
+        "span": pu.span.to_dict(),
+        "cards_key": "missing" if missing else "empty",
+        "model_note": reason[:300],
+        "msg": ("模型返回的 section 合法，但**没有产出任何卡片**"
+                + ("（`cards` 键缺失 → 模型主动省略，通常是内容不足）" if missing
+                   else "（`cards` 是空数组）")
+                + (f"；模型说明：{reason[:120]}" if reason else "")),
+    })
+
+
 def dedupe_entities(entities: Iterable[Entity]) -> list[Entity]:
     """按 id 去重（同一实体在多个单元里被抽到 → 结果里只留一条）。
 
@@ -594,6 +622,34 @@ class ExtractOutcome:
     sections: dict[str, dict[str, Any]] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
     errors: list[dict[str, Any]] = field(default_factory=list)
+    #: 非致命但**必须让调用方看见**的情况（如"模型输出合法但零卡片"）
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+
+    def outcome_status(self) -> str:
+        """把"看起来都成功"拆成 4 种可区分状态（**不改 ``ok`` 语义**）。
+
+        * ``failed``      —— 全单元失败（``ok`` 同样是 false）
+        * ``partial``     —— 有失败也有成功
+        * ``done_empty``  —— 全部成功但**一张卡都没有**（内容不足 / 模型只给了 section）
+        * ``done``        —— 有卡片产出
+
+        ``done_empty`` **不是错误**：模型拒绝抽取可以是对的（原文只有一句定义式陈述，
+        提示词本就要求"只抽有实质内容的知识点"）。但它必须与"抽取失败""管线丢卡"
+        在返回值上**区分开** —— 否则前端只能把空知识库当正常完成展示，
+        用户分不清"内容太少"和"系统坏了"（polysemy-prober 独立验收抓到的静默路径）。
+        """
+        done = int(self.stats.get("units_done") or 0)
+        failed = int(self.stats.get("units_failed") or 0)
+        if failed and not done:
+            return "failed"
+        # 有错误且没有任何产出 → failed（如 convert 里 payload 的 key 全对不上）
+        if self.errors and not self.cards:
+            return "failed"
+        if failed or self.errors:
+            return "partial"
+        if not self.cards:
+            return "done_empty"
+        return "done"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -601,6 +657,9 @@ class ExtractOutcome:
             # ★ 显式成功标记：调用方"只看 cards"会把"全部丢弃"误判成"这篇没有知识点"
             "ok": not self.errors,
             "error_count": len(self.errors),
+            # ★★ 细分状态 + 警告：让"输出合法但零产出"与"抽取失败"可区分
+            "status": self.outcome_status(),
+            "warnings": list(self.warnings),
             "cards": [c.to_dict() for c in self.cards],
             "entities": [e.to_dict() for e in self.entities],
             "edges": [e.to_dict() for e in self.edges],
@@ -761,7 +820,10 @@ def extract_units(
 
         outcome.stats["llm_calls"] += 1
         data = result.data or {}
-        cards = build_cards(doc_id, pu, data.get("cards") or [])
+        raw_cards = data.get("cards")
+        cards = build_cards(doc_id, pu, raw_cards or [])
+        if not cards:
+            note_no_cards(outcome, pu, raw_cards, data.get("section") or {})
         graph = build_graph(doc_id, pu, data)
         outcome.cards.extend(cards)
         outcome.entities.extend(graph.entities)
@@ -950,6 +1012,8 @@ def convert_payloads(
         if pu is None:
             pu = by_span.get(span_k)
         if pu is None:
+            # key 对不上也算"这一个单元失败了"（stats 要说实话，状态才好判）
+            outcome.stats["units_failed"] = int(outcome.stats.get("units_failed") or 0) + 1
             outcome.errors.append(
                 {
                     "code": "E_PICK_KEY",
@@ -958,7 +1022,10 @@ def convert_payloads(
             )
             continue
         data = item.get("data") if isinstance(item.get("data"), dict) else item
-        cards = build_cards(doc_id, pu, (data or {}).get("cards") or [])
+        raw_cards = (data or {}).get("cards")
+        cards = build_cards(doc_id, pu, raw_cards or [])
+        if not cards:
+            note_no_cards(outcome, pu, raw_cards, (data or {}).get("section") or {})
         graph = build_graph(doc_id, pu, data or {})
         outcome.cards.extend(cards)
         outcome.entities.extend(graph.entities)

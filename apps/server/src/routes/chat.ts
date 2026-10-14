@@ -35,6 +35,8 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
     //    这里两种形状都收，避免将来升级/降级再踩。
     const socket = ((conn as { socket?: WsLike }).socket ?? conn) as WsLike;
     const { sessionId } = req.params as { sessionId: string };
+    // RBAC：WS 握手同样过 401 闸门 → 这里 req.user 必然存在（未登录根本连不上）
+    const user = req.user;
 
     let chat: ChatConnectionLike | null = null;
     let closed = false;
@@ -57,6 +59,32 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
             socket.close(code, reason);
           } catch {
             /* 已断开 */
+          }
+        },
+        // ★ 检索：钩子（可为 null，未接入时 agent 按 none 走）+ **服务端身份**
+        //   客户端只能传模式名（`retrieval`），不许传 context 文本 —— pi-bridge 已在帧层拒绝
+        retrieval: deps.retrieval ?? null,
+        user: user ? { id: user.id, roles: user.roles } : null,
+        // 每轮回答的审计（教学场景留痕）：三档引用校验 + 检索状态
+        onAnswerAudit: (a) => {
+          try {
+            deps.repo.rbac.audit({
+              userId: user?.id ?? null,
+              action: 'chat',
+              target: sessionId,
+              detail: {
+                round: a.round,
+                citation_mode: a.mode,
+                citations: a.citations.slice(0, 20),
+                unknown_citations: a.unknown.slice(0, 20),
+                context_provided: a.contextProvided,
+                retrieval_mode: a.retrievalMode,
+                retrieval_status: a.retrievalStatus,
+                retrieval_reason: a.retrievalReason,
+              },
+            });
+          } catch {
+            /* 审计失败不许影响对话 */
           }
         },
       });

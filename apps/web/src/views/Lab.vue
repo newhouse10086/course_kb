@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * SQL 练习台（学生端）—— docs/LAB_DB_DEPLOY.md §6/§7 + docs/SETTINGS_AND_SANDBOX.md §3
  *
@@ -27,20 +27,42 @@ const engines = computed(() => caps.value?.raw ? ((caps.value.raw as any).sandbo
 const engine = ref('')
 const engineInfo = computed(() => engines.value.find((e: any) => e.id === engine.value) || null)
 const engineAvailable = computed(() => !!engineInfo.value?.available)
+/** 后端有没有上报 sandbox 段？（实测真后端 v1.0.0 的 /capabilities **没有** sandbox 键） */
+const sandboxReported = computed(() => !!(caps.value?.raw as any)?.sandbox)
+const missing = ref<Array<{ path: string; code: string; msg: string }>>([])
 const limits = computed(() => ((caps.value?.raw as any)?.sandbox?.limits || { maxRows: 200, timeoutMs: 3000, maxDbBytes: 20971520 }))
+/** 真后端 `/capabilities.sandbox.defaultEngine`（实测 'sqlite'） */
+const defaultEngine = computed(() => String((caps.value?.raw as any)?.sandbox?.defaultEngine || ''))
 
 const datasets = ref<SandboxDataset[]>([])
-const dataset = ref('student-course')
+/** 真后端默认数据集是 `sc`（我 mock 用的 'student-course' 是我自己编的 id） */
+const dataset = ref('sc')
 const session = ref<SandboxSession | null>(null)
 const tables = ref<SandboxTable[]>([])
 const sql = ref('SELECT * FROM student')
 const history = ref<Array<{ sql: string; ok: boolean; at: number }>>([])
 const result = ref<SandboxResult | null>(null)
-const runError = ref<{ code: string; msg: string } | null>(null)
+const runError = ref<{ code: string; msg: string; hint?: string; who?: string } | null>(null)
 const busy = ref(false)
 const note = ref('')
 const noteKind = ref<'info' | 'ok' | 'bad' | 'warn'>('info')
 const dialectNoteOpen = ref(true)
+
+/** 方言：真后端在 `session.schema.dialect`（'sqlite'），capabilities 里在 `engines[].dialect` */
+const sessionDialect = computed(() => {
+  const s = session.value?.schema
+  if (s && typeof s === 'object' && (s as any).dialect) return String((s as any).dialect)
+  return ''
+})
+
+/** 前端内置的 SQLite ↔ MySQL 对照（数据集自带 dialectNotes 时优先用后端的） */
+const FALLBACK_DIALECT_NOTES = [
+  { sqlite: 'AUTOINCREMENT', mysql: 'AUTO_INCREMENT', note: '自增列的写法不同' },
+  { sqlite: 'TEXT / INTEGER', mysql: 'VARCHAR / INT', note: '类型名不同（SQLite 是动态类型）' },
+  { sqlite: 'PRAGMA table_info(t)', mysql: 'DESCRIBE t', note: '看表结构的命令不同' },
+  { sqlite: '无存储过程 / 无权限体系', mysql: 'PROCEDURE / GRANT', note: '这两类实验在 SQLite 上做不了（见 §6 对照表）' },
+  { sqlite: '窗口函数 ≥3.25', mysql: '8.0 起支持', note: '版本门槛不同' },
+]
 
 // 答疑
 const askOpen = ref(false)
@@ -60,10 +82,46 @@ const CRUD_SNIPPETS: Array<{ label: string; sql: string; kind: 'ddl' | 'dml' | '
   { label: '事务', kind: 'tx', sql: 'BEGIN' },
 ]
 
+/**
+ * 真后端 schema → 页面用的表清单
+ * 真形状：`{dialect, tables:[{name, columns:[{name,type,pk,notnull,fk,default}], rows}]}`
+ * 我 mock 的形状：`{tables:[{name, columns:['a','b'], rowCount:5}]}` → 两种都吃
+ */
+function schemaToTables(schema: unknown): SandboxTable[] {
+  const s = schema as { tables?: Array<Record<string, any>> } | undefined
+  if (!s?.tables) return []
+  return s.tables.map((t) => ({
+    name: String(t.name),
+    columns: (t.columns || []).map((c: any) => (typeof c === 'string' ? c : String(c?.name ?? ''))),
+    rowCount: Number(t.rows ?? t.rowCount ?? 0),
+  }))
+}
+
+/** 当前数据集的方言差异说明（真后端 datasets[].dialectNotes 优先，其次前端内置对照表） */
+const dialectNotes = computed(() => {
+  const d = datasets.value.find((x) => x.id === dataset.value)
+  const fromApi = (d?.dialectNotes || []).filter((n) => n && (n.sqlite || n.mysql || n.note))
+  return fromApi.length ? fromApi : FALLBACK_DIALECT_NOTES
+})
+
 async function loadDatasets() {
-  const r = await api.sandboxDatasets()
-  datasets.value = r.datasets || []
-  if (!datasets.value.some((d) => d.id === dataset.value) && datasets.value[0]) dataset.value = datasets.value[0].id
+  try {
+    const r = await api.sandboxDatasets()
+    datasets.value = r.datasets || []
+    // 优先用服务端的 default（实测 'sc'），其次第一个
+    const preferred = r.default || datasets.value[0]?.id
+    if (!datasets.value.some((d) => d.id === dataset.value) && preferred) dataset.value = preferred
+  } catch (e) {
+    // ⚠️ 真后端还没实现 /sandbox/* → 这里**必须**捕获：
+    //    第一版直接 await（不 catch）→ 异常冒泡出 onMounted → 连报告都写不出来（实测踩到）
+    const err = e as { code?: string; status?: number; message: string }
+    if ((err.code === 'E_NOTFOUND' || err.status === 404) && !missing.value.some((m) => m.path === 'GET /api/v1/sandbox/datasets')) {
+      missing.value = [...missing.value, { path: 'GET /api/v1/sandbox/datasets', code: err.code || 'E_NOTFOUND', msg: err.message }]
+    }
+    datasets.value = []
+    note.value = `数据集列表拿不到：${err.message}`
+    noteKind.value = 'bad'
+  }
 }
 
 async function openSession() {
@@ -71,15 +129,27 @@ async function openSession() {
   try {
     const s = await api.sandboxSession(dataset.value)
     session.value = s
-    tables.value = s.tables || []
+    // ⚠️ 真后端**没有** `s.tables`：表清单在 `s.schema.tables`（且列是对象数组 `{name,type,pk,...}`，行数是 `rows`）
+    tables.value = schemaToTables(s.schema)
     result.value = null
     runError.value = null
     history.value = []
-    note.value = `沙箱已就绪：${s.sessionId}（数据集 ${s.datasetLabel || s.dataset}）`
+    note.value = `沙箱已就绪：${s.sessionId}（数据集 ${s.dataset} · 引擎 ${s.engine}${s.created ? ' · 新建' : ' · 复用'}）`
+    // 服务端有权威的审计历史（教学追溯）→ 拉回来展示，别只显示本地那几条
+    try {
+      const h = await api.sandboxHistory(s.sessionId)
+      history.value = (h.entries || []).slice(-30).reverse().map((e) => ({ sql: e.sql, ok: e.ok, at: e.at }))
+    } catch { /* 老后端没有 history 接口 → 本地记录也够用 */ }
     noteKind.value = 'ok'
   } catch (e) {
     session.value = null
-    note.value = `沙箱不可用：${(e as Error).message}`
+    const err = e as { code?: string; status?: number; message: string }
+    if (err.code === 'E_NOTFOUND' || err.status === 404) {
+      if (!missing.value.some((m) => m.path === 'POST /api/v1/sandbox/session')) {
+        missing.value = [...missing.value, { path: 'POST /api/v1/sandbox/session', code: err.code || 'E_NOTFOUND', msg: err.message }]
+      }
+    }
+    note.value = `沙箱不可用：${err.message}`
     noteKind.value = 'bad'
   } finally {
     busy.value = false
@@ -101,19 +171,23 @@ async function run() {
   busy.value = true
   runError.value = null
   try {
-    const r = await api.sandboxExecute(session.value.sessionId, text)
-    result.value = r
-    tables.value = r.tables || tables.value
+    const r = await api.sandboxExecute(session.value.sessionId, text, {
+      maxRows: Number(limits.value.maxRows) || 200, timeoutMs: Number(limits.value.timeoutMs) || 3000,
+    })
+    result.value = { ...r, maxRows: Number(limits.value.maxRows) || 200 }
+    if (r.schema) tables.value = schemaToTables(r.schema)
     if (r.error) {
-      runError.value = r.error
+      // 真后端错误对象：message + hint + who_label（分类器结论）→ 三个都显示，别只显示 code
+      runError.value = { code: r.error.code, msg: r.error.message || r.error.raw || '', hint: r.error.hint || '', who: r.error.who_label || '' }
       history.value = [{ sql: text, ok: false, at: Date.now() }, ...history.value].slice(0, 30)
-      note.value = `${r.error.code}：${r.error.msg}`
+      note.value = `${r.error.code}：${r.error.message || r.error.raw || ''}`
       noteKind.value = 'bad'
+      if (r.killedBy) note.value += `（${r.killedBy}${r.hardKilled ? ' / 硬杀' : ''}）`
     } else {
       history.value = [{ sql: text, ok: true, at: Date.now() }, ...history.value].slice(0, 30)
       note.value = r.rowCount
-        ? `返回 ${r.rowCount} 行（${r.elapsedMs}ms）`
-        : `执行成功（${r.elapsedMs}ms）`
+        ? `返回 ${r.rowCount} 行（${r.elapsedMs ?? '—'}ms${r.statementKind ? ' · ' + r.statementKind : ''}）`
+        : `执行成功（${r.elapsedMs ?? '—'}ms${r.statementKind ? ' · ' + r.statementKind : ''}${r.affected != null ? ' · 影响 ' + r.affected + ' 行' : ''}）`
       noteKind.value = 'ok'
     }
   } catch (e) {
@@ -129,11 +203,11 @@ async function reset() {
   if (!confirm('重置沙箱到初始 schema？你自己建的表和数据都会消失。')) return
   busy.value = true
   try {
-    const r = await api.sandboxReset()
-    tables.value = r.tables || []
+    const r = await api.sandboxReset(dataset.value, session.value?.sessionId)
+    tables.value = schemaToTables(r.schema)
     result.value = null
     runError.value = null
-    note.value = `已重置到数据集 ${r.dataset} 的初始状态（resetPolicy=${r.resetPolicy || 'per_session'}）`
+    note.value = `已重置到数据集 ${dataset.value} 的初始状态（引擎 ${r.engine || engine.value}；服务端 resetPolicy=${(caps.value?.raw as any)?.sandbox?.resetPolicy || 'per_session'}）`
     noteKind.value = 'ok'
   } catch (e) {
     note.value = `重置失败：${(e as Error).message}`
@@ -195,7 +269,12 @@ onMounted(async () => {
     engine_available: engineAvailable.value,
     engines: engines.value.map((e: any) => ({ id: e.id, available: e.available, reason: e.reason || '' })),
     datasets: datasets.value.map((d) => d.id),
-    dialect: session.value?.dialect || engineInfo.value?.dialect || '',
+    dialect: sessionDialect.value || engineInfo.value?.dialect || '',
+    default_dataset: dataset.value,
+    schema_tables: tables.value.map((x) => `${x.name}(${x.rowCount ?? '?'})`),
+    sandbox_reported: sandboxReported.value,
+    missing: missing.value,
+    backend_implemented: sandboxReported.value && missing.value.length === 0,
     limits: limits.value,
   })
   if (queryFlag('selftest') && engineAvailable.value) await runSelftest()
@@ -225,6 +304,7 @@ async function runSelftest() {
   // ① 完整 CRUD（真实点击"运行"按钮）
   const runBtn = document.querySelector('[data-testid="btn-run"]') as HTMLButtonElement | null
   need('run_button', !!runBtn)
+  const firstTable = () => (tables.value[0]?.name || 'students')
   const exec = async (text: string) => {
     sql.value = text
     await nextTick()
@@ -290,11 +370,14 @@ async function runSelftest() {
   const resetBtn = document.querySelector('[data-testid="btn-reset"]') as HTMLButtonElement | null
   need('reset_button', !!resetBtn)
   // 自检里不弹 confirm：直接调接口（真实 UI 走确认框，见 E2E 里对按钮的断言）
-  const r = await api.sandboxReset()
-  tables.value = r.tables || []
+  const r = await api.sandboxReset(dataset.value, session.value?.sessionId)
+  tables.value = schemaToTables(r.schema)
   rec('reset_tables', tables.value.map((t) => `${t.name}(${t.rowCount})`))
-  rec('reset_restores', tables.value.some((t) => t.name === 'student' && t.rowCount === 5))
-  need('reset_restores', tables.value.some((t) => t.name === 'student' && t.rowCount === 5))
+  // 初始 schema 的表名随数据集而变（真后端 sc = students/courses/enrollments）→
+  // 断言"表都回来了且行数 > 0"，而不是写死某张表的行数（那是我 mock 的假设）
+  const restored = tables.value.filter((x) => Number(x.rowCount) > 0)
+  rec('reset_restores', restored.length >= 2 ? tables.value.map((x) => `${x.name}(${x.rowCount})`) : false)
+  need('reset_restores', restored.length >= 2)
 
   // ⑥ 答疑：报错 SQL → 流式 hint + 引用可跳
   await exec('SELECT * FROM no_such_table')
@@ -325,7 +408,8 @@ async function runSelftest() {
   <div class="lab">
     <h1 class="sec-title" data-testid="lab-title">SQL 练习台 <span class="cnt" style="color: var(--muted)">学生</span></h1>
 
-    <div class="lab-bar">
+    <!-- 后端没提供沙箱时**不摆假控件**（空下拉框看着像能用，其实点了什么也不会发生） -->
+    <div v-if="sandboxReported && !missing.length" class="lab-bar">
       <label class="small">引擎
         <select v-model="engine" data-testid="engine-select">
           <option v-for="e in engines" :key="e.id" :value="e.id" :disabled="!e.available">
@@ -333,7 +417,7 @@ async function runSelftest() {
           </option>
         </select>
       </label>
-      <span class="pill" data-testid="dialect">{{ engineInfo?.dialect || '—' }}</span>
+      <span class="pill" data-testid="dialect">{{ sessionDialect || engineInfo?.dialect || '—' }}</span>
       <label class="small">数据集
         <select v-model="dataset" data-testid="dataset-select" @change="openSession()">
           <option v-for="d in datasets" :key="d.id" :value="d.id">{{ d.label }}</option>
@@ -344,8 +428,22 @@ async function runSelftest() {
       <span class="meta faint" data-testid="limits">maxRows={{ limits.maxRows }} · 超时 {{ limits.timeoutMs }}ms</span>
     </div>
 
+    <!-- ★ 后端既没上报 sandbox 能力、/sandbox/* 也 404：如实说清楚（实测真后端 v1.0.0 就是这样） -->
+    <div v-if="!sandboxReported || missing.length" class="note bad" data-testid="sandbox-missing">
+      <b>后端尚未提供 SQL 沙箱</b>（本页不假装能执行 SQL）：
+      <ul style="margin: 4px 0 0; padding-left: 18px">
+        <li v-if="!sandboxReported"><code>/capabilities</code> 里**没有 `sandbox` 段**（前端据此无法知道有哪些引擎）</li>
+        <li v-for="(m, i) in missing" :key="i"><code>{{ m.path }}</code> → <code>{{ m.code }}</code>：{{ m.msg }}</li>
+      </ul>
+      <div class="small" style="margin-top: 6px">
+        需求出处：<code>docs/SETTINGS_AND_SANDBOX.md §3</code>（`/sandbox/session|execute|reset|datasets|ask`）与
+        <code>docs/LAB_DB_DEPLOY.md §6/§7</code>（完整 CRUD + 安全红线：每学生独立库、禁 ATTACH、进程级硬超时）。
+        接口就绪后本页无需改动即可用。
+      </div>
+    </div>
+
     <!-- 引擎不可用：禁用 + 原因 + 指向部署文档（不能只说"不可用"） -->
-    <div v-if="!engineAvailable" class="note bad" data-testid="engine-gate">
+    <div v-else-if="!engineAvailable" class="note bad" data-testid="engine-gate">
       <b>该引擎不可用</b>：{{ engineInfo?.reason || '未上报原因' }}
       <div class="small" style="margin-top: 4px">
         部署方法见 <code>{{ engineInfo?.doc || 'docs/LAB_DB_DEPLOY.md' }}</code>；在修好之前这里不会假装能跑。
@@ -353,16 +451,16 @@ async function runSelftest() {
     </div>
 
     <!-- 方言显著标注（诚实：SQLite ≠ MySQL） -->
-    <div v-if="engineAvailable" class="dialect" data-testid="dialect-note">
+    <div v-if="engineAvailable && !missing.length" class="dialect" data-testid="dialect-note">
       <div class="dh" @click="dialectNoteOpen = !dialectNoteOpen">
-        <b>当前方言：{{ session?.dialect || engineInfo?.dialect }}</b>
+        <b>当前方言：{{ sessionDialect || engineInfo?.dialect }}</b>
         <span class="small muted">与课程用的 MySQL 有差异 —— 这些实验在 SQLite 上做不了：存储过程、权限/角色（见对照表）</span>
         <span class="right small">{{ dialectNoteOpen ? '收起 ▾' : '展开 ▸' }}</span>
       </div>
       <table v-if="dialectNoteOpen" class="table">
         <thead><tr><th>SQLite</th><th>MySQL</th><th>说明</th></tr></thead>
         <tbody>
-          <tr v-for="(n, i) in (session?.dialectNotes || [])" :key="i">
+          <tr v-for="(n, i) in dialectNotes" :key="i">
             <td class="mono small">{{ n.sqlite }}</td><td class="mono small">{{ n.mysql }}</td><td class="small">{{ n.note }}</td>
           </tr>
         </tbody>
@@ -371,7 +469,7 @@ async function runSelftest() {
 
     <div v-if="note" class="note" :class="noteKind" data-testid="lab-note">{{ note }}</div>
 
-    <div class="lab-main">
+    <div v-if="sandboxReported && !missing.length" class="lab-main">
       <section class="panel editor-panel">
         <div class="crud">
           <span class="small muted">快捷语句：</span>
@@ -495,4 +593,10 @@ async function runSelftest() {
 .asktext { white-space: pre-wrap; font-family: var(--font-body); font-size: 13.5px; }
 .cites { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 </style>
+
+
+
+
+
+
 

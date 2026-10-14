@@ -165,10 +165,80 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
 
       const schema = schemaSummary(deps.enums);
 
+      // ④ 检索能力（逐模式**各自独立探测、独立上报**；未接入 → 如实说"未接入"）
+      //    ⚠️ 这里**不写死**"wiki 可用" —— 真值只能来自检索层自己的探测。
+      let retrieval: Record<string, unknown>;
+      if (deps.retrieval?.capabilities) {
+        try {
+          retrieval = await deps.retrieval.capabilities();
+        } catch (err) {
+          retrieval = { registered: true, error: redact(err instanceof Error ? err.message : String(err)) };
+        }
+      } else {
+        retrieval = {
+          registered: false,
+          reason: '检索层未接入（src/retrieval/** 动态导入失败或未交付）→ chat 按 retrieval:none 走',
+          modes: {
+            none: { available: true, reason: '不检索' },
+            wiki: { available: false, reason: '检索层未接入' },
+            kg: { available: false, reason: '检索层未接入' },
+            rag: { available: false, reason: '检索层未接入' },
+          },
+        };
+      }
+
+      // ④ 学生 SQL 沙箱：逐引擎**真探测**（不可用必给 reason + 指向部署文档）
+      let sandbox: Record<string, unknown>;
+      if (deps.sandboxCapabilities) {
+        try {
+          sandbox = await deps.sandboxCapabilities();
+        } catch (err) {
+          sandbox = { available: false, reason: `沙箱探测失败：${redact(err instanceof Error ? err.message : String(err))}` };
+        }
+      } else {
+        sandbox = {
+          available: false,
+          reason: '沙箱未接入（worker 不可用或未注册 sandbox 路由）',
+          defaultEngine: null,
+          engines: [],
+        };
+      }
+
+      // ⑤ 系统设置段：**如实**报当前生效模型与来源（未接入时也要说清"没有设置层"）
+      let settings: Record<string, unknown>;
+      if (deps.settingsCapabilities) {
+        try {
+          settings = await deps.settingsCapabilities();
+        } catch (err) {
+          settings = {
+            available: false,
+            reason: `设置层探测失败：${redact(err instanceof Error ? err.message : String(err))}`,
+          };
+        }
+      } else {
+        settings = {
+          available: false,
+          reason: '设置层未接入（src/settings/** 或 routes/settings.ts 不可用）→ 模型选择走 providers.yaml/.env',
+          activeModel: null,
+        };
+      }
+
       return reply.send({
-        version: SERVER_VERSION,
-        // ⓪ RBAC 自述（docs/RBAC.md §8）：UI 据此决定要不要显示登录页
-        auth: deps.auth,
+        version: SERVER_VERSION,        // ⓪ RBAC 自述（docs/RBAC.md §8）：UI 据此决定要不要显示登录页
+        //    `bootstrap` **每次请求实时计算**（语义 = "库里是否已有用户"）。
+        //    原实现把它固定在启动瞬间 → 启动后再用 `npm run create-admin` 建号仍报
+        //    `not_initialized`（误导）。现已改为实时判断。
+        auth: {
+          required: deps.auth.required,
+          bootstrap: deps.repo.rbac.countUsers() > 0 ? 'initialized' : 'not_initialized',
+        },
+        retrieval,
+        // ④ 学生 SQL 沙箱：**真探测**（逐引擎 + 不可用必给 reason）——
+        //    `sqlite` 永远可用；MySQL/PostgreSQL/openGauss 未部署 → 如实 false + 指向部署文档
+        sandbox: sandbox,
+        // ⑤ 系统设置 / 模型热切换（数据由 video-pipeline 的 `settingsCapabilities` 提供）：
+        //    `activeModel`/`switchedFrom`/`switchedAt`/`settingsSource`/`lastReloadError`/`ignored[]`
+        settings: settings,
         // ① 解析能力：**来自 worker 的真探测**（worker 不可用 → 空数组 + worker.reason 说明）
         adapters: adaptersFromWorker(worker.available),
         // ② 契约 §5.1 的四个能力块（缺一个就是"假装可用"）

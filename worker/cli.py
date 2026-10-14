@@ -910,17 +910,29 @@ def job_sandbox_logs(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
         raise _Fail("E_LOG_ISOLATION", str(exc), "A 学生不能看 B 学生的 SQL 日志") from exc
     except ValueError as exc:
         raise PayloadError(str(exc)) from exc
+    status, fact = logs_mod.status_fact(entries, engine_id=engine_id,
+                                        reason=source.info.reason)
     out: dict[str, Any] = {
         "source": source.info.to_dict(),
         "entries": entries,
         "count": len(entries),
+        # ★ 状态用**中文事实句**给：只给 ok/empty/unavailable 这种英文词，
+        #   模型会把"可读但没记录"说成"读不到"（pi-bridge 真机抓到过这类事实错误）
+        "status": status,
+        "fact": fact,
+        "auditLogged": True,      # 本次读取已写审计（§8.5.5），但不作为日志内容返回
     }
     if engine_id == "sqlite":
-        out["boundary"] = ("SQLite 无 L2/L3（嵌入式引擎没有实例视图与日志文件）—— "
-                           "agent 必须如实说明「读不到引擎日志」，不许假装看过")
+        # 精确表述：不是"拿不到"，是**嵌入式引擎根本没有这两层**
+        out["boundary"] = ("该引擎**没有** L2/L3：SQLite 是嵌入式引擎，"
+                           "既没有实例级统计视图、也没有日志文件（不是权限或网络问题）；"
+                           "L1（引擎原文报错 + audit_log）已在上面的 entries 里")
+    else:
+        out["boundary"] = (f"读不到该引擎日志（原因：{source.info.reason or '日志源未接入'}）"
+                           "——agent 必须如实说明，不许假装看过")
     if opt(payload, "with_text"):
         out["text"] = logs_mod.summarize_for_prompt(entries)
-    emit.progress("sandbox.logs", 1.0, {"entries": len(entries)})
+    emit.progress("sandbox.logs", 1.0, {"entries": len(entries), "status": status})
     return out
 
 

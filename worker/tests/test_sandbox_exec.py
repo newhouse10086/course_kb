@@ -311,6 +311,29 @@ def test_history_is_isolated_and_redacted(roots: SandboxRoots) -> None:
     assert callable(history_mod.append) and callable(history_mod.read)
 
 
+def test_db_size_cap_rolls_back_write(roots: SandboxRoots) -> None:
+    """★ 库大小上限：超出 → `E_SANDBOX_SIZE` **且回滚本次写入**（规格 §7.5）。
+
+    故意用极小上限（1 字节）来**真跑**这条路径 ——
+    否则它只是"文档里写了、代码没验过"。
+    """
+    db = roots.session_path("u_quota", "s1")
+    ds_mod.load_dataset(db, "sc")
+    before = exec_mod.execute(db_path=db, sql="SELECT COUNT(*) AS n FROM students",
+                              user_id="u_quota", session_id="s1", root=str(roots.root))
+    assert before["rows"] == [[6]]
+
+    r = exec_mod.execute(db_path=db, sql="INSERT INTO students(sid, sname) VALUES(4242,'超限')",
+                         user_id="u_quota", session_id="s1", root=str(roots.root),
+                         max_db_bytes=1)
+    assert r["ok"] is False and r["error"]["code"] == "E_SANDBOX_SIZE"
+    assert "回滚" in r["error"]["message"]
+
+    after = exec_mod.execute(db_path=db, sql="SELECT COUNT(*) AS n FROM students",
+                            user_id="u_quota", session_id="s1", root=str(roots.root))
+    assert after["rows"] == [[6]], "超限的写入必须被回滚（不能只报错还写进去）"
+
+
 def test_empty_db_exec_creates_file_and_reports_shape(roots: SandboxRoots) -> None:
     p = roots.session_path("u_new", "s1")
     r = exec_mod.execute(db_path=p, sql="SELECT 1 AS x", user_id="u_new", session_id="s1",

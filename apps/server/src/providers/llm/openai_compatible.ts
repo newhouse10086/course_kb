@@ -83,8 +83,18 @@ export interface OpenAiCompatibleOptions {
   extra?: Record<string, unknown>;
 }
 
-/** 探测用的最小请求 token 数 */
-const PROBE_MAX_TOKENS = 8;
+/**
+ * 探测用的 token 预算。
+ *
+ * ⚠️ **不能取小值**（原为 8，是个真 bug）：
+ * 本项目的端点是**推理模型**（实测一个 8 字回复用掉 54 个 reasoning token），
+ * 而**推理 token 计入 `max_tokens` 预算** ⟹ `max_tokens=8` 时 token 会被 reasoning
+ * 全部吃光、`content` 为空 → 探测报"可用"但拿不到任何内容（**假绿**）。
+ *
+ * 取 512：足够容纳一次 "ping" 的推理开销（实测 ~54 tokens），
+ * 又不至于在探测时烧掉太多额度。与 worker 侧契约一致（探测 ≥500，结构化 ≥2000）。
+ */
+const PROBE_MAX_TOKENS = 512;
 
 export class OpenAiCompatibleLlm implements Provider {
   readonly info: ProviderInfo;
@@ -128,8 +138,9 @@ export class OpenAiCompatibleLlm implements Provider {
       return { ok: false, reason: '凭据未配置（缺少 base_url / api_key / model）', probe: 'config' };
     }
     const t0 = Date.now();
+    const probeLabel = `POST ${this.baseUrl}/chat/completions (max_tokens=${PROBE_MAX_TOKENS})`;
     try {
-      const r = await this.post(
+      const resp = (await this.post(
         {
           model: this.model,
           messages: [{ role: 'user', content: 'ping' }],
@@ -137,12 +148,58 @@ export class OpenAiCompatibleLlm implements Provider {
           temperature: 0,
         },
         signal,
-      );
-      return {
-        ok: true,
-        latencyMs: Date.now() - t0,
-        probe: `POST ${this.baseUrl}/chat/completions (max_tokens=${PROBE_MAX_TOKENS})`,
+      )) as {
+        choices?: {
+          message?: { content?: string; reasoning_content?: string };
+          finish_reason?: string;
+        }[];
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          completion_tokens_details?: { reasoning_tokens?: number };
+        };
       };
+
+      // ─────────────────────────────────────────────────────────────
+      // ★ 修复「假绿」（由 polysemy-prober 实测发现，backend-core 同源确认）
+      //
+      // 原实现：只要 HTTP 200 就报 `ok: true` —— **完全不看 content**。
+      // 本项目的端点是**推理模型**（实测：一个 8 字回复用掉 54 个 reasoning token），
+      // 推理 token **计入 max_tokens 预算** ⟹ 探测若用小 max_tokens，
+      // token 会被 reasoning 全部吃光 → `content` 为空、`finish_reason` 可能是 `stop`，
+      // 于是探测**报 available=true 但实际一个 token 内容都拿不到**。
+      //
+      // 危害：这是本项目最忌讳的「**看起来成功**」——
+      //   能力被报成可用 → 用户触发抽取 → 拿到空内容 → 以为"这篇没有知识点"。
+      //
+      // 修法（与 worker 侧 `E_LLM_EMPTY_CONTENT` 契约对齐，见 worker/README §5）：
+      //   1. 探测预算提到 PROBE_MAX_TOKENS（≥500，容纳推理 token）
+      //   2. **空 content 不算成功** —— 如实报 ok:false + 可读原因 + 诊断字段
+      // ─────────────────────────────────────────────────────────────
+      const msg = resp.choices?.[0]?.message;
+      const content = (msg?.content ?? '').trim();
+      const reasoningChars = (msg?.reasoning_content ?? '').length;
+      const finishReason = resp.choices?.[0]?.finish_reason;
+      const completionTokens = resp.usage?.completion_tokens;
+
+      if (content === '') {
+        const bits: string[] = [];
+        if (finishReason) bits.push(`finish_reason=${finishReason}`);
+        if (typeof completionTokens === 'number') bits.push(`completion_tokens=${completionTokens}`);
+        if (reasoningChars > 0) bits.push(`reasoning_content=${reasoningChars} 字符`);
+        return {
+          ok: false,
+          latencyMs: Date.now() - t0,
+          probe: probeLabel,
+          reason:
+            `E_LLM_EMPTY_CONTENT：HTTP 200 但 content 为空（${bits.join('，') || '无诊断信息'}）` +
+            `。这多半是**推理 token 吃光了输出预算**（推理 token 计入 max_tokens）→ ` +
+            `请提高 max_tokens（结构化输出建议 ≥2000），或换非推理模型。` +
+            `注意：此状态**不可当作模型可用**。`,
+        };
+      }
+
+      return { ok: true, latencyMs: Date.now() - t0, probe: probeLabel };
     } catch (e) {
       return {
         ok: false,

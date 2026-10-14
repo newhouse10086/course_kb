@@ -17,6 +17,12 @@ httpx>=0.27              # OpenAI 兼容 HTTP 调用（json_schema + strict）
 faster-whisper>=1.0      # 本地转写（CPU/int8；Docker 不可用 → 不用 FunASR）
 numpy>=1.26              # ASR 音频 float32 处理
 
+# ── 学生 SQL 沙箱（worker/sandbox/**，T-WORKER）─────────────────────────
+# **零新依赖**：只用标准库 —— sqlite3（引擎 + set_authorizer 第二道防线）、
+# subprocess（独立进程 + 进程级硬超时 kill）、json / os / re / pathlib。
+# 故意**不**引入 SQL 解析库（sqlglot 等）：沙箱的安全判断必须确定性，
+# 且"认不出的语句交给 SQLite 自己报语法错"比第三方解析器的误判更好解释、更好教学。
+
 # ── 测试与自检 ─────────────────────────────────────────────────────────
 pytest>=8.0              # python -m pytest worker/tests
 

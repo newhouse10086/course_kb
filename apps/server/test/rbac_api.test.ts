@@ -1029,6 +1029,108 @@ test('改口令：验旧口令；改后旧会话失效；新 cookie 可用', asy
   }
 });
 
+test('★ auth.bootstrap 实时反映"库里有没有用户"（启动后建号不再滞留 not_initialized）', async () => {
+  // 不设 COURSE_KB_BOOTSTRAP_ADMIN → 启动时零用户
+  counter += 1;
+  const cfg = loadConfig({
+    root: ROOT,
+    env: {
+      ...process.env,
+      COURSE_KB_DATA_DIR: path.join(tmpRoot, `d-boot-${counter}`),
+      COURSE_KB_DB: path.join(tmpRoot, `boot-${counter}.sqlite3`),
+      COURSE_KB_BOOTSTRAP_ADMIN: '',
+    } as Record<string, string>,
+  });
+  const built = await buildApp({
+    cfg,
+    extractor: {
+      name: 'noop',
+      async available() {
+        return { ok: false, reason: '不抽取' };
+      },
+      async extractDocument() {
+        throw new Error('不应被调用');
+      },
+    },
+    workerProbe: async () => ({
+      available: false,
+      bin: 'python',
+      module: 'worker.cli',
+      pythonVersion: null,
+      moduleImportable: false,
+      reason: '测试未启用 worker',
+      checkedAt: Date.now(),
+      cached: false,
+      probes: {
+        python: { ok: false, stdout: '', stderr: '', code: null, elapsedMs: 0 },
+        module: { ok: false, stdout: '', stderr: '', code: null, elapsedMs: 0 },
+      },
+    }),
+  });
+  const live = await listen(built);
+  try {
+    // ① 启动时零用户 → not_initialized（此时所有受保护接口都是 401，因为没账号可登录）
+    const before = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal((before.body.auth as Record<string, unknown>).bootstrap, 'not_initialized');
+    assert.equal((await req(live, 'GET', '/api/v1/documents')).status, 401, '没账号时受保护接口必须 401');
+
+    // ② 服务**运行中**建号（等价于另开终端 `npm run create-admin`）→ 必须立刻变 initialized
+    live.built.deps.repo.rbac.createUser({
+      username: 'lateadmin',
+      passwordHash: await hashPassword('late-pass-12345'),
+      roles: ['admin'],
+    });
+    const after = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal(
+      (after.body.auth as Record<string, unknown>).bootstrap,
+      'initialized',
+      '建号后再查 capabilities 必须是 initialized（不能滞留启动瞬间的旧值）',
+    );
+    // 而且新账号**马上能登录**（不需要重启）
+    assert.equal((await login(live, 'lateadmin', 'late-pass-12345')).status, 200);
+  } finally {
+    await live.built.close();
+  }
+});
+
+test('★ /capabilities 的 retrieval 段：逐模式独立上报；未接入时如实说"未接入"', async () => {
+  const live = await listen(await makeApp());
+  try {
+    const caps = await req(live, 'GET', '/api/v1/capabilities?deep=0');
+    assert.equal(caps.status, 200);
+    const r = caps.body.retrieval as Record<string, unknown>;
+    assert.ok(r, '必须有 retrieval 段');
+    // 形状由检索层定（可能是 `modes:{…}` 嵌套，也可能 `modes:[…]` + 平铺键）——两种都接受，
+    // 但**内容**必须逐模式齐备（这是"三种检索各自独立探测"的可观测保证）。
+    const container = r.modes;
+    const entry = (m: string): Record<string, unknown> | undefined =>
+      Array.isArray(container)
+        ? (r[m] as Record<string, unknown> | undefined)
+        : ((container as Record<string, Record<string, unknown>> | undefined)?.[m] ?? (r[m] as Record<string, unknown> | undefined));
+    for (const m of ['none', 'wiki', 'kg', 'rag']) {
+      const e = entry(m);
+      assert.ok(e, `必须逐模式上报，缺 ${m}`);
+      assert.equal(typeof e.available, 'boolean', `${m}.available 必须是布尔`);
+      if (e.available === false) {
+        assert.ok(String(e.reason ?? '').length > 0, `${m} 不可用必须给可读 reason`);
+      }
+    }
+    assert.equal(entry('none')?.available, true, 'none 永远可用（不检索）');
+    // `registered` 只是"未接入"分支的标记；检索层自己的形状里没有它 → 视为已接入
+    if (r.registered === false) {
+      assert.match(String(r.reason), /未接入/);
+    } else {
+      // kg-rag 已交付：rag 未配置 embedding provider → 必须如实不可用（不许假装有向量检索）
+      assert.equal(entry('rag')?.available, false, 'rag 没有 embedding provider 时必须如实不可用');
+      assert.ok(String(entry('rag')?.reason ?? '').length > 0);
+      // 本次实测：wiki 依赖库里的文档 → 该测试库无文档时也必须**如实**说明（不是假装有结果）
+      assert.equal(typeof entry('wiki')?.available, 'boolean');
+    }
+  } finally {
+    await live.built.close();
+  }
+});
+
 test('users/courses/members：admin 建号、教师建课加成员、学生只能读自己课程', async () => {
   const live = await listen(await makeApp());
   try {

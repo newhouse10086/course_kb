@@ -214,3 +214,30 @@ export function describeCitationMode(mode: CitationMode): string {
   if (mode === CITATION_MODES.forged) return '引用异常（出现检索结果之外的卡片 id，疑为模型编造）';
   return '未引用任何知识库卡片';
 }
+
+// ===========================================================================
+// 4. SSE 安全序列化（AGENTS.md ⚠️坑 17）
+// ===========================================================================
+
+/**
+ * `JSON.stringify` + **转义 U+2028 / U+2029**。
+ *
+ * ⚠️ 坑 17：这两个字符在 JSON 字符串里**是合法字面量** —— `JSON.stringify` 既不转义、
+ * 也**不报错**。但很多"按行切帧"的读取器会把它们当**行分隔符**：
+ * 一帧被切成两帧，第二段不是合法 JSON → **静默丢事件**（而且看起来流还正常结束了）。
+ * 属于"看起来成功"那一类最危险的 bug。
+ *
+ * 触发来源都是任意内容：模型输出正文、学生问题文本、文件名。
+ *
+ * 与 `src/tasks/bus.ts::safeJsonStringify` 语义一致（同一份 SSE 契约 §6「`data:` 是单行 JSON」）。
+ * 之所以不直接 import 那边：**agent 层不应依赖 tasks 层**（依赖方向），
+ * 而这个实现只有两行 replace、语义固定，重复的风险远小于反向依赖。
+ */
+export function safeJsonStringify(value: unknown): string {
+  return JSON.stringify(value).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+}
+
+/** 是否含**裸** U+2028/U+2029（测试与自检用）。 */
+export function hasRawLineSeparator(text: string): boolean {
+  return /[\u2028\u2029]/.test(text);
+}

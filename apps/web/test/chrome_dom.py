@@ -657,7 +657,11 @@ def main() -> int:
                 node = driver.ch.call("DOM.querySelector", {"nodeId": doc_node["root"]["nodeId"], "selector": 'input[type="file"]'})
                 ok("页面上有 file input", bool(node.get("nodeId")))
                 driver.ch.call("DOM.setFileInputFiles", {"files": [str(upload_probe)], "nodeId": node["nodeId"]})
-                driver.ch.wait_for("!!document.querySelector('[data-testid=\"upload-note\"]')", timeout=60, interval=0.2)
+                # 等**上传真正结束**：note 一出现是"正在上传…"，那不是结果
+                driver.ch.wait_for(
+                    "(() => { const n=document.querySelector('[data-testid=\"upload-note\"]');"
+                    " return !!n && /已上传|失败/.test(n.textContent) })()",
+                    timeout=90, interval=0.2)
                 note = str(driver.ch.evaluate("document.querySelector('[data-testid=\"upload-note\"]').textContent") or "")
                 meta = api("/api/v1/_fixture/meta")["config"]
                 after = len(meta["uploads"])

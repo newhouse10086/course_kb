@@ -58,8 +58,30 @@ npm test               # unit + e2e
 
 ---
 
+## 3A. 接真后端（2026-10-15 实测）—— mock 与真实的差异清单
+
+真后端：`cd apps/server && npm run dev`（本机默认 `127.0.0.1:8787`；我验证时用 `COURSE_KB_PORT=8799` 另起实例，避免与 Lead 的进程抢端口）。
+前端接法：`npm run dev`（Vite 代理 `/api → 127.0.0.1:8787`）；无头测试用 `test/real_e2e.py`（自起"同源前端 + `/api` 反代"，真 cookie 才生效）。
+
+| # | 我 mock 的形状 | **真后端实测** | 前端怎么处理 |
+|---|---|---|---|
+| 1 | `{roles:[], permissions:[], authRequired}` | **`{user:{...,roles:[...]}, courses, can:"admin：可见全部"}`** —— roles 在 `user` 里，**没有 permissions[]** | 两处都读（`user.roles` 优先），缺一个也不会把教师误判成学生 |
+| 2 | 无登录流程 | **`POST /auth/login` → httpOnly cookie `ckb_session`**；未登录受保护接口 401 `E_UNAUTHENTICATED`（hint 指向登录接口） | 新增 `/login` 页；401 → 跳登录并记住 `next`；退出调 `/auth/logout` |
+| 3 | `/models`（8 个模型）、`/settings`、`/settings/llm/switch` | **全部 404 `E_NOTFOUND`（尚未实现）** | 页面显示「后端尚未实现」+ 需求出处，**收起切换控件**（不摆假界面） |
+| 4 | `/capabilities.sandbox = {engines, limits}` | **没有 `sandbox` 段**（响应里是 `"sandbox": null`，后端有钩子没实现） | 练习台显示「后端尚未提供 SQL 沙箱」+ 文档指向，**不渲染编辑器/结果表** |
+| 5 | `/sandbox/{datasets,session,execute,reset,ask}` | **404 `E_NOTFOUND`** | 同上；`loadDatasets()` 必须 try/catch（第一版没 catch → 异常冒泡，连报告都写不出来） |
+| 6 | `GET /tasks/{id}`（写死 mock 任务 id） | **`GET /tasks` 列表**才是真的（`{tasks:[{id,kind,status,progress,stage,detail,...}]}`）；`progress` 是 **0–1 比例** + `stage` 文案 | 设置页改为读列表 + 按 `kind` 过滤 LLM 任务；不再写死 id（那是我自己造的假前提） |
+| 7 | 文档列表有 `created_at/updated_at` | 真文档字段是 `{id,title,kind,source_path,size_bytes,page_count,lang,status,meta{uploaded_at,...}}` —— **没有顶层时间戳** | 排序回退为后端顺序（不伪造时间） |
+| 8 | `/capabilities` 即时返回 | **每次 7.3–8.4s**（4 次采样：7288/8360/7393ms；`pi.cached=true`、`worker.cached=true`，但 `pi.loadMs≈2941`、`model.latencyMs≈2549` 每次都跑） | ① 401 本身就是"要登录"的最快信号 → 不等 caps 也显示登录入口；② caps 未到时显示「能力接口加载中…（真探测较慢）」 |
+| 9 | 降级：整段 sandbox 缺失 | 真后端**两种降级要分清**：① 段缺失（没实现）② 段在但引擎 `available:false`（起不来） | 两种分别渲染不同文案（mock 也补齐了"段在但不可用"的用例） |
+| 10 | `/search?q=…` 在中文文档上命中 | 真后端 `/search` 支持 `doc_id` 过滤：**英文手册搜中文词 = 0 命中是正确行为** | 前端不特殊处理；但**换文档时清空上一次检索结果**（否则旧命中留在屏幕上，看着像"在新文档里搜到了"） |
+| 11 | `auth.bootstrap` 我 mock 成 `initialized` | 真后端也是 **`initialized`**（`admin/Admin2026lab` 登录成功）——Lead 看到的 `not_initialized` 在**当前 DB 上不可复现** | 无需处理；若别的实例仍报 `not_initialized`，那是那台实例的 DB 没有管理员 |
+
+**真数据下的空态（如实保留，未用 mock 美化）**：`/health` = `documents:2, units:2528, cards:0, entities:0, edges:0` → 知识库显示「知识点卡片 ×0」「本节暂无知识卡片」、内嵌图谱显示「0 节点 / 0 边：本单元暂无图谱实体（不是渲染失败）」、图谱页 0 节点、检索仍可用（中文样本文档 5 单元）。
+
 ## 3B. 模型设置（教师 / admin）—— `docs/SETTINGS_AND_SANDBOX.md` §2
 
+> ⚠️ 本页依赖的 `/models`、`/settings/*` **真后端还没实现（404）** → 真后端下本页显示"未实现"；下表的数字是**契约 mock** 下跑出来的（等 backend-api 就绪后同样适用，前端无需改动）。—— `docs/SETTINGS_AND_SANDBOX.md` §2
 | 要求 | 实现 |
 |---|---|
 | 模型下拉（`/models`） | 8 个模型逐项显示 **`available` + 真探测延迟**；不可用的带 `reason`（如 `HTTP 503`） |
@@ -91,7 +113,9 @@ npm test               # unit + e2e
 ```powershell
 npm run typecheck   # vue-tsc：0 错
 npm run build       # vite：✓ built
-npm test            # Vitest 63/63 + headless Chrome DOM 断言 180/180
+npm test            # Vitest 63/63 + headless Chrome DOM 断言 180/180（契约 mock）
+python test/real_e2e.py --backend http://127.0.0.1:8799   # 真后端 42/42（真 cookie 登录 + 真数据空态 + 未实现接口如实降级）
+python test/screenshots_real.py --backend http://127.0.0.1:8799  # 真后端截图 12 张（空态如实保留）
 npm run test:perf   # 真实体量性能数字
 python test/screenshots.py   # 14 张截图 + 对比度实测
 ```
@@ -138,9 +162,10 @@ python test/screenshots.py   # 14 张截图 + 对比度实测
 | 亮 | 15.81:1 | 8.65:1 | 5.08:1 | 7.80:1 |
 | 暗 | 14.27:1 | 8.48:1 | 5.13:1 | 6.65:1 |
 
-**截图**：`test/screenshots/{wiki,graph,video,chat,docs,settings,lab}-{light,dark}.png`（**14 张**）。
+**截图**：契约 mock `{wiki,graph,video,chat,docs,settings,lab}-{light,dark}.png`（**14 张**，设计系统证据）
++ 真后端 `real-{login,wiki,graph,docs,lab,settings}-{light,dark}.png`（**12 张**，cards=0 的空态**如实保留**）。
 截图前会做一次**真实交互**把空状态填满（对话页发一句真话走 WebSocket、视频页点一条字幕跳时间点、练习台先建沙箱会话），
-不是往 DOM 里塞假数据。
+不是往 DOM 里塞假数据；真后端那组则相反 —— **刻意不填**，拍到什么就是什么。
 
 ---
 
@@ -171,6 +196,8 @@ apps/web/
 - 合成时钟模式（`?simclock=1`）下 `media_check` 标 `skipped(simclock)` —— **N/A 不冒充通过**。
 - 图谱页"可见边"过滤是**排他**语义：只看 flagged 时可见边全部为 flagged（e2e 断言 `flagged_not_ok === 0`）。
 - 对话页 `set_model` 后端会回 `E_PI_CMD`（pi SDK 需要 Model 对象）→ 前端**不做模型下拉框**，只提供「新会话」。
+
+
 
 
 

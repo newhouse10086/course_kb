@@ -1,4 +1,4 @@
-import { createRouter, createWebHashHistory } from 'vue-router'
+﻿import { createRouter, createWebHashHistory } from 'vue-router'
 
 /**
  * 路由：七个视图（ARCHITECTURE_V2 §2 / M4；`/lab` 与 `/settings` 为 2026-10-15 新增）
@@ -7,6 +7,7 @@ import { createRouter, createWebHashHistory } from 'vue-router'
  */
 export const routes = [
   { path: '/', redirect: '/wiki' },
+  { path: '/login', name: 'login', component: () => import('./views/Login.vue') },
   { path: '/wiki', name: 'wiki', component: () => import('./views/WikiIndex.vue') },
   { path: '/graph', name: 'graph', component: () => import('./views/Graph.vue') },
   { path: '/video', name: 'video', component: () => import('./views/Video.vue') },
@@ -21,3 +22,4 @@ export const router = createRouter({
   history: createWebHashHistory(),
   routes,
 })
+

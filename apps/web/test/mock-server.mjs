@@ -310,6 +310,20 @@ export function capabilitiesPayload(degraded = false) {
       policy: { asr: 'local-first', tts: 'cloud-first', translate: 'cloud-first' },
       pi: { available: false, reason: 'pi SDK 未安装（npm i @earendil-works/pi-coding-agent）' },
       ffmpeg: { available: false, version: '', reason: 'ffmpeg not found on PATH' },
+      // 降级下沙箱**如实上报不可用**（含原因 + 部署文档指向）。
+      // 注意不能"整个 sandbox 段都没有" —— 那前端只能显示"后端没上报"，
+      // 而这里的事实是"引擎起不来"（两种降级要分清）
+      sandbox: {
+        available: false,
+        engines: [
+          { id: 'sqlite', label: 'SQLite（进程内）', available: false, dialect: 'SQLite 3.x',
+            reason: 'worker/sandbox 未就绪：Python 沙箱执行器未安装（pip install -r worker/requirements.txt 后重试）',
+            doc: 'docs/LAB_DB_DEPLOY.md §6' },
+          { id: 'mysql', label: 'MySQL 8.0 容器', available: false, dialect: 'MySQL 8.0',
+            reason: '未安装 Docker', doc: 'docs/LAB_DB_DEPLOY.md §2.1' },
+        ],
+        limits: { maxRows: 200, timeoutMs: 3000, maxDbBytes: 20971520 },
+      },
     }
   }
   return {
@@ -756,6 +770,18 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       }
 
       // ---------- §5.6 tasks ----------
+      // 列表（真后端有 `GET /tasks`；设置页用它判断"有没有在跑的 LLM 任务"）
+      if (api === '/tasks' && req.method === 'GET') {
+        const list = STATE.runningLlmTask
+          ? [{ id: STATE.running.taskId, doc_id: DOC_PDF, kind: STATE.running.kind, status: 'running',
+              progress: STATE.running.total ? STATE.running.done / STATE.running.total : 0,
+              stage: `汇总单元引言 ${STATE.running.done}/${STATE.running.total}`,
+              detail: { kind: STATE.running.kind, done: STATE.running.done, total: STATE.running.total, model: STATE.activeModel },
+              error: null }]
+          : []
+        return json({ total: list.length, tasks: list })
+      }
+      if (api === '/auth/logout' && req.method === 'POST') return json({ ok: true })
       let m = api.match(/^\/tasks\/([^/]+)(?:\/(.*))?$/)
       if (m) {
         const taskId = m[1]
@@ -978,6 +1004,47 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
 
 export const meta = () => buildFixture().meta
 
+/* ---------------- 真后端代理（同源托管 dist + /api 转发） ----------------
+ * 为什么需要它：真后端在 8787 只提供 `/api/v1/*`，**不托管前端 dist**；
+ * 浏览器要同源访问（httpOnly cookie 才自然生效）→ 起一个"同源前端 + /api 反代"的小服务。
+ * 用法：`node test/mock-server.mjs --proxy http://127.0.0.1:8799 --port-file <path>`
+ * 行为：静态走 dist/；`/api/*` 原样转发（保留 Set-Cookie / chunked / SSE 流），不注入任何假数据。
+ */
+export function startProxyServer({ target, port = 0, dist = DIST } = {}) {
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://127.0.0.1')
+    if (!u.pathname.startsWith('/api/')) {
+      let rel = u.pathname === '/' ? 'index.html' : u.pathname.replace(/^\//, '')
+      let file = path.join(dist, rel)
+      if (!file.startsWith(dist) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(dist, 'index.html')
+      if (!fs.existsSync(file)) { res.writeHead(404); return res.end('dist 不存在，先 npm run build') }
+      const ext = path.extname(file)
+      const ctype = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.woff': 'font/woff' }[ext] || 'application/octet-stream'
+      res.writeHead(200, { 'Content-Type': ctype, 'Cache-Control': 'no-store' })
+      return res.end(fs.readFileSync(file))
+    }
+    // ---- /api/* 转发（含 SSE：不缓冲、直接 pipe） ----
+    const t = new URL(target)
+    const up = http.request({
+      host: t.hostname, port: t.port, path: req.url, method: req.method, headers: { ...req.headers, host: `${t.hostname}:${t.port}` },
+    }, (ur) => {
+      res.writeHead(ur.statusCode, ur.headers)
+      ur.pipe(res)
+    })
+    up.on('error', (e) => { try { res.writeHead(502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { code: 'E_PROXY', msg: String(e.message) } })) } catch { /* ignore */ } })
+    req.pipe(up)
+  })
+  return new Promise((resolve) => {
+    server.listen(port, '127.0.0.1', () => {
+      const actual = server.address().port
+      resolve({
+        server, target, port: actual, base: `http://127.0.0.1:${actual}`,
+        close: () => new Promise((r) => server.close(() => r())),
+      })
+    })
+  })
+}
+
 /* ---------------- CLI：给 e2e 驱动用 ----------------
  * `node test/mock-server.mjs --port-file <path>` → 起 normal + degraded 两个实例，
  * 把端口与夹具 meta 写进文件，然后常驻（由驱动进程 terminate）。
@@ -991,16 +1058,30 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 if (isMain) {
   const idx = process.argv.indexOf('--port-file')
   const portFile = idx >= 0 ? process.argv[idx + 1] : null
-  const normal = await startMockServer()
-  const degraded = await startMockServer({ degraded: true })
-  const payload = { normal: normal.port, degraded: degraded.port, meta: meta(), docs: { pdf: DOC_PDF, video: DOC_VIDEO, unit: WIKI_UNIT } }
-  if (portFile) fs.writeFileSync(portFile, JSON.stringify(payload), 'utf8')
-  else console.log(JSON.stringify(payload))
-  const stop = async () => { await normal.close(); await degraded.close(); process.exit(0) }
-  process.on('SIGTERM', stop)
-  process.on('SIGINT', stop)
-  setInterval(() => {}, 1 << 30)
+  const proxyIdx = process.argv.indexOf('--proxy')
+  if (proxyIdx >= 0) {
+    // 真后端模式：只起"同源前端 + /api 反代"，**不注入任何假数据**
+    const proxy = await startProxyServer({ target: process.argv[proxyIdx + 1] })
+    const payload = { real: proxy.port, target: proxy.target, mode: 'proxy' }
+    if (portFile) fs.writeFileSync(portFile, JSON.stringify(payload), 'utf8')
+    else console.log(JSON.stringify(payload))
+    const stopProxy = async () => { await proxy.close(); process.exit(0) }
+    process.on('SIGTERM', stopProxy)
+    process.on('SIGINT', stopProxy)
+    setInterval(() => {}, 1 << 30)
+  } else {
+    const normal = await startMockServer()
+    const degraded = await startMockServer({ degraded: true })
+    const payload = { normal: normal.port, degraded: degraded.port, meta: meta(), docs: { pdf: DOC_PDF, video: DOC_VIDEO, unit: WIKI_UNIT } }
+    if (portFile) fs.writeFileSync(portFile, JSON.stringify(payload), 'utf8')
+    else console.log(JSON.stringify(payload))
+    const stop = async () => { await normal.close(); await degraded.close(); process.exit(0) }
+    process.on('SIGTERM', stop)
+    process.on('SIGINT', stop)
+    setInterval(() => {}, 1 << 30)
+  }
 }
+
 
 
 

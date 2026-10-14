@@ -214,13 +214,35 @@ def test_history_cross_user_is_forbidden(session: dict) -> None:
     assert last["code"] == "E_LOG_ISOLATION"
 
 
+def test_empty_session_logs_are_honest(session: dict) -> None:
+    """★ 没执行过任何 SQL 的会话：entries 为空、status=empty、且**不能说成读不到**。"""
+    code, data, _ = run_cli("sandbox.logs", {**session, "with_text": True})
+    assert code == 0
+    assert data["count"] == 0 and data["entries"] == []
+    assert data["status"] == "empty"
+    assert "可读" in data["fact"] and "≠" in data["fact"]
+    assert data["auditLogged"] is True
+    assert "不等于读不到日志" in data["text"]
+
+
+def test_unavailable_engine_logs_are_honest(session: dict) -> None:
+    """mysql 日志源未接入 → status=unavailable + 可读原因（不假装）。"""
+    code, data, _ = run_cli("sandbox.logs", {**session, "engine": "mysql"})
+    assert code == 0
+    assert data["status"] == "unavailable" and data["entries"] == []
+    assert "读不到" in data["fact"] and "LAB_DB_DEPLOY" in data["fact"]
+
+
 def test_logs_job_shape_and_isolation(session: dict) -> None:
     run_cli("sandbox.exec", {**session, "sql": "SELECT 'x' AS a"})
     run_cli("sandbox.exec", {**session, "sql": "SELECT * FROM nope"})
     code, data, _ = run_cli("sandbox.logs", {**session, "limit": 10, "with_text": True})
     assert code == 0
     assert data["source"]["layers"] == ["L1"] and data["source"]["available"] is True
-    assert "无 L2/L3" in data["boundary"]
+    # ★ 精确表述：不是"拿不到"，是**嵌入式引擎根本没有这两层**
+    assert "没有** L2/L3" in data["boundary"]
+    assert "不是权限或网络问题" in data["boundary"]
+    assert data["status"] == "ok" and "读到了" in data["fact"]
     errors = [e for e in data["entries"] if e["level"] == "error"]
     assert errors and errors[-1]["message"] == "no such table: nope"
     assert errors[-1]["source"] == "L1" and errors[-1]["sessionId"] == "lab1"

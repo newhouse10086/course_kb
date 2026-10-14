@@ -68,6 +68,23 @@ export interface AgentModelCapability {
   probe: 'live' | 'not-run' | 'failed';
   missingEnv: string[];
   httpStatus: number | null;
+  /**
+   * 探测响应的形状（**"HTTP 200" 不等于"模型可用"**）：
+   * - `choices`  = 合法 chat completion
+   * - `error`    = 返回体里有 error
+   * - `unknown`  = 既没有 choices 也没有 error（网关/门户页/HTML）
+   */
+  bodyShape: 'choices' | 'error' | 'unknown' | null;
+  /** `choices[0].finish_reason`（有就给） */
+  finishReason: string | null;
+  /**
+   * `choices[0].message.content` 是否为空。
+   * ⚠️ 推理模型在小 `max_tokens` 下**必然为空**（预算被 reasoning 吃光）——
+   * 契约 §0：这种情况**不许当成功**，所以这里如实标出，并由 `warning` 说明边界。
+   */
+  contentEmpty: boolean | null;
+  /** 探测得到的**警告**（如"只拿到 reasoning，没拿到 content"）；不影响 available 判定，但要让人看见 */
+  warning: string | null;
   /** 从 402 响应里解析出的额度重置时间（有则更有用） */
   resetAt: string | null;
 }
@@ -136,7 +153,37 @@ function emptyModelCapability(reason: string, probe: AgentModelCapability['probe
     missingEnv: [],
     httpStatus: null,
     resetAt: null,
+    bodyShape: null,
+    finishReason: null,
+    contentEmpty: null,
+    warning: null,
   };
+}
+
+/**
+ * 判读探测响应体（**HTTP 200 ≠ 模型可用**）。
+ *
+ * 三种形状：合法 `choices` / 带 `error` / 都不是（网关、门户页、HTML）。
+ * 有 `choices[0]` 时再看 `content` 是否为空 —— 推理模型在小预算下必然为空，
+ * 契约 §0 要求这种情况**不许当成功**，所以要能被识别出来。
+ */
+function describeProbeBody(body: unknown): {
+  bodyShape: 'choices' | 'error' | 'unknown';
+  finishReason: string | null;
+  contentEmpty: boolean | null;
+} {
+  if (!body || typeof body !== 'object') return { bodyShape: 'unknown', finishReason: null, contentEmpty: null };
+  const o = body as { choices?: unknown; error?: unknown };
+  if (Array.isArray(o.choices) && o.choices.length > 0) {
+    const first = o.choices[0] as { finish_reason?: unknown; message?: { content?: unknown } } | null;
+    const finishReason = typeof first?.finish_reason === 'string' ? first.finish_reason : null;
+    const content = first?.message?.content;
+    // content 可能是 null / '' / 数组（多模态）——只要"真空"才算空
+    const contentEmpty = content === null || content === undefined || content === '' ? true : false;
+    return { bodyShape: 'choices', finishReason, contentEmpty };
+  }
+  if (o.error !== undefined) return { bodyShape: 'error', finishReason: null, contentEmpty: null };
+  return { bodyShape: 'unknown', finishReason: null, contentEmpty: null };
 }
 
 /** 从环境变量兜底取凭据（与 T-BACKEND 的 providers.yaml 同名变量）。 */
@@ -208,10 +255,25 @@ function extractResetAt(body: unknown): string | null {
 /** 默认模型探测器：真发一次最小请求（OpenAI 兼容 `/chat/completions`）。 */
 export async function probeLlmEndpoint(
   creds: LlmCredentialsLike,
-  opts: { fetchImpl?: typeof fetch; timeoutMs?: number; redact?: (t: string) => string } = {},
+  opts: {
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+    redact?: (t: string) => string;
+    /**
+     * 探测请求的输出预算。
+     *
+     * ⚠️ 默认 1：**故意便宜**。它能证明"凭据/额度/端点通"，但**不能**证明"能产出内容" ——
+     * 本项目端点是**推理模型**（实测：`max_tokens=100` 时 `content` 仍为空、全被 reasoning 吃光，
+     * 要到 ~500 才稳定出内容）。所以：
+     *  - 返回里会如实带上 `contentEmpty` / `finishReason` / `bodyShape`，并给 warning
+     *  - 想要"真的产出内容"的结论，请显式提高这个值（成本与时延都会上升）
+     */
+    probeMaxTokens?: number;
+  } = {},
 ): Promise<AgentModelCapability> {
   const doFetch = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_MODEL_PROBE_TIMEOUT_MS;
+  const probeMaxTokens = opts.probeMaxTokens ?? 1;
   const redact = opts.redact ?? ((t: string) => scrubSecrets(t, [creds.apiKey]));
   const base = emptyModelCapability('未探测');
   base.model = creds.model ?? null;
@@ -241,7 +303,7 @@ export async function probeLlmEndpoint(
       body: JSON.stringify({
         model: creds.model,
         messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 1,
+        max_tokens: probeMaxTokens,
         stream: false,
       }),
       signal: AbortSignal.timeout(timeoutMs),
@@ -259,8 +321,29 @@ export async function probeLlmEndpoint(
     base.probe = 'live';
 
     if (res.ok) {
+      // ★ 不能只看 HTTP 200：
+      //   ① 网关/门户页可能返回 200 但不是 chat completion（**假绿**）；
+      //   ② 本项目端点是推理模型，小 `max_tokens` 会把预算全用在 reasoning 上 →
+      //      `content` 为空。契约 §0 明确「content 空但 reasoning_content 非空 → 不许当成功」，
+      //      所以这里如实标出响应形状，并在只拿到 reasoning 时给 warning（不假装"内容正常"）。
+      const shape = describeProbeBody(body);
+      base.bodyShape = shape.bodyShape;
+      base.finishReason = shape.finishReason;
+      base.contentEmpty = shape.contentEmpty;
+      if (shape.bodyShape !== 'choices') {
+        base.available = false;
+        base.reason = redact(
+          `端点返回 HTTP ${res.status} 但**不是合法的 chat completion**（未找到 choices；可能是网关/门户/错误页）—— 凭据与端点尚未验证`,
+        );
+        return base;
+      }
       base.available = true;
       base.reason = '';
+      if (shape.contentEmpty) {
+        base.warning = `探测请求 max_tokens=${probeMaxTokens}，响应里 content 为空（finish_reason=${shape.finishReason ?? '未知'}）——` +
+          `本端点疑似**推理模型**：输出预算先被 reasoning 占用。此结果只证明**凭据/额度/端点可用**，不代表能产出内容；` +
+          `要验证内容产出请提高 probeMaxTokens（实测该模型需 ~500）`;
+      }
       return base;
     }
     base.available = false;

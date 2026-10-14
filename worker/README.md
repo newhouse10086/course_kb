@@ -215,6 +215,66 @@ stderr: 日志（**不是协议**）
 
 调用方**不要只看 `cards`**：`cards=0` + `ok=true` 才是"这篇确实没有知识点"。
 
+#### ★ `status` / `warnings`：把"成功但零产出"与"失败"分开
+
+`extract` / `extract.convert` 的 `result.data` 里除了 `ok`/`error_count` 还有：
+
+| `status` | 含义 | `ok` | 退出码 |
+|---|---|---|---|
+| `done` | 有卡片产出 | true | 0 |
+| **`done_empty`** | **全部成功但一张卡都没有** —— 内容不足（模型合理地只返回 `section`） | true | 0 |
+| `partial` | 有失败也有成功 | false | 0 |
+| `failed` | 全失败（含"一个 payload 都没匹配上"） | false | 1 |
+
+`done_empty` **不是错误**（模型拒绝抽取可以是对的：原文只有一句定义式陈述），
+但它**必须**与"抽取失败""管线丢卡"在返回值上区分 —— 否则前端只能把空知识库
+当正常完成展示，用户分不清"内容太少"和"系统坏了"（polysemy-prober 独立验收抓到）。
+
+配套的 `warnings[]`（`done_empty` 时必有）：
+
+```jsonc
+{"code":"W_NO_CARDS", "unit_id":"unt_…", "title":"索引简介", "span":{...},
+ "cards_key":"missing",     // missing=模型主动省略该键（内容不足）；empty=给了空数组
+ "model_note":"本节只有一句定义式陈述……不足以支撑任何操作层面的结论。",
+ "msg":"模型返回的 section 合法，但**没有产出任何卡片**（`cards` 键缺失 …）；模型说明：…"}
+```
+`model_note` 直接取自模型的 `section_summary` —— 它往往正好解释了
+"为什么抽不出知识点"，前端可直接显示给用户。
+
+> ⚠️ **两条路径的差异**（别混淆）：
+> * **B：worker 内调 LLM**（`extract`）—— strict schema **要求** `cards` 键，
+>   模型省略它 → 重试 3 次 → **失败**（`status:"failed"`）。本来就响。
+> * **A：Node 调模型**（`extract.plan` → `extract.convert`）—— 模型输出未经 strict
+>   校验就回传 → 第一版**静默**；现在 `status:"done_empty"` + `warnings`。
+> * `stats.units_no_cards` 计数这类单元，便于看"是整篇内容少还是个别的少"。
+
+#### ★ LLM 错误码：把"推理吃光预算 / 上游过载 / 输出不合规"分开
+
+契约 §0 明确要求「`content` 为空但 `reasoning_content` 非空 → **显式报错**，不许当成功」。
+推理模型的 reasoning token **计入输出预算**（实测：8 字回复用掉 54 个推理 token），
+所以预算太小时 `content` 为空、`finish_reason=length` —— **只判 HTTP 200 就会假绿**。
+
+| 错误码 | 触发 | 处置 |
+|---|---|---|
+| `E_LLM` | 未配置凭据 / 4xx（401/402/403/404/429） | 配置或等额度；`402` 会触发抽取**中断**（`E_LLM_ABORT`） |
+| **`E_LLM_EMPTY_CONTENT`** | `content` 为空（空白也算）——**不算成功** | `detail` 带 `finish_reason`/tokens/`reasoning_chars`；**提高 `max_tokens`**（结构化抽取 ≥2000，探测 ≥500） |
+| **`E_LLM_BAD_JSON`** | 输出不是 JSON（可能被截断） | 看 `finish_reason=length` → 提高预算；否则查提示词 |
+| **`E_LLM_UPSTREAM`** | 上游 5xx / 网络故障（`retryable=true`） | **重试即可**；`detail` 保留 `HTTP 503` + body 片段（如 `Service Overload`） |
+| `E_LLM_SCHEMA` | JSON 合法但字段/枚举不合规（重试后仍错） | 改 schema/提示词；`detail` 列出违规项 |
+
+> 这些检查在 `_call` 里做 → **真 HTTP 与注入 transport 两条路径都覆盖**
+> （第一版只在 `_http_call` 里查，注入替身会绕过）。
+> 顺带一个教训：我第一次重构 `_call` 时**多留了一份定义**，把"并发=1 的锁"覆盖掉了 ——
+> 是既有的 `test_llm_serialises_calls_under_threads`（断言 `max_inflight == 1`）当场抓住的。
+
+**输出预算必须显式给**（`LLMConfig.max_tokens` 默认 8192；Node 传 `maxTokens` 即采纳，
+`settings.json` 里是 16384）：推理 token **计入** `max_tokens`，省略它就是让 provider 的默认值
+决定"能不能出内容"。判据是 **`content` 是否为空**，**不是** `finish_reason`
+（实测 `length` 会出现但不保证总出现 → 只能当线索，所以原因描述写"很可能"而不下断言）。
+
+> 真端点回归（`.env` 现指向推理端点 `llm-api.x-aio.com`）：`extract` 1 个单元 → **8 张卡片**、
+> `status:"done"`、24.3s、`llm_calls:1` —— 显式预算下推理模型的结构化抽取正常。
+
 好处：**提示词/封闭枚举/转换规则只有 worker 一份实现**（不会在 TS 里抄漂移），
 而且 provider 凭据**不必下发子进程**。
 

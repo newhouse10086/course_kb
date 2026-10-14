@@ -14,6 +14,7 @@ import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
+import path from 'node:path';
 
 import { loadConfig, ensureDirs, redact } from './config.ts';
 import type { ServerConfig } from './config.ts';
@@ -21,6 +22,8 @@ import { Db } from './store/db.ts';
 import { Repo } from './store/repo.ts';
 import { loadSchemaEnums } from './store/schema-enums.ts';
 import type { SchemaEnums } from './store/schema-enums.ts';
+import { search as searchKb } from './store/search.ts';
+import type { SearchHit } from './store/search.ts';
 import { TaskEventBus } from './tasks/bus.ts';
 import { TaskQueue } from './tasks/queue.ts';
 import { createHandlers } from './tasks/handlers.ts';
@@ -38,6 +41,7 @@ import { registerCardRoutes } from './routes/cards.ts';
 import { registerSearchRoutes } from './routes/search.ts';
 import { registerTaskRoutes } from './routes/tasks.ts';
 import { registerChatRoute } from './routes/chat.ts';
+import { registerSandboxRoutes, DEFAULT_LIMITS, ownerOfSession } from './routes/sandbox.ts';
 import { registerAuthRoutes } from './routes/auth.ts';
 import { registerRbacRoutes } from './routes/rbac.ts';
 import { installAuth } from './auth/middleware.ts';
@@ -270,6 +274,141 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   }
   Object.assign(handlers, extraHandlers);
 
+  // ── 检索层（`src/retrieval/**`，kg-rag-architect 交付）─────────────────
+  // 动态接入：未交付/导入失败 → deps.retrieval=null → chat 按 `retrieval:'none'` 走、不报错
+  // （与 providers/agent 同一策略："缺谁都能起"）。
+  const retrievalMod = await tryImport<{
+    createRetrievalFacade?: (opts: { db: Db; repo: Repo; edgeTypes?: string[] }) => NonNullable<AppDeps['retrieval']>;
+  }>('./retrieval/index.ts');
+  let retrieval: AppDeps['retrieval'] = null;
+  if (typeof retrievalMod.mod?.createRetrievalFacade === 'function') {
+    try {
+      retrieval = retrievalMod.mod.createRetrievalFacade({
+        db,
+        repo,
+        // 边类型来自 contracts/schema（封闭枚举）→ kg 的"传递闭包只走 DEPENDS_ON/PART_OF"据此判定
+        ...(enums.edgeTypes?.length ? { edgeTypes: enums.edgeTypes } : {}),
+      });
+      process.stderr.write('[retrieval] 检索层已接入（wiki/kg/rag 三模式各自独立探测）\n');
+    } catch (err) {
+      process.stderr.write(
+        `[retrieval] 组装失败 → 按未接入处理（chat 走 none）：${redact(err instanceof Error ? err.message : String(err))}\n`,
+      );
+      retrieval = null;
+    }
+  } else {
+    process.stderr.write('[retrieval] 未接入（createRetrievalFacade 不可用）→ chat 按 none 走\n');
+  }
+
+  // ── 学生 SQL 沙箱：AI 答疑处理器（pi-bridge 的 `createAskHandler`）─────────
+  // 动态接入 → 未就绪时 `/sandbox/ask` 如实 503（不假装能答疑）。
+  const askMod = await tryImport<{
+    createAskHandler?: (deps: Record<string, unknown>) => AppDeps['sandboxAsk'];
+  }>('./sandbox/ask.ts');
+  let sandboxAsk: AppDeps['sandboxAsk'] = null;
+  if (typeof askMod.mod?.createAskHandler === 'function') {
+    try {
+      /** 会话 id → 所有者（可逆编码，见 `routes/sandbox.ts::ownerOfSession`）。 */
+      const ownerOf = (sid: string): string | null => ownerOfSession(sid);
+      /** 沙箱库根目录（必须与 `routes/sandbox.ts` 一致，否则答疑读到的是另一个库！）。 */
+      const sandboxRoot = path.join(cfg.dataDir, 'sandbox');
+      const workerCall = async (job: string, input: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        const r = await runner.raw({ job, input: { ...input, root: sandboxRoot }, timeoutMs: 30_000 });
+        return r.ok && r.result ? r.result : {};
+      };
+      sandboxAsk = askMod.mod.createAskHandler({
+        // schema 与最近执行都走 **worker job**（与 /sandbox/schema、/sandbox/history 同源 → 不会有两套真相）
+        getSchema: async (sessionId: string) => {
+          const owner = ownerOf(sessionId);
+          if (!owner) return null;
+          const out = await workerCall('sandbox.schema', { user_id: owner, session_id: sessionId });
+          return Object.keys(out).length > 0 ? (out as never) : null;
+        },
+        getRecentExecutions: async (sessionId: string, limit: number) => {
+          const owner = ownerOf(sessionId);
+          if (!owner) return [] as never;
+          const out = await workerCall('sandbox.history', {
+            user_id: owner,
+            session_id: sessionId,
+            limit,
+            request_user_id: owner,
+          });
+          return ((out.entries as unknown[]) ?? []) as never;
+        },
+        resolveUserId: (sessionId: string) => ownerOf(sessionId),
+        // 知识库检索：复用 `store/search.ts`（bigram/坑 15、16 已处理），映射成 ask 要的形状
+        search: async (q: string, opts?: { limit?: number }) => {
+          const res = searchKb(db, repo, q, { limit: opts?.limit ?? 5 });
+          return res.hits.map((h: SearchHit) => ({
+            kind: h.kind,
+            ref_id: h.ref_id,
+            title: h.title,
+            snippet: (h as { snippet?: string }).snippet ?? '',
+            ...(typeof h.score === 'number' ? { score: h.score } : {}),
+            ...(h.doc_id ? { doc_id: h.doc_id } : {}),
+          })) as never;
+        },
+        onDiagnostic: (m: string) => process.stderr.write(`[sandbox.ask] ${redact(m)}\n`),
+        audit: (event: Record<string, unknown>) => {
+          try {
+            repo.rbac.audit({
+              userId: (event.userId as string | null) ?? null,
+              action: 'log_read',
+              target: String(event.sessionId ?? ''),
+              detail: event,
+            });
+          } catch {
+            /* 审计失败不影响答疑 */
+          }
+        },
+      });
+      process.stderr.write('[sandbox] AI 答疑已接入\n');
+    } catch (err) {
+      process.stderr.write(
+        `[sandbox] 答疑组装失败 → /sandbox/ask 会如实 503：${redact(err instanceof Error ? err.message : String(err))}\n`,
+      );
+      sandboxAsk = null;
+    }
+  } else {
+    process.stderr.write('[sandbox] 答疑未接入（createAskHandler 不可用）→ /sandbox/ask 如实 503\n');
+  }
+
+  // ── 系统设置 + 模型热切换（video-pipeline 交付；动态接入）────────────────
+  // 分工：`settings.json` 运行期可改（热重载）· `providers.yaml` 部署期 · `.env` 只放凭据。
+  // ⚠️ **非法配置 → 拒绝启动 + 可读原因**（spec §1）：`watchSettings` 抛 SettingsError 时
+  //    这里**必须把它抛出去**，绝不"静默用默认值"跑起来 —— 那会让运维以为自己的改动生效了。
+  const settingsMod = await tryImport<{
+    watchSettings?: (opts: { root: string }) => { get: () => unknown };
+    sandboxLimitsOf?: (s: unknown) => Record<string, unknown>;
+  }>('./settings/index.ts');
+  const settingsRoutesMod = await tryImport<{
+    createSettingsRoutes?: (deps: Record<string, unknown>) => (app: FastifyInstance) => Promise<void> | void;
+    settingsCapabilities?: (store: unknown, switcher?: unknown) => Record<string, unknown>;
+  }>('./routes/settings.ts');
+
+  let settingsStore: { get: () => unknown } | null = null;
+  if (typeof settingsMod.mod?.watchSettings === 'function') {
+    try {
+      settingsStore = settingsMod.mod.watchSettings({ root: cfg.root });
+      process.stderr.write('[settings] settings.json 已加载并开启热重载\n');
+    } catch (err) {
+      throw new Error(
+        `settings.json 配置非法，拒绝启动：${redact(err instanceof Error ? err.message : String(err))}`,
+      );
+    }
+  } else {
+    process.stderr.write('[settings] 未接入（watchSettings 不可用）→ /settings/* 不注册\n');
+  }
+
+  /** `/capabilities` 的 settings 段数据（video-pipeline 提供；未接入时返回 null）。 */
+  const settingsCapabilitiesFn =
+    settingsStore && typeof settingsRoutesMod.mod?.settingsCapabilities === 'function'
+      ? (): Promise<Record<string, unknown>> =>
+          Promise.resolve(
+            settingsRoutesMod.mod!.settingsCapabilities!(settingsStore, null) as Record<string, unknown>,
+          )
+      : null;
+
   // ── RBAC：首个管理员引导（**仅当库里零用户**；不硬编码口令）──────────
   // 注：`/capabilities` 的 `auth.bootstrap` 按契约只报 **initialized | not_initialized**
   //     （"刚创建"只是启动瞬间的内部状态，不进对外契约）。
@@ -323,6 +462,46 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     agentCapabilities,
     agentError,
     chatFactory,
+    retrieval,
+    sandboxAsk,
+    // 沙箱限制：**实时**取自 settings.json（热重载改了立刻生效）；未接入 → DEFAULT_LIMITS 兜底
+    sandboxLimits: () => {
+      const s = settingsStore?.get();
+      const fn = settingsMod.mod?.sandboxLimitsOf;
+      if (s !== undefined && typeof fn === 'function') {
+        try {
+          return fn(s) as never;
+        } catch (err) {
+          process.stderr.write(`[settings] sandboxLimitsOf 取值失败 → 用内置兜底：${redact(String(err))}\n`);
+        }
+      }
+      return DEFAULT_LIMITS;
+    },
+    settingsCapabilities: settingsCapabilitiesFn,
+    sandboxCapabilities: async () => {
+      const r = await runner.raw({ job: 'sandbox.engines', input: {}, timeoutMs: 30_000 });
+      if (!r.ok || !r.result) {
+        return {
+          available: false,
+          reason: `沙箱引擎探测失败：${r.error?.msg ?? r.error?.code ?? '未知原因'}`,
+          defaultEngine: null,
+          engines: [],
+        };
+      }
+      const out = r.result as { defaultEngine?: string; engines?: unknown[] };
+      const engines = Array.isArray(out.engines) ? out.engines : [];
+      const sqlite = engines.find((e) => (e as { id?: string }).id === 'sqlite') as
+        | { available?: boolean; reason?: string }
+        | undefined;
+      return {
+        available: sqlite?.available !== false,
+        ...(sqlite?.available === false ? { reason: sqlite.reason ?? 'sqlite 引擎不可用' } : {}),
+        defaultEngine: out.defaultEngine ?? 'sqlite',
+        engineCount: engines.length,
+        engines,
+        limits: DEFAULT_LIMITS,
+      };
+    },
     auth: { required: true, bootstrap: bootstrapState },
   };
 
@@ -365,6 +544,25 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   installAuth(app, { repo, cfg });
   registerAuthRoutes(app, deps);
   registerRbacRoutes(app, deps);
+  registerSandboxRoutes(app, deps);
+
+  // ── 注册 video-pipeline 的 `/settings/*` + `/models`（未交付/失败则跳过，不影响其余功能）──
+  if (settingsStore && typeof settingsRoutesMod.mod?.createSettingsRoutes === 'function') {
+    try {
+      await settingsRoutesMod.mod.createSettingsRoutes({
+        cfg,
+        store: settingsStore,
+        repo,
+        queue,
+        providers,
+      })(app);
+      process.stderr.write('[settings] /settings/* 与 /models 已注册\n');
+    } catch (err) {
+      process.stderr.write(
+        `[settings] 路由注册失败（其余功能不受影响）：${redact(err instanceof Error ? err.message : String(err))}\n`,
+      );
+    }
+  }
   registerDocumentRoutes(app, deps);
   registerCardRoutes(app, deps);
   registerSearchRoutes(app, deps);

@@ -28,6 +28,10 @@ from worker.pipeline import extract as extract_legacy
 from worker.pipeline import extract_core as core
 from worker.pipeline import units as units_mod
 from worker.pipeline.llm import (
+    E_LLM_BAD_JSON,
+    E_LLM_EMPTY_CONTENT,
+    E_LLM_SCHEMA,
+    E_LLM_UPSTREAM,
     LLMClient,
     LLMConfig,
     LLMError,
@@ -486,6 +490,221 @@ def test_pick_key_and_stable_ids() -> None:
     assert core.stable_card_id("doc_a", "unt_a", "x").startswith("crd_")
     assert core.stable_entity_id("doc_a", "B+tree") == core.stable_entity_id("doc_a", "b+tree")
     assert core.stable_entity_id("doc_a", "B+tree").startswith("ent_")
+
+
+def test_empty_output_is_distinguishable_from_failure() -> None:
+    """★ polysemy-prober 独立验收发现的静默路径：**输出合法但零产出**。
+
+    模型可以**合理地拒绝抽取**（原文只有一句定义式陈述，提示词本就要求"只抽有实质
+    内容的知识点"）→ 这时 ``cards`` 键会整个缺失。第一版把它与"抽取失败/管线丢卡"
+    表达成同一个结果（``ok:true, error_count:0, cards:0``），调用方无法分辨，
+    前端只能把空知识库当正常完成展示。
+
+    修法：**不改 ``ok`` 语义**（真实失败路径不受影响），加 ``status`` 细分 + ``warnings``。
+    """
+    units = [mk_unit("unt_1", 1, "索引简介", 1, 1, 1,
+                     text="索引 index 是加速查询的数据结构。")]
+    # 他们抓到的**原始 LLM 输出**：只有 section，没有 cards / entities 键
+    refused = {"section": {
+        "section_role": "concept_intro",
+        "section_summary": "本节只有一句定义式陈述……不足以支撑任何操作层面的结论。",
+    }}
+    out = core.convert_payloads(doc_id="doc_x", units=units,
+                                payloads=[{"key": "unt_1#page:1-1", "data": refused}])
+    d = out.to_dict()
+    assert d["ok"] is True and d["error_count"] == 0      # 不是失败
+    assert d["status"] == "done_empty"                    # 但状态可区分
+    assert d["warnings"][0]["code"] == "W_NO_CARDS"
+    assert d["warnings"][0]["cards_key"] == "missing"     # 缺键 ≠ 空数组
+    assert "不足以支撑任何操作层面的结论" in d["warnings"][0]["model_note"]
+    assert d["stats"]["units_no_cards"] == 1
+    assert d["stats"]["units_done"] == 1
+
+    # 有卡片 → done
+    good = {"section": refused["section"], "cards": [
+        {"name": "索引", "kind": "concept", "one_line": "加速查询的数据结构",
+         "purpose": "减少扫描行数", "usage_mode": "server_automatic",
+         "operational_role": "performance", "evidence_quote": "index 是加速查询的数据结构"}]}
+    out2 = core.convert_payloads(doc_id="doc_x", units=units,
+                                 payloads=[{"key": "unt_1#page:1-1", "data": good}])
+    assert out2.to_dict()["status"] == "done" and out2.to_dict()["warnings"] == []
+
+    # 空数组（而非缺键）也要能区分
+    empty_arr = {"section": refused["section"], "cards": [], "entities": [], "edges": []}
+    out3 = core.convert_payloads(doc_id="doc_x", units=units,
+                                 payloads=[{"key": "unt_1#page:1-1", "data": empty_arr}])
+    assert out3.to_dict()["warnings"][0]["cards_key"] == "empty"
+
+    # 全失败（key 对不上）→ failed（与 done_empty 明确不同）
+    out4 = core.convert_payloads(doc_id="doc_x", units=units,
+                                 payloads=[{"key": "unt_缺失#page:9-9", "data": good}])
+    d4 = out4.to_dict()
+    assert d4["ok"] is False and d4["status"] == "failed"
+    assert [e["code"] for e in d4["errors"]] == ["E_PICK_KEY"]
+    assert d4["stats"]["units_failed"] == 1
+
+
+def test_extract_units_status_and_no_cards_warning() -> None:
+    """★ 两条 LLM 路径对"零卡片"的表现**本来就不同**，测试把这个差异钉住：
+
+    | 路径 | 模型省略 ``cards`` 键 | 结果 |
+    |---|---|---|
+    | **B：worker 内调 LLM**（``extract``） | **strict schema 要求该键** → 重试 3 次 → 失败 | `units_failed=3`、`status="failed"`（**本来就响**） |
+    | **A：Node 调模型**（``plan`` → ``convert``） | 输出未经 strict 校验就回传 | **第一版静默**；现在 `status="done_empty"` + `warnings` |
+
+    → polysemy-prober 观测到的静默案例走的正是 **A 路径**；这里两条都断言。
+    """
+    import json as _json
+
+    # ① B 路径：缺 cards 键 → schema 拦下（重试后计失败，不是静默）
+    missing = {"section": {"section_role": "concept_intro",
+                           "section_summary": "内容不足，无法抽取"}}
+    llm = LLMClient(config=cfg(), transport=lambda p: _json.dumps(missing, ensure_ascii=False),
+                    sleep=lambda _s: None)
+    out = core.extract_units(doc_id="doc_x", units=_units3(), llm=llm)
+    d = out.to_dict()
+    assert d["status"] == "failed" and d["ok"] is False
+    assert d["stats"]["units_failed"] == 3
+    assert all(str(e.get("code", "")).startswith("E_LLM") for e in d["errors"]), d["errors"][:1]
+
+    # ② B 路径：schema 合法但 cards 为空数组 → done_empty + 警告
+    llm2 = LLMClient(config=cfg(), transport=lambda p: stub_payload(cards=0, entities=0, edges=0))
+    out2 = core.extract_units(doc_id="doc_x", units=_units3(), llm=llm2)
+    d2 = out2.to_dict()
+    assert d2["ok"] is True and d2["status"] == "done_empty"
+    assert d2["stats"]["units_no_cards"] == 3
+    assert {w["cards_key"] for w in d2["warnings"]} == {"empty"}
+
+    # ③ 有产出 → done，且没有警告
+    out3 = core.extract_units(doc_id="doc_x", units=_units3(),
+                              llm=LLMClient(config=cfg(), transport=lambda p: stub_payload()))
+    assert out3.to_dict()["status"] == "done" and out3.cards
+    assert out3.to_dict()["warnings"] == []
+
+
+def test_llm_empty_content_is_not_success() -> None:
+    """★ 契约 §0：**空 content 不许当成功**（推理模型的推理 token 计入输出预算）。
+
+    polysemy-prober 在 Node 侧实测：``max_tokens=8`` 时 ``content=''``、
+    ``finish_reason='length'``、``reasoning_content`` 437 字符 ——
+    只判 HTTP 200 就会**假绿**。worker 侧同类问题：第一版返回空串 →
+    上层只看到"不是 JSON"，把"预算不足"误诊成"模型输出格式不对"。
+    """
+
+    # 注入 transport 返回的就是**assistant 的 content 本身**（空串 = 空内容）
+    llm = LLMClient(config=cfg(), transport=lambda p: "", sleep=lambda _s: None)
+    with pytest.raises(LLMError) as exc:
+        llm.complete_json(system="s", user="u", schema={"type": "object"})
+    err = exc.value
+    assert err.code == E_LLM_EMPTY_CONTENT
+    assert "没有输出内容" in err.msg
+    assert "max_tokens" in err.hint and "2000" in err.hint
+    # 只有空白也算空（模型有时返回 "\n\n"）
+    llm2 = LLMClient(config=cfg(), transport=lambda p: "   \n ", sleep=lambda _s: None)
+    with pytest.raises(LLMError) as exc2:
+        llm2.complete_text(system="s", user="u")
+    assert exc2.value.code == E_LLM_EMPTY_CONTENT
+
+
+def test_llm_non_json_output_gets_dedicated_code_and_meta() -> None:
+    """非 JSON 输出 → ``E_LLM_BAD_JSON`` + 诊断（不是笼统的 schema 错）。"""
+
+    # transport 直接返回一句自然语言（不是 JSON）
+    llm = LLMClient(config=cfg(), transport=lambda p: "抱歉，我无法完成",
+                    sleep=lambda _s: None)
+    with pytest.raises(LLMError) as exc:
+        llm.complete_json(system="s", user="u", schema={"type": "object"}, max_attempts=2)
+    assert exc.value.code == E_LLM_BAD_JSON
+    assert "不是合法 JSON" in exc.value.msg
+    assert "max_tokens" in exc.value.hint
+    # 对照：**是 JSON 但字段不合规** → 仍然是 E_LLM_SCHEMA（两者处置不同）
+    llm2 = LLMClient(config=cfg(), transport=lambda p: json.dumps({"kind": "乱写的"}),
+                     sleep=lambda _s: None)
+    with pytest.raises(LLMSchemaError) as exc2:
+        llm2.complete_json(system="s", user="u",
+                           schema={"type": "object",
+                                   "properties": {"kind": {"type": "string", "enum": ["concept"]}}},
+                           max_attempts=1)
+    assert exc2.value.code == E_LLM_SCHEMA
+
+
+def test_llm_upstream_5xx_is_retryable_and_keeps_status() -> None:
+    """★ 上游 5xx（如 503 Service Overload）→ ``E_LLM_UPSTREAM``，**保留状态码与 body**。
+
+    实测场景：一次真实 failed 其实源于上游瞬时 503，但错误文案只说"返回非 JSON"
+    → 运维无法分辨"重试即可"与"要改提示词/结构"（polysemy-prober 报的发现 B）。
+    """
+    import httpx
+
+    import worker.pipeline.llm as llm_mod
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"message": "Service Overload"}})
+
+    class _Client(httpx.Client):
+        def __init__(self, **kw):  # noqa: ANN003
+            kw["transport"] = httpx.MockTransport(handler)
+            super().__init__(**kw)
+
+    original = llm_mod.httpx.Client
+    llm_mod.httpx.Client = _Client
+    try:
+        llm = LLMClient(config=cfg(), sleep=lambda _s: None)
+        with pytest.raises(LLMError) as exc:
+            llm.complete_json(system="s", user="u", schema={"type": "object"})
+    finally:
+        llm_mod.httpx.Client = original
+    err = exc.value
+    assert err.code == E_LLM_UPSTREAM
+    assert "HTTP 503" in err.msg
+    assert "Service Overload" in err.detail          # ★ body 片段保留
+    assert getattr(err, "retryable", False) is True
+    assert "重试即可" in err.hint
+
+
+def test_llm_always_sends_explicit_token_budget() -> None:
+    """★ 必须**显式**给 ``max_tokens``：推理 token 计入预算，靠 provider 默认值就是碰运气。
+
+    （Lead 实测：``max_tokens=8`` → content 空；512 → 正常出内容。
+    Node 侧 ``settings.json`` 的 ``llm.maxTokens=16384`` 会随 job 参数进来。）
+    """
+    seen: dict = {}
+
+    def transport(payload: dict) -> str:
+        seen.update(payload)
+        return json.dumps({"ok": 1})
+
+    schema = {"type": "object", "properties": {"ok": {"type": "integer"}}}
+    # ① 未指定 → 用配置默认（8192），**payload 里必须有这个键**
+    llm = LLMClient(config=cfg(), transport=transport)
+    llm.complete_json(system="s", user="u", schema=schema)
+    assert seen["max_tokens"] == 8192
+
+    # ② Node 传 maxTokens → 采纳
+    llm2 = LLMClient(config=cfg(maxTokens=16384), transport=transport)
+    llm2.complete_json(system="s", user="u", schema=schema)
+    assert seen["max_tokens"] == 16384
+    assert llm2.cfg.max_tokens == 16384
+    # 它有正式字段，不该被当成"额外透传"塞进 extra
+    assert "maxTokens" not in llm2.cfg.extra and "max_tokens" not in llm2.cfg.extra
+
+    # ③ 调用方显式覆盖 → 优先
+    llm3 = LLMClient(config=cfg(), transport=transport)
+    llm3.complete_json(system="s", user="u", schema=schema, max_tokens=512)
+    assert seen["max_tokens"] == 512
+
+
+def test_llm_empty_content_wording_is_not_overclaiming() -> None:
+    """措辞不越界：``finish_reason``/reasoning 只是**线索**，不能说成"必然原因"。
+
+    （Lead 实测：8 token 时出现了 ``finish=length``，但不能依赖它 ——
+    判据只看 ``content`` 是否为空。）
+    """
+    llm = LLMClient(config=cfg(), transport=lambda p: "", sleep=lambda _s: None)
+    with pytest.raises(LLMError) as exc:
+        llm.complete_json(system="s", user="u", schema={"type": "object"})
+    assert "没有输出内容" in exc.value.msg
+    assert "很可能" in exc.value.msg or "推理" not in exc.value.msg
 
 
 def test_ancestor_paths() -> None:

@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * WikiIndex —— 知识库浏览（知识库视图）
  *
@@ -342,7 +342,13 @@ const _fmtSpan = fmtSpan
 const _linkify = linkify
 
 watch(() => route.query.doc, (v, old) => {
-  if (v && v !== old) void boot()
+  if (v && v !== old) {
+    // ⚠️ 换文档时**必须清掉上一次的检索结果**：页面不会重载，旧命中会留在屏幕上，
+    //    看起来像"在新文档里搜到了"，其实是另一份文档的结果（对着真后端实测踩到）
+    searchHits.value = []
+    searchTotal.value = 0
+    void boot()
+  }
 })
 
 onMounted(boot)

@@ -57,6 +57,9 @@ interface QueueItem {
   seq: number;
 }
 
+/** 会真的调模型的任务 kind（模型热切换必须等它们跑完 / 或中止它们）。 */
+export const LLM_KINDS: ReadonlySet<string> = new Set(['extract', 'rollup', 'translate', 'mindmap']);
+
 export class TaskQueue {
   private readonly repo: Repo;
   private readonly bus: TaskEventBus;
@@ -69,6 +72,8 @@ export class TaskQueue {
   private readonly activeByUser = new Map<string, number>();
   private seq = 0;
   private stopped = false;
+  /** `pauseAdmissions()` 的开关：true 时**不领新任务**（在跑的跑完为止）。 */
+  private paused = false;
 
   constructor(opts: TaskQueueOptions) {
     this.repo = opts.repo;
@@ -144,6 +149,55 @@ export class TaskQueue {
   /** 优先级升序；同级按入队序（FIFO）。 */
   private sortPending(): void {
     this.pending.sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.seq - b.seq));
+  }
+
+  /**
+   * 暂停"领取新任务"（**drain 语义**：在跑的任务继续跑完，pending 停在队列里不动）。
+   *
+   * 用途：模型热切换的 `mode:"drain"` —— 停准入 → 等当前 LLM 单元跑完 → 切模型 → resume。
+   * 与 `shutdown` 的区别：**不中止任何任务**，也不停服务。
+   */
+  pauseAdmissions(): void {
+    this.paused = true;
+  }
+
+  /** 恢复准入（并立刻调度 pending 里的任务）。 */
+  resumeAdmissions(): void {
+    this.paused = false;
+    this.pump();
+  }
+
+  get admissionsPaused(): boolean {
+    return this.paused;
+  }
+
+  /** 与 `admissionsPaused` getter 等价的**方法**名（Lead 裁定的调用形状；两者都留，避免猜）。 */
+  isAdmissionsPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * 运行中任务的概要 —— 外部（模型热切换）**不必自己猜 kind 语义**。
+   * `isLlm` 按 kind 归类：这些任务会真的调模型，热切换必须等它们（或中止它们）。
+   */
+  runningSummary(): {
+    taskId: string;
+    kind: string;
+    userId: string | null;
+    docId: string | null;
+    isLlm: boolean;
+  }[] {
+    return [...this.active.keys()].map((taskId) => {
+      const row = this.repo.getTaskRow(taskId);
+      const kind = String(row?.kind ?? '');
+      return {
+        taskId,
+        kind,
+        userId: row?.user_id ?? null,
+        docId: row?.doc_id ?? null,
+        isLlm: LLM_KINDS.has(kind),
+      };
+    });
   }
 
   private activeCountFor(userId: string): number {
@@ -292,6 +346,8 @@ export class TaskQueue {
   // ── 内部 ───────────────────────────────────────────────────────────
 
   private pump(): void {
+    // drain 期间：不领新任务（在跑的继续）
+    if (this.paused) return;
     while (!this.stopped && this.active.size < this.concurrency && this.pending.length > 0) {
       this.sortPending(); // 每次取之前重排：新入队的高优先级任务能"插队"
       const item = this.pending.shift() as QueueItem;

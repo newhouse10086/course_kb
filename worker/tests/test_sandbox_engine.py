@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """引擎抽象 + 注册表 + 日志源测试。
 
 ★ 验收项（LAB_DB_DEPLOY §9）：**加一个引擎 = 加 adapter + 配置，不改上层** ——
@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from worker.sandbox import engine as engine_mod
+from worker.sandbox import history as history_mod
 from worker.sandbox import logs as logs_mod
 from worker.sandbox import datasets as ds_mod
 from worker.sandbox.paths import SandboxRoots
@@ -345,10 +346,72 @@ def test_unavailable_log_sources_are_declared(tmp_path: Path) -> None:
 
 def test_prompt_summary_is_bounded_and_honest(tmp_path: Path) -> None:
     text = logs_mod.summarize_for_prompt([])
-    assert "暂无 L1 日志" in text
+    # ★ 空日志要说成"可读但没记录"，不能说成"读不到"（pi-bridge 真机抓到的模型误判）
+    assert "暂无 L1 记录" in text and "不等于读不到日志" in text
     many = [{"at": 1_700_000_000_000, "level": "error", "source": "L1",
              "code": "E_SQL_SYNTAX", "message": "near \"FROM\": syntax error",
              "sql": "SELECT FROM t"} for _ in range(50)]
     out = logs_mod.summarize_for_prompt(many, max_entries=3, max_chars=400)
     assert len(out) <= 400 + 40
     assert out.count("E_SQL_SYNTAX") == 3
+
+
+def test_log_status_fact_sentences() -> None:
+    """★ 状态必须是**中文事实句**：``empty``（可读但没记录）不能说成"读不到"。
+
+    背景：pi-bridge 真机实测到模型把 empty 说成"我暂时读不到该实例的引擎日志" ——
+    事实说错，学生会以为系统坏了。根因是只给了一个英文状态词。
+    """
+    empty_status, empty_fact = logs_mod.status_fact([])
+    assert empty_status == "empty"
+    assert "可读" in empty_fact and "≠" in empty_fact and "不要说" in empty_fact
+
+    ok_status, ok_fact = logs_mod.status_fact([{"level": "error"}, {"level": "info"}])
+    assert ok_status == "ok" and "2 条" in ok_fact and "读到了" in ok_fact
+
+    na_status, na_fact = logs_mod.status_fact([], engine_id="mysql", reason="adapter 未接入")
+    assert na_status == "unavailable" and "读不到" in na_fact and "adapter 未接入" in na_fact
+
+
+def test_log_read_audit_is_not_returned_as_log_content(tmp_path: Path) -> None:
+    """★ 空会话的 ``sandbox.logs`` 必须返回**空 entries**。
+
+    第一版把"谁读了日志"这条审计也当日志返回 → 空会话看起来有 1 条记录，
+    调用方/模型会以为**有执行历史**（"没记录"说成"有记录"，与 empty/unavailable
+    误判是同一类事实错误）。审计**照写**，但不作为日志内容。
+    """
+    roots = SandboxRoots.resolve(tmp_path / "sb")
+    roots.ensure()
+    db = roots.session_path("u1", "s1")
+    ds_mod.load_dataset(db, "sc")
+    src = logs_mod.SqliteLogSource(root=roots)
+
+    # ① 空会话：0 条内容
+    assert src.fetch({"session_id": "s1", "user_id": "u1"}) == []
+    # ② 显式要审计时才给（给测试/审计工具用）
+    with_audit = src.fetch({"session_id": "s1", "user_id": "u1"}, include_audit=True)
+    assert [e.get("kind") for e in with_audit] == ["log_read", "log_read"]   # 两次读各留一条
+    # ③ 审计确实落盘了（只是不混进内容）：上面两次读各留一条
+    rows = history_mod.read(roots, "u1", "s1", limit=10)
+    assert [r.get("kind") for r in rows] == ["LOG_READ", "LOG_READ"]
+
+
+def test_logs_after_execution_show_exactly_the_executions(tmp_path: Path) -> None:
+    """读日志之后再看：entries 只含真实执行（1 成功 + 1 失败），不含审计行。"""
+    from worker.sandbox import exec as exec_mod
+
+    roots = SandboxRoots.resolve(tmp_path / "sb3")
+    roots.ensure()
+    db = roots.session_path("u1", "s1")
+    ds_mod.load_dataset(db, "sc")
+    exec_mod.execute(db_path=db, sql="SELECT 1 AS ok_one", user_id="u1", session_id="s1",
+                     root=str(roots.root))
+    exec_mod.execute(db_path=db, sql="SELECT * FROM nope", user_id="u1", session_id="s1",
+                     root=str(roots.root))
+    src = logs_mod.SqliteLogSource(root=roots)
+    entries = src.fetch({"session_id": "s1", "user_id": "u1", "limit": 20})
+    assert [e["level"] for e in entries] == ["info", "error"]
+    assert entries[0]["sql"] == "SELECT 1 AS ok_one"
+    assert entries[1]["message"] == "no such table: nope"
+    status, fact = logs_mod.status_fact(entries)
+    assert status == "ok" and "2 条" in fact

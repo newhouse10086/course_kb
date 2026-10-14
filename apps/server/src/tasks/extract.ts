@@ -71,6 +71,13 @@ export interface ExtractDocumentRequest {
   /** 只抽前 N 个 item（小样本先跑）；item 粒度由 worker 的 pick 决定 */
   limit?: number;
   excludedRanges?: number[][];
+  /**
+   * 断点文件（`worker/README.md` §7）：worker 每单元落盘（原子替换）。
+   * 模型热切换的 `mode:"abort"` = 存断点 → 终止 → 换模型 → **从断点续推**（不重复计费）。
+   */
+  checkpointFile?: string;
+  /** `true` 时 worker **跳过已完成单元**（必须与同一个 `checkpointFile` 配对才有意义）。 */
+  resume?: boolean;
   signal?: AbortSignal;
   onProgress?: (info: { stage: string; done: number; total: number }) => void;
   onEvent?: (e: Record<string, unknown>) => void;
@@ -82,6 +89,13 @@ export interface ExtractDocumentResult {
   edges: EdgeDraft[];
   /** unit_id → section 概括（F3 的叶子层摘要来源） */
   sections: Record<string, SectionSummary>;
+  /**
+   * ★ worker 自报的批次状态：`done` | `done_empty` | `partial` | `failed`。
+   * `done_empty` = 全部成功但**零卡片**（内容不足）→ 调用方**不许当成功**（见 `EXTRACT_STATUS`）。
+   */
+  status?: string;
+  /** 零卡片/部分失败时的告警（`W_NO_CARDS` 带**模型自己的解释** `model_note`，可直接给学生看） */
+  warnings?: unknown[];
   usedProvider?: string;
   degradedFrom?: string;
   degradedReason?: string;
@@ -199,6 +213,12 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
           pages_total: req.pagesTotal ?? 0,
           ...(deps.chunkChars ? { chunk_chars: deps.chunkChars } : {}),
           ...(req.excludedRanges ? { excluded_ranges: req.excludedRanges } : {}),
+          // ★ 断点续跑（模型热切换 `mode:"abort"` 依赖它）：
+          //   契约 `worker/README.md` §7 —— `payload.checkpoint_file` + `resume:true`
+          //   会**跳过已完成单元**。原实现没转发这两个字段 → "终止后 resume" 其实是
+          //   **从头重跑**（静默重复计费，正是 spec 要避免的）。这里必须透传。
+          ...(req.checkpointFile ? { checkpoint_file: req.checkpointFile } : {}),
+          ...(req.resume ? { resume: true } : {}),
         },
         ...(req.signal ? { signal: req.signal } : {}),
         ...(req.onEvent ? { onEvent: req.onEvent } : {}),
@@ -296,6 +316,8 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
           max_pages: maxPages,
           pages_total: req.pagesTotal ?? 0,
           ...(req.excludedRanges ? { excluded_ranges: req.excludedRanges } : {}),
+          ...(req.checkpointFile ? { checkpoint_file: req.checkpointFile } : {}),
+          ...(req.resume ? { resume: true } : {}),
         },
         ...(req.signal ? { signal: req.signal } : {}),
         ...(req.onEvent ? { onEvent: req.onEvent } : {}),
@@ -376,6 +398,9 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
         entities,
         edges,
         sections,
+        // ★ 透传 worker 的批次状态与告警（`done_empty` 必须能被上层看见，不许当成功）
+        ...(asString(conv.status) ? { status: asString(conv.status) } : {}),
+        ...(asArray(conv.warnings).length > 0 ? { warnings: asArray(conv.warnings) } : {}),
         ...(usedProvider ? { usedProvider } : {}),
         ...(degradedFrom ? { degradedFrom, degradedReason } : {}),
         stats: {

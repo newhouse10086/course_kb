@@ -1,0 +1,57 @@
+{
+  "$schema": "./settings.schema.json",
+  "version": 1,
+  "llm": {
+    "active": "deepseek-v4.1-flash",
+    "fallbacks": [
+      "glm-5.3",
+      "kimi-k3"
+    ],
+    "temperature": 0,
+    "maxTokens": 16384,
+    "structured": {
+      "jsonSchemaStrict": true
+    },
+    "concurrency": 1
+  },
+  "asr": {
+    "active": "local-fw",
+    "model": "tiny",
+    "fallbacks": [
+      "aliyun-asr"
+    ]
+  },
+  "tts": {
+    "active": null
+  },
+  "translate": {
+    "active": "llm-mt",
+    "glossaryMode": "inject",
+    "keepIdentifiers": true
+  },
+  "sandbox": {
+    "enabled": true,
+    "engine": "sqlite",
+    "limits": {
+      "maxRows": 200,
+      "timeoutMs": 3000,
+      "maxDbBytes": 20971520
+    },
+    "allowWrites": true,
+    "resetPolicy": "per_session"
+  },
+  "quota": {
+    "student": {
+      "concurrentLlmTasks": 1,
+      "dailyLlmCalls": 200
+    },
+    "teacher": {
+      "concurrentLlmTasks": 2,
+      "dailyLlmCalls": 2000
+    }
+  },
+  "hotReload": {
+    "watch": true,
+    "debounceMs": 500
+  }
+}
