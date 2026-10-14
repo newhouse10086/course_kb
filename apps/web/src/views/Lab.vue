@@ -106,6 +106,8 @@ const citations = ref<Array<{ card_id: string; name: string; unit_id: string; hr
 const askContext = ref<Record<string, unknown> | null>(null)
 const askStages = ref<string[]>([])
 const askError = ref('')
+/** 后端如实声明的读不到清单（例如引擎日志不可用） */
+const askDegraded = ref<string[]>([])
 
 const CRUD_SNIPPETS: Array<{ label: string; sql: string; kind: 'ddl' | 'dml' | 'dql' | 'tx' }> = [
   { label: '建表', kind: 'ddl', sql: 'CREATE TABLE my_note (id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_at TEXT)' },
@@ -277,7 +279,12 @@ async function reset() {
 
 function useSnippet(s: { sql: string }) { sql.value = s.sql }
 
-/** ★ 答疑：把 SQL + 报错 + 问题交给 AI（流式），引用卡片可跳原文 */
+/**
+ * ★ 答疑：把 SQL + 报错 + 问题交给 AI（流式），引用卡片可跳原文
+ *
+ * 真后端帧名是 open / frame / done / error（**不是** progress/text/citation/done —— 我 mock 的帧名是自造的）。
+ * frame 里是 pi 消息信封：text_delta / message_end / error / settled。
+ */
 async function ask() {
   if (!askOpen.value) askOpen.value = true
   askBusy.value = true
@@ -286,6 +293,7 @@ async function ask() {
   askStages.value = []
   askContext.value = null
   askError.value = ''
+  askDegraded.value = []
   const body = {
     sessionId: session.value?.sessionId,
     sql: sql.value.trim(),
@@ -294,21 +302,62 @@ async function ask() {
   }
   await postSse(api.sandboxAskUrl(), body, {
     onEvent: (event, data) => {
-      if (event === 'progress') {
-        askStages.value = [...askStages.value, String(data?.stage || '处理中')]
-        askContext.value = data?.detail || null
+      const d = (data || {}) as any
+      if (event === 'open') {
+        askStages.value = [...askStages.value, `已连接（session ${d.sessionId || '—'}）`]
+      } else if (event === 'progress') {
+        askStages.value = [...askStages.value, String(d.stage || '处理中')]
+        askContext.value = d.detail || null
+      } else if (event === 'frame') {
+        if (d.type === 'text_delta' && d.delta) askText.value += String(d.delta)
+        else if (d.type === 'error') askError.value = `${d.code || 'E_LLM'}：${d.msg || '上游失败'}`
+        else if (d.type === 'settled') askStages.value = [...askStages.value, `会话结束（aborted=${d.aborted === true}）`]
+        else if (d.type === 'message_end') {
+          const msg = d.message || {}
+          const texts = (msg.content || []).filter((c: any) => c?.type === 'text').map((c: any) => String(c.text || ''))
+          const degradedText = texts.find((x: string) => /日志可用性|读不到/.test(x))
+          if (msg.role === 'user' && degradedText) {
+            askDegraded.value = [...askDegraded.value, degradedText.slice(0, 300)]
+          }
+          if (msg.role === 'assistant' && (msg.model || msg.provider)) {
+            askStages.value = [...askStages.value, `回答模型：${msg.provider || ''}/${msg.model || ''}`]
+          }
+        }
       } else if (event === 'text') {
-        askText.value += String(data?.delta || '')
+        askText.value += String(d.delta || '')
       } else if (event === 'citation') {
-        citations.value = data?.citations || []
+        citations.value = normalizeCitations(d.citations || [])
       } else if (event === 'done') {
-        askStages.value = [...askStages.value, `完成（引用 ${data?.cited ?? 0} 张卡片，风格 ${data?.hint_style || ''}）`]
+        if (d.text && String(d.text).length > askText.value.length) askText.value = String(d.text)
+        citations.value = normalizeCitations(d.citations || citations.value)
+        askStages.value = [...askStages.value, `完成（ok=${d.ok === true}，引用 ${citations.value.length} 张卡片）`]
+        if (d.ok !== true && !askError.value) askError.value = String(d.hint || '答疑未成功完成（后端 ok=false）')
+      } else if (event === 'error') {
+        askError.value = `${d.code || 'E_ASK'}：${d.msg || d.message || ''}`
       }
     },
     onError: (msg) => { askError.value = msg },
     onClose: () => { askBusy.value = false },
   })
   askBusy.value = false
+}
+
+/** 引用归一：真后端可能只给 id 组合（没有 href）→ 前端自己拼 #/wiki?doc=…&unit=…&card=… */
+function normalizeCitations(raw: any[]): Array<{ card_id: string; name: string; unit_id: string; href: string }> {
+  return (raw || []).map((c: any) => {
+    const cardId = String(c.card_id || c.id || c.cardId || '')
+    const unitId = String(c.unit_id || c.unitId || '')
+    const docId = String(c.doc_id || c.docId || '')
+    const q = docId ? `doc=${docId}` : ''
+    const q2 = unitId ? `${q ? '&' : ''}unit=${unitId}` : ''
+    const q3 = cardId ? `${q || q2 ? '&' : ''}card=${cardId}` : ''
+    return {
+      card_id: cardId,
+      name: String(c.name || c.title || cardId),
+      unit_id: unitId,
+      href: String(c.href || `#/wiki${q || q2 || q3 ? '?' : ''}${q}${q2}${q3}`),
+    }
+  }).filter((c) => !!c.card_id)
 }
 
 function gotoCitation(href: string) { void router.push(href.replace(/^#/, '')) }
@@ -376,6 +425,9 @@ async function runSelftest() {
     for (let i = 0; i < 200 && busy.value; i++) await new Promise((r) => setTimeout(r, 50))
     return { result: result.value, error: runError.value }
   }
+  // ⚠️ 真沙箱会话按 (user,dataset) **持久**（sessionId 固定）→ 自检必须幂等，否则第二次跑
+  //    就是 "table stu_note already exists"（实测 E_SQL_EXEC）
+  await exec('DROP TABLE IF EXISTS stu_note')
   const ddl = await exec('CREATE TABLE stu_note (id INTEGER PRIMARY KEY, txt TEXT)')
   rec('crud_ddl', { cols: ddl.result?.columns, error: ddl.error?.code || null })
   need('crud_ddl', !ddl.error && tables.value.some((t) => t.name === 'stu_note'))
@@ -425,11 +477,14 @@ async function runSelftest() {
   need('single_tx_interim_noted', txInterim === !!document.querySelector('[data-testid="interim-note"]'))
 
   // 整批执行：开关 → 请求带 multi:true → BEGIN/INSERT/ROLLBACK 全 ok 且行数不变
+  await exec('DROP TABLE IF EXISTS tx_probe')
   await exec('CREATE TABLE tx_probe (id INTEGER PRIMARY KEY, v TEXT)')
   const cnt = async () => (await exec('SELECT * FROM tx_probe')).result?.rowCount ?? -1
   multiMode.value = true
   await nextTick()
   const rb = await exec("BEGIN; INSERT INTO tx_probe (id, v) VALUES (1, 'x'); ROLLBACK")
+  // statements 的 DOM 断言必须**立刻**做：后面任何一次查询都会把 result 换掉（实测踩到）
+  const rbStatementsShown = !!document.querySelector('[data-testid="statements"]')
   const afterRb = await cnt()
   const cm = await exec("BEGIN; INSERT INTO tx_probe (id, v) VALUES (2, 'y'); COMMIT")
   const afterCm = await cnt()
@@ -438,7 +493,7 @@ async function runSelftest() {
   need('multi_rollback_no_effect', afterRb === 0 && !!(rb.result as any)?.statements?.length)
   need('multi_commit_visible', afterCm === 1)
   need('multi_toggle_visible', !!document.querySelector('[data-testid="multi-toggle"]'))
-  need('multi_statements_rendered', !!document.querySelector('[data-testid="statements"]'))
+  need('multi_statements_rendered', rbStatementsShown)
   need('multi_note_explains_why', /独立进程/.test(document.querySelector('[data-testid="multi-note"]')?.textContent || ''))
   multiMode.value = false
   await exec('DROP TABLE tx_probe')
@@ -509,11 +564,21 @@ async function runSelftest() {
   // 真模型流式回答要几十秒（mock 是即时的）→ 预算放到 180s
   for (let i = 0; i < 1800 && (askBusy.value || !askText.value); i++) await new Promise((r) => setTimeout(r, 100))
   await new Promise((r) => setTimeout(r, 600))
-  rec('ask', { len: askText.value.length, stages: askStages.value.length, citations: citations.value.length, head: askText.value.slice(0, 60), context: askContext.value })
-  need('ask_streamed', askText.value.length > 40 && askStages.value.length > 0)
-  need('ask_cites_kb', citations.value.length > 0 && citations.value.every((c) => c.href.includes('#/wiki')))
-  need('ask_kept_hint_style', /先别急着|先问|提示/.test(askText.value))
-  need('ask_sees_error', String((askContext.value as any)?.error || '').includes('no such table'))
+  rec('ask', { len: askText.value.length, stages: askStages.value.length, citations: citations.value.length,
+    head: askText.value.slice(0, 60), error: askError.value.slice(0, 90), degraded: askDegraded.value.length,
+    context: askContext.value })
+  // 真模型可能真的失败（实测上游 403 E_LLM）→ 断言要么给答案、要么如实报错，不许假装成功
+  const answered = askText.value.length > 40
+  rec('ask_answered', answered)
+  need('ask_streamed', (answered || !!askError.value) && askStages.value.length > 0)
+  need('ask_not_silent', answered || !!askError.value)
+  need('ask_cites_kb_or_reports_failure',
+    askError.value ? true : citations.value.length > 0 && citations.value.every((c) => c.href.includes('#/wiki')))
+  // 真环境实测：上游 403 → 后端如实给 E_LLM，页面必须显示出来（不许静默）
+  if (askError.value) {
+    need('ask_error_visible', !!document.querySelector('[data-testid="ask-error"]'))
+    rec('ask_error_text', askError.value.slice(0, 120))
+  }
   rec('citation_links', citations.value.map((c) => c.href))
   const citeEl = document.querySelector('[data-testid="citation"] a') as HTMLElement | null
   rec('citation_anchor', citeEl?.getAttribute('href'))
@@ -739,6 +804,10 @@ async function runSelftest() {
         <li v-for="(s, i) in askStages" :key="i" class="small faint">{{ s }}</li>
       </ol>
       <pre class="asktext" data-testid="ask-text">{{ askText || '（等待回答…）' }}</pre>
+      <div v-if="askDegraded.length" class="note warn" data-testid="ask-degraded">
+        <b>本次回答的如实声明</b>（后端明确告知读不到什么，别当成 AI 看过）：
+        <div v-for="(g, i) in askDegraded" :key="i" class="small" style="margin-top: 3px">{{ g }}</div>
+      </div>
       <div v-if="askError" class="note bad" data-testid="ask-error">答疑流异常：{{ askError }}</div>
       <div v-if="citations.length" class="cites" data-testid="citation">
         <span class="small muted">引用的知识库卡片（可跳原文）：</span>

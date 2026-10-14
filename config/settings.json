@@ -2,7 +2,7 @@
   "$schema": "./settings.schema.json",
   "version": 1,
   "llm": {
-    "active": "glm-5.3",
+    "active": "kimi-k3",
     "fallbacks": [
       "glm-5.3",
       "kimi-k3"

@@ -297,11 +297,16 @@ async function runSelftest() {
   const need = (k: string, cond: boolean) => { if (!cond) failed.push(k) }
 
   // ① 运行中：直接热切必须被拒（走真按钮 → 真请求）
+  //    真环境可能**空闲**（实测 busy=false）→ 分两条路各自断言，不能假设"一定有任务在跑"
+  const idle = !running.value
+  rec('idle', idle)
   rec('running_task', running.value ? `${running.value.kind} ${running.value.done}/${running.value.total}` : null)
   rec('progress_pct', progressPct.value)
-  need('running_visible', !!running.value && progressPct.value > 0)
+  // 空闲时没有进度条可言（进度 > 0 只在真有任务时才要求）
+  need('running_visible', idle ? true : progressPct.value > 0)
   rec('switch_button_label', switchLabel.value)
-  need('switch_label_abort', switchLabel.value === '终止并切换')
+  // 空闲时按钮是"切换模型"；有任务时必须是"终止并切换"（两种都对，取决于真实队列状态）
+  need('switch_label_abort', idle ? switchLabel.value === '切换模型' : switchLabel.value === '终止并切换')
 
   const sel = document.querySelector('[data-testid="model-select"]') as HTMLSelectElement | null
   const btn = document.querySelector('[data-testid="btn-switch"]') as HTMLButtonElement | null
@@ -323,8 +328,25 @@ async function runSelftest() {
     rec('confirm_required', confirmOpen.value)
     need('confirm_required', confirmOpen.value === true)
     rec('confirm_default_mode', confirmMode.value)
-    need('confirm_mode_abort_when_running', confirmMode.value === 'abort')
+    need('confirm_mode_abort_when_running', idle ? confirmMode.value === 'now' : confirmMode.value === 'abort')
 
+    // ② 空闲时：走**502 探测失败 + 回滚**路径（用不存在的模型名，安全，不改任何状态）
+    if (idle) {
+      const before = activeModel.value
+      picked.value = 'no-such-model-xyz'
+      confirmMode.value = 'now'
+      await doSwitch()
+      rec('probe_failed_rollback', { note: note.value.slice(0, 90), kind: noteKind.value, active: activeModel.value })
+      need('probe_failed_rollback', note.value.includes('回滚') && activeModel.value === before)
+      rec('idle_path_verified', true)
+      // 真环境空闲 → 409/断点续推只能靠契约 mock 覆盖（README §4 已说明）
+      rec('busy_path', 'skipped(idle)：无运行中任务，409 E_MODEL_BUSY 与断点续推由契约 mock 覆盖')
+      picked.value = before
+      writeReport('selftest-report', { ok: failed.length === 0, checks, failed })
+      const box = document.getElementById('selftest-panel')
+      if (box) box.textContent = failed.length === 0 ? '自检通过（空闲路径 + 502 回滚）' : `自检未通过：${failed.join(', ')}`
+      return { ok: failed.length === 0, checks, failed }
+    }
     // ② 先试 mode=now（运行中）→ 409 E_MODEL_BUSY
     confirmMode.value = 'now'
     await doSwitch()

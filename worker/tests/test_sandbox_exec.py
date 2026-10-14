@@ -368,6 +368,51 @@ def test_history_is_isolated_and_redacted(roots: SandboxRoots) -> None:
     assert callable(history_mod.append) and callable(history_mod.read)
 
 
+def test_runner_stdin_is_explicit_utf8(sc_db: Path, roots: SandboxRoots) -> None:
+    """★ 第二个 stdin 解码点：**沙箱执行体**（`worker/sandbox/runner.py`）。
+
+    它同样从 stdin 读 payload —— 第一版也是 `sys.stdin.read()`（按语言环境解码），
+    中文 SQL/中文数据会**静默乱码**。生产路径上 `exec.py` 会注入 `PYTHONIOENCODING=utf-8`
+    掩盖了它；这里**故意用敌意环境**（清掉该变量 + `PYTHONUTF8=0`）直接调 runner，
+    证明它**自己**就正确。
+    """
+    import json as _json
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+
+    env = {k: v for k, v in _os.environ.items()
+           if k.upper() not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+    env["PYTHONUTF8"] = "0"
+    repo_root = str(Path(__file__).resolve().parents[2])
+    payload = {"db_path": str(sc_db), "root": str(roots.root),
+               "sql": "SELECT sname FROM students WHERE dept='计算机' ORDER BY sid",
+               "max_rows": 10, "timeout_ms": 5000}
+    proc = _sp.run([_sys.executable, "-m", "worker.sandbox.runner"],
+                   input=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                   capture_output=True, cwd=repo_root, env=env, timeout=60)
+    out = _json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
+    assert out.get("error") is None, out
+    # 精确值（不是"非空"）：中文姓名必须完好
+    assert out["rows"] == [["张三"], ["李四"]], out["rows"]
+
+    # 中文写入也要完好（INSERT 后回读）
+    payload2 = {**payload, "sql": "CREATE TABLE t_cn(v TEXT)"}
+    _sp.run([_sys.executable, "-m", "worker.sandbox.runner"],
+            input=_json.dumps(payload2, ensure_ascii=False).encode("utf-8"),
+            capture_output=True, cwd=repo_root, env=env, timeout=60)
+    payload3 = {**payload, "sql": "INSERT INTO t_cn(v) VALUES('中文写入')"}
+    _sp.run([_sys.executable, "-m", "worker.sandbox.runner"],
+            input=_json.dumps(payload3, ensure_ascii=False).encode("utf-8"),
+            capture_output=True, cwd=repo_root, env=env, timeout=60)
+    payload4 = {**payload, "sql": "SELECT v FROM t_cn"}
+    proc4 = _sp.run([_sys.executable, "-m", "worker.sandbox.runner"],
+                    input=_json.dumps(payload4, ensure_ascii=False).encode("utf-8"),
+                    capture_output=True, cwd=repo_root, env=env, timeout=60)
+    out4 = _json.loads(proc4.stdout.decode("utf-8").strip().splitlines()[-1])
+    assert out4["rows"] == [["中文写入"]], out4["rows"]
+
+
 def test_db_size_cap_rolls_back_write(roots: SandboxRoots) -> None:
     """★ 库大小上限：超出 → `E_SANDBOX_SIZE` **且回滚本次写入**（规格 §7.5）。
 

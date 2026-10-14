@@ -69,12 +69,16 @@ def decode_payload_bytes(data: bytes, *, source: str = "stdin") -> str:
     for bom, encoding in _BOMS:
         if raw.startswith(bom):
             try:
-                return raw.decode(encoding)
+                text = raw.decode(encoding)
             except UnicodeDecodeError as exc:
                 raise PayloadEncodingError(
                     f"{source} 的 BOM 声明为 {encoding}，但解码失败：{exc}",
                     detail=f"前 {_ERROR_SNIPPET_BYTES} 字节：{raw[:_ERROR_SNIPPET_BYTES]!r}",
                 ) from exc
+            # ⚠️ 用显式 codec（`utf-16-le`）解码时 BOM 会**留在文本里**（U+FEFF），
+            #    而 `json.loads` 见到它会直接报 "Unexpected UTF-8 BOM"。
+            #    `utf-8-sig` 会自动去掉，`utf-16-le` 不会 → 统一在这里剥一次。
+            return text[1:] if text.startswith("\ufeff") else text
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as exc:

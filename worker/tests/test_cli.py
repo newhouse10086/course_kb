@@ -792,11 +792,18 @@ def test_bom_file_is_accepted(tmp_path) -> None:
     code, events, _o, _e = run_cli(["--job", "search", "--in", str(f)])
     assert code == 0 and result_of(events)["terms"] == ["索引"]
 
-    # UTF-16LE（`Set-Content -Encoding Unicode` 的产物）同样按 BOM 识别
+    # UTF-16LE：PowerShell 的 `Set-Content -Encoding Unicode` **会写 BOM** → 按 BOM 识别
     f2 = tmp_path / "u16.json"
-    f2.write_bytes('{"job":"search","q":"事务"}'.encode("utf-16-le"))
+    f2.write_bytes(b"\xff\xfe" + '{"job":"search","q":"事务"}'.encode("utf-16-le"))
     code2, events2, _o, _e = run_cli(["--job", "search", "--in", str(f2)])
     assert code2 == 0 and result_of(events2)["terms"] == ["事务"]
+
+    # ⚠️ **无 BOM** 的 UTF-16 **不做猜测**（猜编码会引入更隐蔽的错误）→ 明确失败
+    f3 = tmp_path / "u16_nobom.json"
+    f3.write_bytes('{"job":"search","q":"事务"}'.encode("utf-16-le"))
+    code3, events3, _o, _e = run_cli(["--job", "search", "--in", str(f3)])
+    assert code3 == 2 and last(events3)["code"] == "E_PAYLOAD"
+    assert "UTF-8" in last(events3)["msg"]
 
 
 def test_invalid_utf8_fails_loudly_not_silently() -> None:

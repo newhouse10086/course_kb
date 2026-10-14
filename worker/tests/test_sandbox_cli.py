@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,9 +23,14 @@ def run_cli(job: str, payload: dict | None = None, timeout: int = 120):
     args = [sys.executable, "-m", "worker.cli", "--job", job]
     if len(blob) < 7000:
         args += ["--in", blob]
+    # ★ 敌意环境（清掉 PYTHONIOENCODING/PYTHONUTF8）：中文 payload 走 stdin 是推荐通道，
+    #   必须证明"不靠调用方的 env 也正确"（历史上这个 bug 被正确 env 掩盖过）
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+    env["PYTHONUTF8"] = "0"
     proc = subprocess.run(args, input=(blob if len(blob) >= 7000 else None),
                           capture_output=True, cwd=str(ROOT), timeout=timeout, text=True,
-                          encoding="utf-8")
+                          encoding="utf-8", env=env)
     events = [json.loads(ln) for ln in proc.stdout.split("\n") if ln.strip()]
     results = [e for e in events if e["type"] == "result"]
     return proc.returncode, (results[-1]["data"] if results else None), (events[-1] if events else None)

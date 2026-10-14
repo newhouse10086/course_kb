@@ -116,6 +116,45 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   // ── 封闭枚举（C3：来自 schema/*.json，不内置兜底）─────────────────
   const enums: SchemaEnums = loadSchemaEnums(cfg.root);
 
+  // ── 系统设置（video-pipeline 交付；**必须在 providers 之前加载**）──────────
+  // 为什么提前：provider 层的 `modelOverride` 要读 `settings.llm.active` —— 那是"热切换"的
+  // **唯一真相源**（否则出现"界面显示新模型、实际请求还在用 providers.yaml 的旧模型"）。
+  // 分工：`settings.json` 运行期可改（热重载）· `providers.yaml` 部署期 · `.env` 只放凭据。
+  // ⚠️ **非法配置 → 拒绝启动 + 可读原因**：`watchSettings` 抛错时**必须**抛出去，
+  //    绝不"静默用默认值"跑起来 —— 那会让运维以为自己的改动生效了。
+  const settingsMod = await tryImport<{
+    watchSettings?: (opts: { root: string }) => { get: () => unknown };
+    sandboxLimitsOf?: (s: unknown) => Record<string, unknown>;
+  }>('./settings/index.ts');
+  let settingsStore: { get: () => unknown } | null = null;
+  if (typeof settingsMod.mod?.watchSettings === 'function') {
+    try {
+      settingsStore = settingsMod.mod.watchSettings({ root: cfg.root });
+      process.stderr.write('[settings] settings.json 已加载并开启热重载\n');
+    } catch (err) {
+      throw new Error(
+        `settings.json 配置非法，拒绝启动：${redact(err instanceof Error ? err.message : String(err))}`,
+      );
+    }
+  } else {
+    process.stderr.write('[settings] 未接入（watchSettings 不可用）→ 模型选择走 providers.yaml/.env\n');
+  }
+
+  /**
+   * 热切换的唯一真相源：`settings.llm.active`。
+   * - 返回 `undefined`（设置层未接入 / 字段缺失）→ provider 层**沿用 providers.yaml**（不改变既有行为）
+   * - 取值抛错 → 也返回 `undefined`（provider 层承诺不因此中断组装）
+   */
+  const activeModelOverride = (): string | undefined => {
+    try {
+      const s = settingsStore?.get() as { llm?: { active?: unknown } } | undefined;
+      const active = s?.llm?.active;
+      return typeof active === 'string' && active.trim() !== '' ? active.trim() : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   // ── providers（T-PROVIDERS 的写域，动态 import）────────────────────
   let providers: ProviderFacade | null = null;
   let providersError: string | null = null;
@@ -124,6 +163,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       config: unknown;
       runWorker: unknown;
       onSkip?: (entry: unknown, reason: string) => void;
+      /** ★ 热切换接点（Lead 铺好）：非空 → 覆盖 LLM provider 的 model；空/抛错 → 沿用配置 */
+      modelOverride?: () => string | undefined;
     }) => ProviderFacade;
   }>('./providers/index.ts');
   if (providerMod.mod?.createProviderLayer) {
@@ -131,6 +172,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       providers = providerMod.mod.createProviderLayer({
         config: cfg.providers,
         runWorker: runner,
+        // ★ 热切换接点：**唯一真相源** = `settings.llm.active`（Lead 已在 providers 侧实现覆盖）
+        modelOverride: activeModelOverride,
         onSkip: (entry, reason) => {
           const id = (entry as { id?: string } | undefined)?.id ?? '?';
           process.stderr.write(`[providers] 跳过 ${id}：${redact(reason)}\n`);
@@ -412,32 +455,11 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     process.stderr.write('[sandbox] 答疑未接入（createAskHandler 不可用）→ /sandbox/ask 如实 503\n');
   }
 
-  // ── 系统设置 + 模型热切换（video-pipeline 交付；动态接入）────────────────
-  // 分工：`settings.json` 运行期可改（热重载）· `providers.yaml` 部署期 · `.env` 只放凭据。
-  // ⚠️ **非法配置 → 拒绝启动 + 可读原因**（spec §1）：`watchSettings` 抛 SettingsError 时
-  //    这里**必须把它抛出去**，绝不"静默用默认值"跑起来 —— 那会让运维以为自己的改动生效了。
-  const settingsMod = await tryImport<{
-    watchSettings?: (opts: { root: string }) => { get: () => unknown };
-    sandboxLimitsOf?: (s: unknown) => Record<string, unknown>;
-  }>('./settings/index.ts');
+  // ── 系统设置：路由注册用的模块引用（**加载已在 providers 之前完成**，见上方注释）──
   const settingsRoutesMod = await tryImport<{
     createSettingsRoutes?: (deps: Record<string, unknown>) => (app: FastifyInstance) => Promise<void> | void;
     settingsCapabilities?: (store: unknown, switcher?: unknown) => Record<string, unknown>;
   }>('./routes/settings.ts');
-
-  let settingsStore: { get: () => unknown } | null = null;
-  if (typeof settingsMod.mod?.watchSettings === 'function') {
-    try {
-      settingsStore = settingsMod.mod.watchSettings({ root: cfg.root });
-      process.stderr.write('[settings] settings.json 已加载并开启热重载\n');
-    } catch (err) {
-      throw new Error(
-        `settings.json 配置非法，拒绝启动：${redact(err instanceof Error ? err.message : String(err))}`,
-      );
-    }
-  } else {
-    process.stderr.write('[settings] 未接入（watchSettings 不可用）→ /settings/* 不注册\n');
-  }
 
   /** `/capabilities` 的 settings 段数据（video-pipeline 提供；未接入时返回 null）。 */
   const settingsCapabilitiesFn =

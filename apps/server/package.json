@@ -11,9 +11,9 @@
     "start": "node src/index.ts",
     "typecheck": "tsc --noEmit",
     "create-admin": "node src/auth/create-admin.ts",
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
-    "test:backend": "node --test --test-concurrency=1 test/store_*.test.ts test/routes_*.test.ts test/rbac_*.test.ts test/sse_*.test.ts test/worker_*.test.ts",
-    "test:worker": "node --test test/worker_framing.test.ts"
+    "test": "node --test --test-force-exit --test-concurrency=1 \"test/**/*.test.ts\"",
+    "test:backend": "node --test --test-force-exit --test-concurrency=1 test/store_*.test.ts test/routes_*.test.ts test/rbac_*.test.ts test/sse_*.test.ts test/worker_*.test.ts",
+    "test:worker": "node --test --test-force-exit test/worker_framing.test.ts"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^1.2.0",
