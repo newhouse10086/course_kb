@@ -538,7 +538,9 @@ def group_sandbox_worker():
         check("sandbox", "可导入 worker.sandbox.runner", False, "可导入",
               f"{type(e).__name__}: {e}", "medium")
         return
-    root = VERIFY / "sandbox"
+    # ⚠️ 沙箱库**必须**在 worker 约定的根目录下（data/sandbox）—— 这是安全设计，
+    #   不是可绕过的配置；验证也用同一目录（子目录 _verify，避免污染真实学生库）。
+    root = KB / "data" / "sandbox" / "_verify"
     root.mkdir(parents=True, exist_ok=True)
     a = root / "stuA.sqlite3"
     b = root / "stuB.sqlite3"
@@ -614,8 +616,9 @@ def group_sandbox_worker():
 
     # ★ 路径越界
     for bad, label in [
-        (root / ".." / ".." / "escape.sqlite3", "../ 逃逸"),
+        (KB / "data" / "escape.sqlite3", "../ 逃逸（沙箱外）"),
         (KB / "data" / "course_kb.sqlite3", "主知识库"),
+        (KB / "data" / "sandbox" / ".." / "escape2.sqlite3", "../ 归一化逃逸"),
     ]:
         try:
             r = run("SELECT 1", bad)
