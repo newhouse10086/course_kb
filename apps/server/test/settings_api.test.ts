@@ -88,6 +88,8 @@ class FakeQueue implements QueueLike {
   readonly runningIds = new Set<string>();
   readonly enqueued: { id: string; input: Record<string, unknown> }[] = [];
   paused = false;
+  /** ★ 模拟真实 `TaskQueue` 的**幂等**暂停时刻（重复 pause **不刷新**） */
+  private pausedAtMs: number | null = null;
   pauseCalls = 0;
   resumeCalls = 0;
   /**
@@ -141,13 +143,27 @@ class FakeQueue implements QueueLike {
   }
 
   pauseAdmissions(): void {
-    this.paused = true;
+    // 幂等：已在暂停中时**不刷新**时刻（backend-api 的真实实现也是这个语义 ——
+    // 否则"暂停超时自动恢复"永远等不到超时）
+    if (!this.paused) {
+      this.paused = true;
+      this.pausedAtMs = Date.now();
+    }
     this.pauseCalls += 1;
   }
 
   resumeAdmissions(): void {
     this.paused = false;
+    this.pausedAtMs = null;
     this.resumeCalls += 1;
+  }
+
+  admissionsPausedAt(): number | null {
+    return this.pausedAtMs;
+  }
+
+  admissionsPausedForMs(now = Date.now()): number | null {
+    return this.pausedAtMs === null ? null : Math.max(0, now - this.pausedAtMs);
   }
 
   get admissionsPaused(): boolean {
@@ -792,6 +808,54 @@ test('★★ 自动兜底恢复：暂停超过时限后**无人干预也会自�
   }
 });
 
+test('★★ 自动兜底也要覆盖**别人发起的暂停**（用队列的 `admissionsPausedAt()`，不只我们自己那次）', async () => {
+  const ctx = await makeCtx({ running: [{ kind: 'extract' }] });
+  try {
+    const { ModelCatalog } = await import('../src/settings/models.ts');
+    const { ModelSwitcher } = await import('../src/settings/switcher.ts');
+    const cat = new ModelCatalog({
+      cfg: ctx.cfg,
+      makeProvider: () => ({
+        info: { id: 'amr', kind: 'llm', label: 'x', vendor: 'x', runtime: 'cloud', configured: true, available: false, capabilities: {} },
+        async healthCheck() {
+          return { ok: true, latencyMs: 1, probe: 'fake' };
+        },
+      }),
+    });
+    const sw = new ModelSwitcher({
+      cfg: ctx.cfg, store: ctx.store, repo: ctx.repo, catalog: cat, queue: ctx.queue,
+      autoResumeMs: 80,
+    });
+    try {
+      // ★ 关键：**绕过我的切换器**，直接停准入（模拟"别人/别的代码路径"暂停）
+      ctx.queue.pauseAdmissions();
+      assert.equal(ctx.queue.admissionsPaused, true);
+      // 状态应如实报出"不是我们发起的"，且暂停时刻来自队列
+      const st = sw.admissionState();
+      assert.equal(st.paused, true);
+      assert.match(st.reason, /非本切换器发起/);
+      assert.equal(typeof st.pausedSince, 'number');
+      assert.equal(st.stillRunning.length, 0, '不是我们发起的，就没有任务快照（如实为空）');
+      assert.ok((st.autoResumeInMs ?? -1) <= 80);
+
+      // 什么都不做 → 也必须被兜底恢复
+      const deadline = Date.now() + 2500;
+      while (ctx.queue.admissionsPaused && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(ctx.queue.admissionsPaused, false, '★ 非本切换器发起的暂停也必须被自动恢复');
+      const audit = ctx.repo.rbac.listAudit({ action: 'admissions_auto_resume' });
+      assert.equal(audit.total, 1);
+      assert.match(String(audit.entries[0]?.detail_json), /"by":"auto"/);
+    } finally {
+      sw.close();
+    }
+  } finally {
+    ctx.store.close();
+    await ctx.app.close();
+  }
+});
+
 test('自动兜底恢复：**手动恢复后定时器要被清掉**（不许之后再冒出一次 auto 事件）', async () => {
   const ctx = await makeCtx({ running: [{ kind: 'extract' }] });
   try {
@@ -944,6 +1008,30 @@ test('switch：并发点两次 → 串行执行（不会互相回滚）', async 
 // ═══════════════════════════════════════════════════════════════════════
 // 6. /capabilities 数据函数 + 热重载对 API 的可见性
 // ═══════════════════════════════════════════════════════════════════════
+
+test('★ switch 响应如实报"两个模型真相源"是否一致（不许让"切换成功"变成局部真相）', async () => {
+  await withCtx({}, async (ctx) => {
+    // ctx 的 providers.yaml 配的是 cfg-model；切到 model-beta → 两个源**不一致**
+    const r1 = await req(ctx, 'POST', '/api/v1/settings/llm/switch', { as: 'admin', body: { model: MODEL_B, mode: 'now' } });
+    assert.equal(r1.status, 200);
+    const ms1 = r1.body.modelSources as { settingsActive: string; providerConfigured: string; consistent: boolean };
+    assert.equal(ms1.settingsActive, MODEL_B);
+    assert.equal(ms1.providerConfigured, 'cfg-model');
+    assert.equal(ms1.consistent, false);
+    assert.equal(
+      (r1.body.notes as string[]).some((n) => /provider 层配置的 model 仍是 cfg-model/.test(n)),
+      true,
+      '必须明确提示"有消费方可能仍用旧模型"',
+    );
+
+    // 切到与 provider 配置一致的那个模型 → consistent:true，且不再有该提示
+    const r2 = await req(ctx, 'POST', '/api/v1/settings/llm/switch', { as: 'admin', body: { model: 'cfg-model', mode: 'now' } });
+    assert.equal(r2.status, 200);
+    const ms2 = r2.body.modelSources as { consistent: boolean };
+    assert.equal(ms2.consistent, true);
+    assert.equal((r2.body.notes as string[]).some((n) => /provider 层配置的 model 仍是/.test(n)), false);
+  });
+});
 
 test('settingsCapabilities()：报 activeModel / switchedFrom / switchedAt（注册由 backend-api 做）', async () => {
   await withCtx({}, async (ctx) => {

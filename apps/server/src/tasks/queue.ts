@@ -74,6 +74,8 @@ export class TaskQueue {
   private stopped = false;
   /** `pauseAdmissions()` 的开关：true 时**不领新任务**（在跑的跑完为止）。 */
   private paused = false;
+  /** 准入被暂停的时刻（`null` = 未暂停）；供"超时自动恢复"判断暂停了多久。 */
+  private pausedSince: number | null = null;
 
   constructor(opts: TaskQueueOptions) {
     this.repo = opts.repo;
@@ -156,14 +158,19 @@ export class TaskQueue {
    *
    * 用途：模型热切换的 `mode:"drain"` —— 停准入 → 等当前 LLM 单元跑完 → 切模型 → resume。
    * 与 `shutdown` 的区别：**不中止任何任务**，也不停服务。
+   *
+   * 幂等：重复调用**不刷新** `admissionsPausedAt()`（保留"第一次被暂停"的时间 ——
+   * 否则"超时自动恢复"会一直以为刚暂停，永远等不到超时 → 队列永久停摆）。
    */
   pauseAdmissions(): void {
+    if (!this.paused) this.pausedSince = Date.now();
     this.paused = true;
   }
 
   /** 恢复准入（并立刻调度 pending 里的任务）。 */
   resumeAdmissions(): void {
     this.paused = false;
+    this.pausedSince = null;
     this.pump();
   }
 
@@ -174,6 +181,22 @@ export class TaskQueue {
   /** 与 `admissionsPaused` getter 等价的**方法**名（Lead 裁定的调用形状；两者都留，避免猜）。 */
   isAdmissionsPaused(): boolean {
     return this.paused;
+  }
+
+  /**
+   * 准入是**什么时候**被暂停的（`null` = 当前未暂停）。
+   *
+   * 为什么要有：调用方（如模型热切换的"drain 超时自动恢复"）只能看到"现在是否暂停"，
+   * 看不到"暂停了多久" → 若暂停由**别的代码路径**触发，它的超时兜底就不会触发，
+   * 队列可能**永久停摆**（全班提交不了任务，只能重启服务）。
+   */
+  admissionsPausedAt(): number | null {
+    return this.pausedSince;
+  }
+
+  /** 已暂停多久（ms）；未暂停 → `null`。 */
+  admissionsPausedForMs(now = Date.now()): number | null {
+    return this.pausedSince === null ? null : Math.max(0, now - this.pausedSince);
   }
 
   /**

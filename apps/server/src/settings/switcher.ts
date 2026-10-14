@@ -48,8 +48,8 @@ export const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
  */
 export const DEFAULT_AUTO_RESUME_MS = 600_000;
 
-/** 自动恢复定时器发现"有切换正在进行"时的重试间隔（ms）。 */
-const AUTO_RESUME_RETRY_MS = 15_000;
+/** 自动恢复守卫的巡检周期上限（ms）：默认 10 分钟时限 → 30s 巡一次，最迟晚 30s 恢复。 */
+const GUARD_MAX_PERIOD_MS = 30_000;
 
 /** 准入闸门的当前状态（`GET /settings/llm` 与 resume 响应都用它）。 */
 export interface AdmissionState {
@@ -88,6 +88,13 @@ export interface QueueLike {
   admissionsPaused?: boolean;
   /** **方法**形式（Lead 裁定的调用形状；`TaskQueue` 两者都留，避免调用方猜） */
   isAdmissionsPaused?(): boolean;
+  /**
+   * ★ 暂停**时刻**（ms）；`null` = 当前未暂停。由 backend-api 提供，**幂等**：
+   * 重复 `pauseAdmissions()` **不刷新**该时刻（否则"超时自动恢复"永远等不到超时 → 永久停摆）。
+   * 有了它，我们才能覆盖**所有**暂停路径（不只我们自己因 drain 超时暂停的那次）。
+   */
+  admissionsPausedAt?(): number | null;
+  admissionsPausedForMs?(now?: number): number | null;
   /** backend-api 新增：直接告诉你哪些是 LLM 任务（比我自己解析 kind 准） */
   runningSummary?(): { taskId: string; kind: string; userId: string | null; docId: string | null; isLlm: boolean }[];
 }
@@ -156,6 +163,23 @@ export interface SwitchResult {
   stillRunning: { id: string; kind: string }[];
   /** 准入闸门状态快照（含"距离自动恢复还有多久"）—— `state:'timeout'` 时尤其要看它 */
   admissions?: AdmissionState;
+  /**
+   * ★ **模型真相源对照**（防"看起来切换成功"）。
+   *
+   * 现状有两个"当前模型"：
+   * - `settings.llm.active`（运行期，**本接口改这个**）
+   * - `config/providers.yaml` 的 `model: ${LLM_MODEL}`（部署期，provider/pi 层实际用的）
+   *
+   * 只有**读 settings 的消费方**才会跟随热切换。若两者不一致而某些调用方仍读
+   * providers.yaml（实测：pi 的 `ready` 帧报的是旧模型），那"切换成功"就是**局部真相** ——
+   * 所以这里**结构化地如实报出来**，让 UI/排障一眼看到，而不是让人自己去猜。
+   */
+  modelSources?: {
+    settingsActive: string;
+    providerConfigured: string;
+    /** 两个真相源是否一致（false = 有消费方可能仍用旧模型） */
+    consistent: boolean;
+  };
   rolledBack: boolean;
   notes: string[];
 }
@@ -205,10 +229,15 @@ export class ModelSwitcher {
   private inFlightSwitches = 0;
   /** 因 drain 超时而**保持暂停**的状态；非 null 表示"准入被我们关着" */
   private paused: { since: number; reason: string; stillRunning: { id: string; kind: string }[] } | null = null;
-  private autoResumeTimer: NodeJS.Timeout | null = null;
+  private guardTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: SwitcherOptions) {
     this.o = opts;
+    // ★ **一开始就起守卫**（不是"等我们暂停时才起"）：
+    //   `queue.pauseAdmissions()` 是公开 API，别人也可能暂停 —— 若守卫只在我们自己
+    //   drain 超时时才武装，那种暂停就**永远没人恢复**（实测：加了这条测试立刻抓到）。
+    //   安全网必须在"谁都还没看"的时候就已经张着。
+    this.ensureGuard();
   }
 
   private autoResumeMs(): number {
@@ -218,19 +247,35 @@ export class ModelSwitcher {
     return Number.isFinite(n) && n >= 0 ? n : DEFAULT_AUTO_RESUME_MS;
   }
 
-  /** 准入闸门当前状态（UI 与 resume 响应用它；**暂停中会如实报还剩多久自动恢复**）。 */
+  /**
+   * 准入闸门当前状态（UI 与 resume 响应用）。
+   *
+   * ⚠️ 暂停时刻**优先取队列的 `admissionsPausedAt()`**（权威，覆盖**所有**暂停路径），
+   * 我们自己的 `this.paused` 只是"我们还记着原因/stillRunning"的补充。
+   * 否则：别人直接 `pauseAdmissions()` 时我们会以为"没暂停"或"刚开始暂停"。
+   */
   admissionState(): AdmissionState {
     const now = this.now();
     const gate = this.gate();
-    const pausedNow = this.paused !== null && (gate ? gate.paused() : true);
+    const pausedNow = gate ? gate.paused() : this.paused !== null;
+    if (!pausedNow) {
+      return {
+        paused: false, pausedForMs: 0, pausedSince: null, reason: '', stillRunning: [], autoResumeInMs: null,
+      };
+    }
+    const fromQueue = this.o.queue?.admissionsPausedAt?.() ?? null;
+    const pausedSince = fromQueue ?? this.paused?.since ?? null;
+    const pausedForMs = pausedSince === null ? 0 : Math.max(0, now - pausedSince);
     const auto = this.autoResumeMs();
     return {
-      paused: pausedNow,
-      pausedForMs: this.paused ? now - this.paused.since : 0,
-      pausedSince: this.paused ? this.paused.since : null,
-      reason: this.paused?.reason ?? '',
+      paused: true,
+      pausedForMs,
+      pausedSince,
+      reason:
+        this.paused?.reason ??
+        (fromQueue !== null ? '准入被暂停（非本切换器发起；已按队列的暂停时刻计时）' : ''),
       stillRunning: this.paused?.stillRunning ?? [],
-      autoResumeInMs: pausedNow && auto > 0 && this.paused ? Math.max(0, auto - (now - this.paused.since)) : null,
+      autoResumeInMs: auto > 0 ? Math.max(0, auto - pausedForMs) : null,
     };
   }
 
@@ -290,46 +335,61 @@ export class ModelSwitcher {
     };
   }
 
-  /** 暂停准入 + 记状态 + 挂自动恢复定时器（只有 drain 超时走这里）。 */
+  /** 暂停准入 + 记状态 + 起自动恢复守卫（只有 drain 超时走这里）。 */
   private markPaused(reason: string, stillRunning: { id: string; kind: string }[]): void {
     this.paused = { since: this.now(), reason, stillRunning };
-    this.armAutoResume();
+    this.ensureGuard();
   }
 
-  private armAutoResume(): void {
-    this.clearAutoResumeTimer();
+  /**
+   * 自动恢复**守卫**（幂等：只挂一个定时器）。
+   *
+   * ⚠️ 为什么用**周期检查**而不是"暂停时挂一次性定时器"：
+   * 一次性定时器只能覆盖**我们自己**造成的暂停；而 `queue.pauseAdmissions()` 是一条**公开 API**，
+   * 别人（或别的代码路径）也能暂停。周期检查 + `queue.admissionsPausedAt()`（backend-api 提供的
+   * **权威暂停时刻**，且重复 pause 不刷新）→ 覆盖**所有**暂停路径。
+   * 这条比"加个手动恢复接口"更重要：**人会忘，忘了就是全班提交不了任务**。
+   */
+  private ensureGuard(): void {
+    if (this.guardTimer) return;
     const auto = this.autoResumeMs();
     if (auto <= 0) {
       this.o.log?.('准入自动恢复被关闭（autoResumeMs=0）→ 暂停会一直保持到人工恢复', 'warn');
       return;
     }
-    this.autoResumeTimer = setTimeout(() => {
-      this.autoResumeTimer = null;
-      if (this.paused === null) return; // 已被手动恢复
-      if (this.inFlightSwitches > 0) {
-        // 有切换正在进行 → 不能现在恢复（会破坏 drain 语义）→ 稍后重试
-        this.o.log?.('准入自动恢复推迟：有切换正在进行', 'warn');
-        this.autoResumeTimer = setTimeout(() => {
-          this.autoResumeTimer = null;
-          if (this.paused !== null && this.inFlightSwitches === 0) this.resumeAdmissions({ by: 'auto' });
-        }, AUTO_RESUME_RETRY_MS);
-        this.autoResumeTimer.unref?.();
-        return;
-      }
-      this.resumeAdmissions({ by: 'auto' });
-    }, auto);
-    // 定时器不该决定进程寿命（同 watcher 的教训）
-    this.autoResumeTimer.unref?.();
+    // 默认 10 分钟时限 → 30s 巡一次（最迟晚 30s 恢复，可接受）；测试里给 80ms 则 80ms 巡一次
+    const period = Math.max(30, Math.min(auto, GUARD_MAX_PERIOD_MS));
+    this.guardTimer = setInterval(() => this.maybeAutoResume(), period);
+    // 定时器不该决定进程寿命（同 watcher 的教训：它是后台兜底，不是业务句柄）
+    this.guardTimer.unref?.();
+  }
+
+  /** 到点就恢复（有切换在进行则推迟到下一轮）。 */
+  private maybeAutoResume(): void {
+    const gate = this.gate();
+    if (!gate || !gate.paused()) return;
+    if (this.inFlightSwitches > 0) {
+      this.o.log?.('准入自动恢复推迟：有切换正在进行', 'warn');
+      return;
+    }
+    const st = this.admissionState();
+    const auto = this.autoResumeMs();
+    if (st.pausedForMs < auto) return;
+    this.o.log?.(
+      `准入已暂停 ${Math.round(st.pausedForMs / 1000)}s（超过时限 ${Math.round(auto / 1000)}s）→ 自动恢复`,
+      'warn',
+    );
+    this.resumeAdmissions({ by: 'auto' });
   }
 
   private clearAutoResumeTimer(): void {
-    if (this.autoResumeTimer) {
-      clearTimeout(this.autoResumeTimer);
-      this.autoResumeTimer = null;
+    if (this.guardTimer) {
+      clearInterval(this.guardTimer);
+      this.guardTimer = null;
     }
   }
 
-  /** 关闭（释放自动恢复定时器；测试与关服要调）。 */
+  /** 关闭（释放守卫定时器；测试与关服要调）。 */
   close(): void {
     this.clearAutoResumeTimer();
     this.paused = null;
@@ -602,11 +662,24 @@ export class ModelSwitcher {
       this.auditEvent(req, from, model, 'ok', '');
       this.o.log?.(`模型热切换 ${from} → ${model}（mode=${req.mode}, ${this.now() - t0}ms）`);
 
+      // ★ 如实报"两个真相源"是否一致（见 `modelSources` 的注释）
+      const providerConfigured = this.o.cfg.llm?.model ?? '';
+      const consistent = providerConfigured === '' || providerConfigured === model;
+      if (!consistent) {
+        notes.push(
+          `⚠️ settings.llm.active 已切到 ${model}，但 **provider 层配置的 model 仍是 ${providerConfigured}**` +
+            `（config/providers.yaml 的 \`model: \${LLM_MODEL}\`）→ 只有**读 settings 的消费方**会用新模型；` +
+            `未接入的调用方（实测：pi 的 ready 帧）仍报旧模型。这是**如实上报**，不是切换失败。`,
+        );
+      }
+
       return {
         ok: true, mode: req.mode, activeModel: model, switchedFrom: from, switchedAt: this.now(),
         probe, waitedMs: this.now() - t0, state: 'switched', drained, aborted, resumed,
         admissionPaused, stillRunning: [], rolledBack: false,
-        admissions: this.admissionState(), notes,
+        admissions: this.admissionState(),
+        modelSources: { settingsActive: model, providerConfigured, consistent },
+        notes,
       };
     } finally {
       // ★ 准入恢复：正常与失败路径都恢复；**只有 drain 超时**保持暂停（那条路已挂自动恢复兜底）

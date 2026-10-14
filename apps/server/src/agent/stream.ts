@@ -70,6 +70,15 @@ export interface ReadyFrame {
   restoredMessages?: number;
   /** `resumed=false` 时的可读原因（首次 / 损坏 / 未启用持久化）——**不许静默当新会话** */
   resumeReason?: string;
+  /**
+   * ★ 模型来源：
+   * - `injected` / `resolved` = 用的是**项目配置/调用方指定**的模型
+   * - `pi-global-fallback` = ★ 没解析出来，回落到了 pi 自己的全局默认
+   *   （可能与 `/settings` 的 `llm.active` 不一致 —— 别让前端把它当成"当前模型"）
+   */
+  model_source?: 'injected' | 'resolved' | 'pi-global-fallback';
+  /** 模型来源相关警告（非空**必须外显**） */
+  model_warning?: string;
 }
 
 export interface TextDeltaFrame {
@@ -477,6 +486,8 @@ export function makeReadyFrame(opts: {
   resumed?: boolean;
   restoredMessages?: number;
   resumeReason?: string;
+  modelSource?: 'injected' | 'resolved' | 'pi-global-fallback';
+  modelWarning?: string;
 }): ReadyFrame {
   return {
     type: 'ready',
@@ -495,6 +506,8 @@ export function makeReadyFrame(opts: {
     resumed: opts.resumed ?? false,
     restoredMessages: opts.restoredMessages ?? 0,
     ...(opts.resumeReason !== undefined ? { resumeReason: opts.resumeReason } : {}),
+    model_source: opts.modelSource ?? 'pi-global-fallback',
+    ...(opts.modelWarning !== undefined ? { model_warning: opts.modelWarning } : {}),
   };
 }
 

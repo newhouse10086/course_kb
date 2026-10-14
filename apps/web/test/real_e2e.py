@@ -268,7 +268,8 @@ def main() -> int:
             run_view('真数据 / 文档页', check_docs_real)
 
             # ============ 8. 真后端已实现：模型设置页（真模型表 + busy + 二次确认）============
-            dom = nav('settings?selftest=1', "!!document.getElementById('settings-report')", 240)
+            # 真后端自检要跑完整 CRUD/切换流程（几十秒）→ 等 selftest-report，不是只等页面 report
+            dom = nav('settings?selftest=1', "!!document.getElementById('selftest-report')", 300)
 
             def check_settings_real() -> None:
                 rep = report(dom, 'settings-report') or {}
@@ -298,7 +299,7 @@ def main() -> int:
             run_view('真后端 / 模型设置页（真模型表 + busy + 二次确认）', check_settings_real)
 
             # ============ 8b. 真后端已实现：SQL 练习台（真引擎 + 真 schema + 真 CRUD + 真错误码）============
-            dom = nav('lab?selftest=1', "!!document.getElementById('lab-report')", 240)
+            dom = nav('lab?selftest=1', "!!document.getElementById('selftest-report')", 300)
 
             def check_lab_real() -> None:
                 rep = report(dom, 'lab-report') or {}
@@ -339,6 +340,22 @@ def main() -> int:
                    (c.get('bad_table_error') or {}).get('code') == 'E_SQL_NO_OBJECT'
                    and 'no such table' in str((c.get('bad_table_error') or {}).get('msg')),
                    json.dumps(c.get('bad_table_error'), ensure_ascii=False)[:200])
+                # ★ 事务：单条被如实拒绝（E_SQL_UNSUPPORTED/who=rules/interim）+ 整批（multi）才有效
+                ok('单条事务被如实拒绝（E_SQL_UNSUPPORTED + who=rules + interim）',
+                   (c.get('single_tx_rejected') or {}).get('code') == 'E_SQL_UNSUPPORTED'
+                   and (c.get('single_tx_rejected') or {}).get('who') == 'rules'
+                   and (c.get('single_tx_kind') if isinstance(c.get('single_tx_kind'), str) else None) is not None
+                   and c.get('single_tx_who_kind') == 'rules',
+                   json.dumps(c.get('single_tx_rejected'), ensure_ascii=False)[:200])
+                ok('服务端标注 transactions_cross_call=false（页面据此引导整批）',
+                   rep.get('transactions_cross_call') is False, str(rep.get('transactions_cross_call')))
+                ok('整批执行：ROLLBACK 后行数不变', c.get('multi_rollback_no_effect') is True,
+                   json.dumps(c.get('multi_rollback'), ensure_ascii=False)[:220])
+                ok('整批执行：COMMIT 后新行可见', c.get('multi_commit_visible') is True,
+                   json.dumps(c.get('multi_commit'), ensure_ascii=False)[:220])
+                ok('整批开关与逐条结果都渲染', c.get('multi_toggle_visible') is True and c.get('multi_statements_rendered') is True)
+                ok('整批说明写清"独立进程"原因', c.get('multi_note_explains_why') is True)
+
                 # ★ who 驱动话术：三档必须不同（Lead 硬要求）
                 w1, w2, w3 = c.get('who_student') or {}, c.get('who_rules') or {}, c.get('who_system') or {}
                 ok('学生的错：who=student + E_SQL_SYNTAX', w1.get('kind') == 'student' and w1.get('code') == 'E_SQL_SYNTAX',
@@ -384,10 +401,16 @@ def main() -> int:
                     ok('能力横幅在 300s 内渲染', False, f'实测：{diag}')
                     return
                 ok('能力横幅读真 /capabilities', 'data-testid="caps-bar"' in dom)
-                ok('LLM 可用（真探测通过）', 'data-cap="llm"' in dom and 'data-available="true"' in dom)
-                ok('不可用能力给出原因（缺哪个环境变量）',
-                   'data-testid="caps-bar"' in dom and ('ALIYUN' in dom or 'BAIDU' in dom or '未配置' in dom),
-                   '能力原因未显示')
+                llm_chip = ch.evaluate(
+                    "(() => { const c=document.querySelector('[data-testid=\"caps-bar\"] [data-cap=\"llm\"]');"
+                    " return c ? c.getAttribute('data-available') : '' })()") or ''
+                ok('LLM 可用（真探测通过）', llm_chip == 'true', f'data-available={llm_chip}')
+                reason = ch.evaluate(
+                    "(() => { const c=Array.from(document.querySelectorAll('[data-testid=\"caps-bar\"] [data-available=\"false\"]'));"
+                    " return c.length ? c[0].getAttribute('title') : '' })()") or ''
+                ok('不可用能力给出原因（缺哪个环境变量/服务）',
+                   bool(reason) and ('不可用' in reason),
+                   f'reason={reason[:120]}')
                 ok('导航按能力渲染（pi 可用 → 助教入口可用）', 'data-nav="/chat"' in dom)
             run_view('真数据 / 能力横幅', check_caps_real)
 

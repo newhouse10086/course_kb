@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 沙箱 SQL 迷你引擎（**只用于 mock**，不是产品实现）
  *
  * 为什么要有它：SQL 练习台的验收是"**完整 CRUD 交互**，不是只读"。
@@ -191,8 +191,19 @@ export class SandboxDb {
       this.log.push({ sql: text, changes: before - t.rows.length })
       return done([], [])
     }
-    // ---- 事务 ----
-    if (/^BEGIN(\s+TRANSACTION)?$/i.test(text) || /^COMMIT$/i.test(text) || /^ROLLBACK$/i.test(text)) return done([], [])
+    // ---- 事务（仅整批内有意义）----
+    // ⚠️ 第一版把 BEGIN/COMMIT/ROLLBACK 都当 no-op → **ROLLBACK 不撤销插入**，
+    //    与真后端（better-sqlite3 真事务）不一致 → "回滚后行数不变"的断言会假绿。
+    //    这里做真快照：BEGIN 存深拷贝，ROLLBACK 还原，COMMIT 丢弃快照。
+    if (/^BEGIN(\s+TRANSACTION)?$/i.test(text)) {
+      this.txSnapshot = JSON.parse(JSON.stringify(Array.from(this.tables.entries())))
+      return done([], [])
+    }
+    if (/^COMMIT$/i.test(text)) { this.txSnapshot = null; return done([], []) }
+    if (/^ROLLBACK$/i.test(text)) {
+      if (this.txSnapshot) { this.tables = new Map(this.txSnapshot); this.txSnapshot = null }
+      return done([], [])
+    }
     // ---- SELECT ----
     if (/^SELECT\b/i.test(text)) return this.select(text, maxRows, t0)
     // ---- CREATE VIEW / INDEX ----

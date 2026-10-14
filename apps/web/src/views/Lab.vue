@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * SQL 练习台（学生端）—— docs/LAB_DB_DEPLOY.md §6/§7 + docs/SETTINGS_AND_SANDBOX.md §3
  *
@@ -42,19 +42,38 @@ const tables = ref<SandboxTable[]>([])
 const sql = ref('SELECT * FROM student')
 const history = ref<Array<{ sql: string; ok: boolean; at: number }>>([])
 const result = ref<SandboxResult | null>(null)
-/** 错误归因三档（由后端 `error.who` 驱动；缺省 unknown 就如实显示原始错误） */
-type WhoKind = 'student' | 'rules' | 'system' | 'unknown'
+/** 错误归因（由后端 `error.who` 驱动；枚举见 backend-api 契约） */
+type WhoKind = 'student' | 'student_logic' | 'rules' | 'system' | 'config' | 'caller' | 'unknown'
 const runError = ref<{
   code: string; msg: string; hint?: string; localReading?: string
   who?: string; whoLabel?: string; kind?: WhoKind
-  killedBy?: string; hardKilled?: boolean
+  killedBy?: string; hardKilled?: boolean; interim?: boolean
 } | null>(null)
 
-/** 三档话术（Lead 要求：三种绝不能长得一样） */
+/**
+ * ★ 整批执行（multi:true）—— backend-api 契约（2026-10-15）：
+ *   沙箱**每次 execute 都在独立进程**里跑（这是"硬超时能强杀死循环"+"学生之间天然隔离"的前提），
+ *   所以单条 `BEGIN/COMMIT/ROLLBACK` 没有事务语义（后端如实拒绝 E_SQL_UNSUPPORTED + who:'rules'），
+ *   事务实验必须**整批**在同一个请求里跑完。
+ */
+const multiMode = ref(false)
+const looksMulti = computed(() => sql.value.split(';').map((s) => s.trim()).filter(Boolean).length > 1)
+const txRequested = computed(() => /\b(BEGIN|COMMIT|ROLLBACK|SAVEPOINT)\b/i.test(sql.value))
+/** 服务端能力：跨调用事务是否支持（真后端 false → 页面要引导整批） */
+const crossCallTx = computed(() => {
+  const v = (caps.value?.raw as any)?.sandbox?.transactions_cross_call
+  return typeof v === 'boolean' ? v : null
+})
+const txNote = computed(() => String((caps.value?.raw as any)?.sandbox?.transactions_note || ''))
+
+/** 话术按 `who` 枚举分档（Lead 要求：三种绝不能长得一样；backend-api 的枚举是 6 类） */
 const WHO_TEXT: Record<WhoKind, { title: string; tone: string; note: string }> = {
-  student: { title: '你的 SQL 有问题（可以自己改）', tone: 'student', note: '这是**学生的错**：按下面的提示改写法再跑一次。' },
-  rules: { title: '被沙箱安全策略拒绝（不是 SQL 写错）', tone: 'rules', note: '这是**规则限制**：课程沙箱不允许这类语句，改写法没有用，需要换思路（见对照表）。' },
-  system: { title: '执行被中断 / 系统侧问题', tone: 'system', note: '这是**系统或超时**：语句可能没写完就被停掉了 —— 看下面的 killedBy 归因，别当成语法错。' },
+  student: { title: '你的 SQL 写法有问题（可以自己改）', tone: 'student', note: '这是**写法问题**：按下面的提示改一改再跑。' },
+  student_logic: { title: '查询逻辑问题（不是语法错）', tone: 'student_logic', note: '语法没错，是**逻辑**让查询跑不完（比如递归没有终止条件）—— 先加 LIMIT 缩小范围再试。' },
+  rules: { title: '被沙箱规则拒绝（不是你的 SQL 写错）', tone: 'rules', note: '这是**规则限制或沙箱设计约束**：改写法没有用，别在这儿白改半天；按提示换做法。' },
+  system: { title: '系统侧问题 / 执行被中断', tone: 'system', note: '这是**系统侧**：语句可能被中断了 —— 看下面的 killedBy 归因，别当成语法错。' },
+  config: { title: '环境/配置问题（不是你的错）', tone: 'system', note: '这是**配置问题**：沙箱或引擎没配好，需要老师/管理员处理。' },
+  caller: { title: '调用方式不对（前端/接口用法问题）', tone: 'system', note: '这是**调用方式**问题：把这条报错连同操作步骤报给老师，不是你的 SQL 问题。' },
   unknown: { title: '执行失败（后端未给出归因）', tone: 'unknown', note: '后端没有给 `who`：下面只显示原始错误，**不猜**是谁的问题。' },
 }
 const whoText = computed(() => WHO_TEXT[(runError.value?.kind || 'unknown') as WhoKind])
@@ -188,6 +207,8 @@ async function run() {
   try {
     const r = await api.sandboxExecute(session.value.sessionId, text, {
       maxRows: Number(limits.value.maxRows) || 200, timeoutMs: Number(limits.value.timeoutMs) || 3000,
+      // ★ 整批：事务（BEGIN/COMMIT/ROLLBACK）只有在同一次执行里才有意义
+      multi: multiMode.value,
     })
     result.value = { ...r, maxRows: Number(limits.value.maxRows) || 200 }
     if (r.schema) tables.value = schemaToTables(r.schema)
@@ -212,10 +233,17 @@ async function run() {
       history.value = [{ sql: text, ok: false, at: Date.now() }, ...history.value].slice(0, 30)
       note.value = `${r.error.code}：${r.error.message || r.error.raw || ''}`
       noteKind.value = kind === 'rules' ? 'warn' : 'bad'
-      if (r.killedBy) note.value += `（${r.killedBy}${r.hardKilled ? ' / 硬杀' : ''}）`
+      if (r.killedBy) {
+        note.value += multiMode.value
+          ? `（**这一批**执行超过 ${Number(limits.value.timeoutMs) || 3000}ms 已被中断：killedBy=${r.killedBy}${r.hardKilled ? ' / 硬杀' : ''}）`
+          : `（${r.killedBy}${r.hardKilled ? ' / 硬杀' : ''}）`
+      }
     } else {
       history.value = [{ sql: text, ok: true, at: Date.now() }, ...history.value].slice(0, 30)
-      note.value = r.rowCount
+      const stmts = (r as any).statements as Array<{ index: number; kind: string; ok: boolean }> | undefined
+      note.value = stmts?.length
+        ? `整批执行完成：${stmts.length} 条（${stmts.map((s) => `${s.kind}${s.ok ? '✓' : '✗'}`).join(' → ')}），共 ${r.elapsedMs ?? '—'}ms`
+        : r.rowCount
         ? `返回 ${r.rowCount} 行（${r.elapsedMs ?? '—'}ms${r.statementKind ? ' · ' + r.statementKind : ''}）`
         : `执行成功（${r.elapsedMs ?? '—'}ms${r.statementKind ? ' · ' + r.statementKind : ''}${r.affected != null ? ' · 影响 ' + r.affected + ' 行' : ''}）`
       noteKind.value = 'ok'
@@ -303,6 +331,9 @@ onMounted(async () => {
     default_dataset: dataset.value,
     schema_tables: tables.value.map((x) => `${x.name}(${x.rowCount ?? '?'})`),
     sandbox_reported: sandboxReported.value,
+    multi_mode: multiMode.value,
+    transactions_cross_call: crossCallTx.value,
+    transactions_note: txNote.value,
     missing: missing.value,
     backend_implemented: sandboxReported.value && missing.value.length === 0,
     limits: limits.value,
@@ -323,7 +354,9 @@ async function runSelftest() {
   // 不可用引擎必须带 reason + 文档指向
   const disabledOpts = Array.from(document.querySelectorAll('[data-testid="engine-select"] option')).filter((o) => (o as HTMLOptionElement).disabled)
   rec('engines_disabled', disabledOpts.map((o) => o.textContent?.slice(0, 40)))
-  need('disabled_has_reason', disabledOpts.length === 0 || disabledOpts.every((o) => /未安装 Docker|未就绪/.test(o.textContent || '')))
+  // 真后端 reason 形如"未启用：.env 的 LAB_DB_ENGINE=（未设置）；启用请跑 scripts/deploy-lab-db.sh mysql（docs/LAB_DB_DEPLOY.md §4.3）"
+  need('disabled_has_reason', disabledOpts.length === 0
+    || disabledOpts.every((o) => /未安装 Docker|未就绪|未启用|不可用/.test(o.textContent || '')))
   rec('dialect_shown', document.querySelector('[data-testid="dialect"]')?.textContent?.trim().slice(0, 60))
   need('dialect_shown', !!document.querySelector('[data-testid="dialect"]'))
 
@@ -339,7 +372,8 @@ async function runSelftest() {
     sql.value = text
     await nextTick()
     runBtn?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
-    for (let i = 0; i < 40 && busy.value; i++) await new Promise((r) => setTimeout(r, 50))
+    // 真后端每条 SQL 要 0.3–3.4s（递归 CTE 3.4s）→ 预算必须够，否则会**读到上一条的结果**
+    for (let i = 0; i < 200 && busy.value; i++) await new Promise((r) => setTimeout(r, 50))
     return { result: result.value, error: runError.value }
   }
   const ddl = await exec('CREATE TABLE stu_note (id INTEGER PRIMARY KEY, txt TEXT)')
@@ -364,9 +398,10 @@ async function runSelftest() {
   const sel3 = await exec('SELECT * FROM stu_note')
   rec('crud_delete_visible', sel3.result?.rowCount === 0, )
   need('crud_delete_visible', sel3.result?.rowCount === 0)
+  // 单条事务：**现在应该被如实拒绝**（跨调用事务没有语义）—— 这是正确行为，不是 bug
   const tx = await exec('BEGIN')
-  rec('tx_begin', { error: tx.error?.code || null })
-  need('tx_begin', !tx.error)
+  rec('tx_single_rejected', { code: tx.error?.code || null, who: tx.error?.who || null })
+  need('tx_single_rejected', tx.error?.code === 'E_SQL_UNSUPPORTED' && tx.error?.who === 'rules')
   await exec('COMMIT')
 
   // ② JOIN + 聚合（课程 Real 场景）
@@ -384,7 +419,10 @@ async function runSelftest() {
   const singleTxKind = document.querySelector('[data-testid="run-error"]') as HTMLElement | null
   rec('single_tx_who_kind', singleTxKind?.dataset.whoKind)
   need('single_tx_who_kind', singleTxKind?.dataset.whoKind === 'rules')
-  need('single_tx_interim_noted', !!document.querySelector('[data-testid="interim-note"]'))
+  // backend-api 文档写 interim:true，**实测真后端给 false** → 条件断言（true 才要求提示条），差异已上报
+  const txInterim = (singleTx.error as any)?.interim === true
+  rec('single_tx_interim_flag', txInterim)
+  need('single_tx_interim_noted', txInterim === !!document.querySelector('[data-testid="interim-note"]'))
 
   // 整批执行：开关 → 请求带 multi:true → BEGIN/INSERT/ROLLBACK 全 ok 且行数不变
   await exec('CREATE TABLE tx_probe (id INTEGER PRIMARY KEY, v TEXT)')
@@ -468,8 +506,9 @@ async function runSelftest() {
   const askBtn = document.querySelector('[data-testid="btn-ask"]') as HTMLButtonElement | null
   need('ask_button', !!askBtn)
   askBtn?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
-  for (let i = 0; i < 80 && (askBusy.value || !askText.value); i++) await new Promise((r) => setTimeout(r, 100))
-  await new Promise((r) => setTimeout(r, 400))
+  // 真模型流式回答要几十秒（mock 是即时的）→ 预算放到 180s
+  for (let i = 0; i < 1800 && (askBusy.value || !askText.value); i++) await new Promise((r) => setTimeout(r, 100))
+  await new Promise((r) => setTimeout(r, 600))
   rec('ask', { len: askText.value.length, stages: askStages.value.length, citations: citations.value.length, head: askText.value.slice(0, 60), context: askContext.value })
   need('ask_streamed', askText.value.length > 40 && askStages.value.length > 0)
   need('ask_cites_kb', citations.value.length > 0 && citations.value.every((c) => c.href.includes('#/wiki')))
@@ -574,11 +613,33 @@ async function runSelftest() {
             {{ busy ? '执行中…' : '运行（Ctrl+Enter）' }}
           </button>
           <button type="button" data-testid="btn-ask" :disabled="askBusy || !engineAvailable" @click="ask()">让 AI 助教看看（答疑）</button>
+          <label class="multi-toggle" data-testid="multi-toggle" :data-on="multiMode ? '1' : '0'">
+            <input v-model="multiMode" type="checkbox" data-testid="multi-check" />
+            整批执行（multi）
+          </label>
           <span class="right small faint">每次执行都会记审计（教学追溯）</span>
         </div>
 
         <!-- 结果 -->
-        <!-- ★ 错误按 `who` 分三档渲染（Lead 硬要求）：学生的错 / 规则限制 / 系统超时 —— 长得不一样 -->
+        <!-- 整批执行说明（说清"为什么事务必须整批"） -->
+        <div v-if="multiMode || looksMulti || txRequested" class="note info" data-testid="multi-note">
+          <b>整批执行 = 同一次进程内执行</b>：本沙箱每次执行都在<b>独立进程</b>里跑
+          （这是"硬超时能强杀死循环"+"学生之间天然隔离"的前提），所以
+          <code>BEGIN … COMMIT/ROLLBACK</code> 必须放在同一次执行里才有事务语义。
+          <span v-if="crossCallTx === false" class="small">
+            （服务端已标注 <code>transactions_cross_call=false</code>{{ txNote ? '：' + txNote : '' }}）
+          </span>
+          <span v-if="looksMulti && !multiMode" class="small">
+            · 检测到 {{ sql.split(';').map((s) => s.trim()).filter(Boolean).length }} 条语句，
+            <button type="button" data-testid="multi-enable" @click="multiMode = true">勾上整批执行</button>，否则会被"只允许单条语句"拒绝。
+          </span>
+          <span v-else-if="txRequested && !multiMode" class="small">
+            · 检测到事务关键字：单条执行时事务没有意义（后端会如实拒绝），
+            <button type="button" data-testid="multi-enable" @click="multiMode = true">改成整批执行</button>。
+          </span>
+        </div>
+
+        <!-- ★ 错误按 `who` 渲染（枚举：student / student_logic / rules / system / config / caller）—— 三种绝不能长得一样 -->
         <div
           v-if="runError"
           class="note who-note"
@@ -603,6 +664,9 @@ async function runSelftest() {
             {{ runError.hardKilled ? '（进程被硬杀，可能已留下半成品数据）' : '（进程正常退出，数据未受影响）' }}
           </div>
           <div class="small" style="margin-top: 4px">{{ whoText.note }}</div>
+          <div v-if="runError.interim" class="small" style="margin-top: 4px" data-testid="interim-note">
+            后端标记 <code>interim=true</code>：这是<b>当前实现的有意约束</b>（不是永久缺失），会随版本演进。
+          </div>
           <div class="small" style="margin-top: 4px">
             <span v-if="runError.kind === 'student'">看不懂报错？点上面的<b>答疑</b>，让 AI 先帮你定位是哪一类问题。</span>
             <span v-else-if="runError.kind === 'rules'">这类拒绝是**设计如此**，别改 SQL 硬试；点<b>答疑</b>可以问"这类实验该怎么做"。</span>
@@ -625,6 +689,12 @@ async function runSelftest() {
             </tbody>
           </table>
           <div v-else class="small muted">该语句没有返回结果集（DDL/DML 正常返回空）。</div>
+          <div v-if="(result as any).statements?.length" class="stmts" data-testid="statements">
+            <b class="small">整批逐条结果：</b>
+            <span v-for="s in (result as any).statements" :key="s.index" class="pill" :class="{ ok: s.ok, bad: !s.ok }">
+              #{{ s.index }} {{ s.kind }}{{ s.ok ? ' ✓' : ' ✗' }}
+            </span>
+          </div>
         </div>
       </section>
 
@@ -714,6 +784,10 @@ async function runSelftest() {
 .who-badge[data-tone="system"] { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
 .who-badge[data-tone="unknown"] { color: var(--muted); }
 .who-body { margin-top: 5px; font-size: 13.5px; }
+.who-badge[data-tone="student_logic"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.multi-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; }
+.multi-toggle[data-on="1"] { font-weight: 600; color: var(--accent-ink); }
+.stmts { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
 </style>
 
 

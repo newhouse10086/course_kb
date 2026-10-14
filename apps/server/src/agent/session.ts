@@ -37,7 +37,7 @@ import { join } from 'node:path';
 
 import type { AgentSession, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
 
-import { AGENT_ERROR_CODES, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
+import { AGENT_ERROR_CODES, HINT_SDK_OK, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
 import { composeMessageWithContext, sanitizeUntrusted } from './guards.ts';
 import { loadSdk, type SdkLoadResult } from './sdk.ts';
 import {
@@ -57,6 +57,7 @@ import {
 /** 默认空闲回收：30 分钟（契约 §7.4 的 v2 等价物） */
 export const DEFAULT_IDLE_TTL_MS = 30 * 60 * 1000;
 /** `prompt()` resolve 之后，再等 settled 的上限（正常应立刻拿到） */
+export const DEFAULT_PROMPT_TIMEOUT_MS = 120_000;
 export const DEFAULT_SETTLE_GRACE_MS = 5_000;
 
 /** 我们用到的 `AgentSession` 成员（结构化声明，避免与 SDK 类型版本强耦合）。 */
@@ -89,6 +90,27 @@ export interface AgentManagerOptions {
   thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   idleTtlMs?: number;
   settleGraceMs?: number;
+  /**
+   * ★ 本轮**硬超时**（默认 120s）：到点仍未收到 `agent_settled` / 拒绝 → 发 `E_PI_TIMEOUT`
+   * + 一条 synthetic `settled`，**绝不让客户端无限等待**。
+   *
+   * 为什么必须有：SDK 的 `prompt()` 在**上游失败**（如 401）时可能既不 resolve、
+   * 也不发出可映射的失败事件 —— 真机验收里学生就是"发完提问永远转圈、一帧都没有"。
+   * 宁可如实报超时，也不要静默悬挂（"看起来成功"那类最危险）。
+   */
+  promptTimeoutMs?: number;
+  /**
+   * ★ **显式指定模型**（`Model` 对象，或 `'providerId/modelId'` 字符串）。
+   *
+   * 不设时尝试用 `resolveConfiguredModelRef()`（项目 config 的 active LLM）解析；
+   * 再不行就**只能**回落 pi 的全局默认 —— 那时 `ready` 帧会如实标
+   * `modelSource:'pi-global-fallback'` + `modelWarning`（不许静默用错模型）。
+   */
+  model?: unknown;
+  /** 注入模型运行时（不传则用 SDK 的 `ModelRuntime.create()`） */
+  modelRuntime?: unknown;
+  /** 解析模型用的 pi 模型目录（`models.json`；默认走 agentDir） */
+  modelsPath?: string;
   /**
    * **替换** pi 默认的系统提示词（不设置就用 pi 默认的 coding-agent 提示词）。
    *
@@ -131,6 +153,16 @@ export interface SessionInit {
   restoredMessages?: number;
   /** `resumed=false` 时的**可读原因**（损坏/不兼容/首次），不许静默 */
   resumeReason?: string;
+  /**
+   * 模型是从哪来的：
+   * - `injected`       = 调用方显式传了 `Model` 对象
+   * - `resolved`       = 由 `provider/model` 字符串或项目配置解析而来
+   * - `pi-global-fallback` = ★ **没能解析**，回落到了 pi 自己的全局默认
+   *   （`~/.pi/agent/settings.json`）—— 可能与项目 `settings.json` 的 `llm.active` 不一致
+   */
+  modelSource?: 'injected' | 'resolved' | 'pi-global-fallback';
+  /** 模型来源相关的**警告**（非空时要外显给前端/日志，不许静默） */
+  modelWarning?: string;
 }
 
 /** 会话运行统计（诊断用） */
@@ -168,8 +200,114 @@ function defaultCwd(): string {
   }
 }
 
-/** 浏览器会话 id 校验（同时防止把 id 拼进文件路径） */
-const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/**
+ * 解析"本次会话该用哪个模型"。
+ *
+ * 顺序：
+ *  1. `opts.model` 已是 `Model` 对象 → 直接用（`injected`）
+ *  2. `opts.model` 是 `'provider/model'` 字符串 → 用 ModelRuntime 解析（`resolved`）
+ *  3. `opts.model` 没给 → 读**项目配置**的 active LLM（`resolveConfiguredModelRef()`）→ 解析（`resolved`）
+ *  4. 都失败 → `pi-global-fallback` + **可读 warning**（绝不静默用错模型）
+ *
+ * 为什么不能省孤儿步：`createAgentSession` 不传 `model` 时，pi 用 `~/.pi/agent/settings.json`
+ * 里的全局默认。真机事故：全局是 `glm-5.2`/`opencode-go`（key 已 401），而项目配置是
+ * `amr/deepseek-v4.1-flash` → `ready` 帧、`/settings`、`/capabilities` 三处两个答案，
+ * 学生提问**静默无响应**。
+ */
+async function resolveSessionModel(
+  sdk: SdkLoadResult & { available: true },
+  opts: {
+    model?: unknown;
+    modelRuntime?: unknown;
+    modelsPath?: string;
+  },
+  agentDir: string | undefined,
+): Promise<{ model: unknown; source: SessionInit['modelSource']; warning?: string }> {
+  const explicit = opts.model;
+  // 1) 已经是 Model 对象（有 provider/id 之类结构或就是对象）
+  if (explicit !== undefined && typeof explicit === 'object' && explicit !== null) {
+    return { model: explicit, source: 'injected' };
+  }
+
+  // 2/3) 需要一个运行时才能把字符串解析成 Model
+  let runtime = opts.modelRuntime as { getModel?: (p: string, m: string) => unknown } | undefined;
+  if (!runtime && typeof sdk.ModelRuntime?.create === 'function') {
+    try {
+      runtime = (await sdk.ModelRuntime.create({
+        ...(agentDir ? { authPath: join(agentDir, 'auth.json') } : {}),
+        ...(opts.modelsPath
+          ? { modelsPath: opts.modelsPath }
+          : agentDir
+            ? { modelsPath: join(agentDir, 'models.json') }
+            : {}),
+        refreshOnCreate: false,
+      })) as { getModel?: (p: string, m: string) => unknown };
+    } catch (err) {
+      return {
+        model: null,
+        source: 'pi-global-fallback',
+        warning: `模型运行时创建失败（${err instanceof Error ? err.message : String(err)}）→ 回落 pi 全局默认`,
+      };
+    }
+  }
+  const ref = typeof explicit === 'string' && explicit.trim() !== '' ? explicit : await resolveConfiguredModelRef();
+  if (ref && runtime && typeof runtime.getModel === 'function') {
+    const slash = ref.indexOf('/');
+    const provider = slash > 0 ? ref.slice(0, slash) : '';
+    const modelId = slash > 0 ? ref.slice(slash + 1) : ref;
+    const found = provider ? runtime.getModel(provider, modelId) : undefined;
+    if (found) return { model: found, source: 'resolved' };
+    return {
+      model: null,
+      source: 'pi-global-fallback',
+      warning: `模型 ${ref} 在当前模型目录里找不到（provider=${provider || '?'}）→ 回落 pi 全局默认，可能与项目设置不一致`,
+    };
+  }
+  return {
+    model: null,
+    source: 'pi-global-fallback',
+    warning: ref
+      ? `无法解析模型 ${ref}（缺少 ModelRuntime）→ 回落 pi 全局默认，可能与项目设置不一致`
+      : '未能从项目配置里解析出 active 模型 → 回落 pi 全局默认（可能与 /settings 显示的模型不一致）',
+  };
+}
+
+/**
+ * 从**项目配置**里解析出 active LLM 的 `provider/model` 引用。
+ *
+ * 动态 import `../config.ts`（T-BACKEND 的写域，只读不改）；拿不到就返回 null。
+ * 与 `/capabilities` 的凭据解析走**同一条**来源，避免"三处两个答案"。
+ */
+export async function resolveConfiguredModelRef(): Promise<string | null> {
+  const envRef =
+    process.env.LLM_PROVIDER && process.env.LLM_MODEL
+      ? `${process.env.LLM_PROVIDER}/${process.env.LLM_MODEL}`
+      : process.env.LLM_MODEL
+        ? `amr/${process.env.LLM_MODEL}`
+        : null;
+  if (envRef) return envRef;
+  try {
+    const mod = (await import('../config.ts')) as {
+      loadConfig?: () => { llm?: { active?: string; providerId?: string; model?: string } };
+    };
+    const cfg = mod.loadConfig?.();
+    const llm = cfg?.llm;
+    if (llm) {
+      if (typeof llm.active === 'string' && llm.active.includes('/')) return llm.active;
+      if (typeof llm.providerId === 'string' && typeof llm.model === 'string') {
+        return `${llm.providerId}/${llm.model}`;
+      }
+      if (typeof llm.providerId === 'string' && typeof llm.active === 'string') {
+        return `${llm.providerId}/${llm.active}`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** 浏览器会话 id 校验（同时防止把 id 拼进文件路径） */const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 export function isValidSessionId(sessionId: string): boolean {
   return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId);
 }
@@ -227,6 +365,10 @@ export class ManagedAgentSession implements ChatSessionLike {
   private _resumed = false;
   private _restoredMessages = 0;
   private _resumeReason = '';
+  private _modelSource: SessionInit['modelSource'] = 'pi-global-fallback';
+  private _modelWarning: string | undefined;
+  /** 本轮是否被看门狗判超时（之后丢弃迟到事件，避免第二条 settled） */
+  private timedOutRound = false;
   /** 本轮 settled 是否已收到 */
   private settledSeen = false;
   /** 本轮是否以"中断"结束（由 settled 帧固化，供 prompt() 返回值用） */
@@ -244,6 +386,8 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._resumed = init.resumed === true;
     this._restoredMessages = init.restoredMessages ?? 0;
     this._resumeReason = init.resumeReason ?? '';
+    this._modelSource = init.modelSource ?? 'pi-global-fallback';
+    this._modelWarning = init.modelWarning;
     // ★ 先订阅（坑 14）：在任何人拿到这个对象、发第一条 prompt 之前就挂好
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
   }
@@ -251,6 +395,10 @@ export class ManagedAgentSession implements ChatSessionLike {
   // ------------------------------------------------------------------
   private onPiEvent(event: SdkEventLike): void {
     this.touch();
+    // ★ 本轮已由**看门狗**结束（超时）→ 丢弃迟到事件：
+    //   否则上游稍后恢复时会把一条迟到的 `agent_settled` 再映射成一帧 settled，
+    //   前端会收到"第二次结束"（也违背契约 §7.2 一轮一条 settled）。
+    if (this.timedOutRound) return;
     let frames: AgentFrame[];
     try {
       frames = mapSdkEvent(event, this.state);
@@ -358,6 +506,8 @@ export class ManagedAgentSession implements ChatSessionLike {
       resumed: this._resumed,
       restoredMessages: this._restoredMessages,
       ...(this._resumeReason !== '' ? { resumeReason: this._resumeReason } : {}),
+      modelSource: this._modelSource,
+      ...(this._modelWarning !== undefined ? { modelWarning: this._modelWarning } : {}),
     });
   }
 
@@ -418,14 +568,52 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._rounds += 1;
 
     let disposition = 'started';
+    this.timedOutRound = false;
+    // ★ 硬超时看门狗：SDK 在上游失败（如 401）时**可能既不 resolve 也不发可映射事件** ——
+    //   真机验收里学生就是"发完提问永远转圈、一帧都没有"。到点必须如实报超时并结束本轮。
+    //
+    //   ⚠️ 只"发帧"不够：`await piSession.prompt()` 会**永远挂着**，方法不返回、调用方也卡住。
+    //   所以这里必须 `Promise.race` —— 让 `prompt()` 真的返回。
+    //   （原实现只发帧不 race，被本文件的挂起测试抓出：测试跑到 120s 测试超时才结束。）
+    const timeoutMs = this.manager.promptTimeoutMs;
+    let watchdog: NodeJS.Timeout | undefined;
+    const timeoutMarker = new Promise<'timeout'>((resolve) => {
+      watchdog = setTimeout(() => {
+        this.timedOutRound = true;
+        this._running = false;
+        this.settledSeen = true; // 本轮已结束（看门狗收尾），别再等 settled
+        this.emit(
+          agentError(AGENT_ERROR_CODES.E_PI_TIMEOUT, `本轮运行超过 ${Math.round(timeoutMs / 1000)} 秒仍无结束信号`, {
+            hint: `${HINT_SDK_OK}运行超时/上游无响应（常见：模型凭据失效、网络挂起）—— 已终止本轮，可重试`,
+            detail: `promptTimeoutMs=${timeoutMs}；model=${this.modelId() ?? '?'}；modelSource=${this._modelSource}`,
+          }),
+        );
+        this.emit({ type: 'settled', aborted: false, synthetic: true, disposition: 'timeout' });
+        resolve('timeout');
+      }, timeoutMs);
+      if (typeof (watchdog as { unref?: () => void }).unref === 'function') {
+        (watchdog as { unref: () => void }).unref();
+      }
+    });
     try {
-      await this.piSession.prompt(outgoing, {
-        // SDK 用它告诉我们"这条 prompt 是被受理成 run，还是被 extension 处理掉了"
-        preflightResult: (d) => {
-          if (typeof d === 'string' && d !== '') disposition = d;
-        },
-      });
+      const raced = await Promise.race([
+        this.piSession
+          .prompt(outgoing, {
+            // SDK 用它告诉我们"这条 prompt 是被受理成 run，还是被 extension 处理掉了"
+            preflightResult: (d) => {
+              if (typeof d === 'string' && d !== '') disposition = d;
+            },
+          })
+          .then(() => 'done' as const),
+        timeoutMarker,
+      ]);
+      if (raced === 'timeout') {
+        // 看门狗已发过 error+settled → 立即返回，**不等**那个永不 resolve 的 SDK promise
+        return { disposition: 'timeout', aborted: false, syntheticSettled: true };
+      }
     } catch (err) {
+      if (watchdog) clearTimeout(watchdog);
+      if (this.timedOutRound) return { disposition: 'timeout', aborted: false, syntheticSettled: true };
       this._running = false;
       // prompt() **拒绝**（未受理）：转成分类后的 error 帧，并把本轮视为结束
       const classified = classifyFailure(err, { where: '发送 prompt', model: this.modelId() });
@@ -433,6 +621,7 @@ export class ManagedAgentSession implements ChatSessionLike {
       this.emit({ type: 'settled', aborted: false, synthetic: true, disposition: 'rejected' });
       throw err;
     }
+    if (watchdog) clearTimeout(watchdog);
 
     // `disposition === 'handled'` = 没有启动运行 → 不会有 agent_settled（v1 同款处理）
     if (disposition === 'handled') {
@@ -506,6 +695,8 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._resumed = init.resumed === true;
     this._restoredMessages = init.restoredMessages ?? 0;
     this._resumeReason = init.resumeReason ?? '';
+    this._modelSource = init.modelSource ?? 'pi-global-fallback';
+    this._modelWarning = init.modelWarning;
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
     try {
       oldUnsub();
@@ -564,6 +755,11 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   private readonly excludeTools: string[] | undefined;
   private readonly onDiagnostic: (message: string) => void;
   private reaper: NodeJS.Timeout | null = null;
+
+  /** 本轮硬超时（会话层用；没配就用默认 120s） */
+  get promptTimeoutMs(): number {
+    return this.opts.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
+  }
 
   constructor(opts: AgentManagerOptions = {}) {
     this.opts = opts;
@@ -679,6 +875,25 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     if (this.excludeTools) options.excludeTools = this.excludeTools;
     if (this.opts.thinkingLevel) options.thinkingLevel = this.opts.thinkingLevel;
 
+    // ★ 显式指定模型（否则 pi 会用它自己的全局默认，和项目 settings.json 的 llm.active 不一致）
+    let modelSource: SessionInit['modelSource'] = 'pi-global-fallback';
+    let modelWarning: string | undefined;
+    try {
+      const resolved = await resolveSessionModel(sdk, this.opts, this.agentDir);
+      if (resolved.model) {
+        options.model = resolved.model as CreateAgentSessionOptions['model'];
+        modelSource = resolved.source;
+        if (resolved.source === 'pi-global-fallback') modelWarning = resolved.warning;
+      } else {
+        modelWarning = resolved.warning;
+      }
+    } catch (err) {
+      modelWarning = `模型解析失败（回落 pi 全局默认，可能与项目设置不一致）：${
+        err instanceof Error ? err.message : String(err)
+      }`;
+    }
+    if (modelWarning) this.diagnostic(`模型来源=${modelSource}：${modelWarning}`);
+
     // 自定义系统提示词（教学答疑场景）：需要 DefaultResourceLoader；
     // 拿不到就**如实降级**（只用用户消息里的说明），并记诊断 —— 不假装设置成功。
     const wantsCustomPrompt =
@@ -750,6 +965,8 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       resumed,
       restoredMessages,
       resumeReason,
+      modelSource,
+      ...(modelWarning !== undefined ? { modelWarning } : {}),
     };
   }
 

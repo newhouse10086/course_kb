@@ -223,7 +223,7 @@ export const api = {
       body: JSON.stringify(sessionId ? { dataset, sessionId } : { dataset }),
     }),
   /** 执行 SQL：**失败也返回 200 + ok:false + error**（SQL 报错要显示给学生看，不是网络错误） */
-  sandboxExecute: (sessionId: string, sql: string, opts?: { maxRows?: number; timeoutMs?: number }) =>
+  sandboxExecute: (sessionId: string, sql: string, opts?: { maxRows?: number; timeoutMs?: number; multi?: boolean }) =>
     req<SandboxResult>('/sandbox/execute', undefined, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId, sql, ...(opts || {}) }),
@@ -297,6 +297,7 @@ export function cardSpan(c: Card | null | undefined): Span | null {
   }
   return null
 }
+
 
 
 

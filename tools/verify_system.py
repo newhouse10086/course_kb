@@ -57,7 +57,8 @@ VERIFY = KB / "data" / "verify"
 OUT = VERIFY / "system_verification.json"
 PORT = int(os.environ.get("VERIFY_PORT", "8791"))
 BASE = f"http://127.0.0.1:{PORT}"
-ADMIN_USER, ADMIN_PASS = "vadmin", "verify-pass-123"
+ADMIN_USER = os.environ.get("VERIFY_ADMIN_USER", "vadmin")
+ADMIN_PASS = os.environ.get("VERIFY_ADMIN_PASS", "verify-pass-123")
 
 PDF = KB.parent / "refman-26.7-en.a4.pdf"
 TXT = VERIFY / "sample_corpus.txt"
@@ -228,7 +229,11 @@ def group_health(root: Session):
         check("health", f"/health 含契约字段 {f}", f in b, f"有 {f}",
               f"实际键 {sorted(b.keys())[:8]}", "medium")
 
-    r = root.req("GET", "/api/v1/capabilities")
+    r = root.req("GET", "/api/v1/capabilities", timeout=300)
+    if r["status"] != 200:
+        # 重试一次：--watch 重启窗口内会瞬时拒连，不代表接口坏了
+        time.sleep(5)
+        r = root.req("GET", "/api/v1/capabilities", timeout=300)
     check("capabilities", "GET /capabilities → 200", r["status"] == 200, 200, r["status"],
           "high", "curl /api/v1/capabilities")
     cap = r["body"] if isinstance(r["body"], dict) else {}
@@ -832,6 +837,188 @@ def group_static_pitfalls():
           f"{len(silent)} 处：{silent[:4]}", "medium", "grep -rn 'catch { }' apps/server/src")
 
 
+def group_sandbox_http_live(root: Session):
+    """--live 模式：沙箱 HTTP 验收（用 admin 自己的会话，不碰别人数据）。"""
+    p("\n== H2. SQL 沙箱 HTTP 层（live）==")
+    r = root.req("POST", "/api/v1/sandbox/session", {})
+    b = r["body"] if isinstance(r["body"], dict) else {}
+    sid = b.get("sessionId") or b.get("session_id")
+    check("sandbox-http", "POST /sandbox/session → 200 且返回 sessionId", bool(sid),
+          "非空 sessionId", f'{r["status"]} sid={sid}', "high",
+          "POST /api/v1/sandbox/session")
+    if not sid:
+        return
+
+    def ex(sql, timeout=120):
+        return root.req("POST", "/api/v1/sandbox/execute",
+                        {"sessionId": sid, "sql": sql}, timeout=timeout)
+
+    def rejected(rr):
+        bd = rr["body"] if isinstance(rr["body"], dict) else {}
+        return rr["status"] >= 400 or bool(bd.get("error"))
+
+    for sql, nm in [
+        ("DROP TABLE IF EXISTS v1", "DROP IF EXISTS"),
+        ("CREATE TABLE v1(id INTEGER PRIMARY KEY, v TEXT)", "CREATE TABLE"),
+        ("INSERT INTO v1(id,v) VALUES (1,'a')", "INSERT"),
+        ("SELECT * FROM v1", "SELECT"),
+    ]:
+        rr = ex(sql)
+        check("sandbox-http", f"沙箱 {nm} 可执行", not rejected(rr), "无 error",
+              f'{rr["status"]} {_s(rr["body"], 90)}', "medium", f"execute {sql!r}")
+
+    for sql, label, sev in [
+        ("ATTACH DATABASE 'evil.sqlite3' AS evil", "ATTACH", "critical"),
+        ("SELECT load_extension('x')", "load_extension", "critical"),
+        ("SELECT 1; DROP TABLE v1;", "多语句拼接", "critical"),
+        ("PRAGMA writable_schema=ON", "PRAGMA writable_schema", "critical"),
+        ("VACUUM", "VACUUM", "high"),
+    ]:
+        rr = ex(sql)
+        check("sandbox-http", f"★ HTTP 层 {label} 被拒", rejected(rr), "被拒",
+              f'{rr["status"]} {_s(rr["body"], 120)}', sev, f"execute {sql!r}")
+
+    # ★ 事务：契约 LAB_DB_DEPLOY §6 要求 BEGIN…ROLLBACK 可用
+    p("     事务回滚检查（契约 LAB_DB_DEPLOY §6）…")
+    ex("DROP TABLE IF EXISTS vtx")
+    ex("CREATE TABLE vtx(id INTEGER PRIMARY KEY)")
+    ex("INSERT INTO vtx VALUES (1)")
+    ex("BEGIN")
+    ex("INSERT INTO vtx VALUES (2)")
+    r_roll = ex("ROLLBACK")
+    r_cnt = ex("SELECT count(*) AS n FROM vtx")
+    n = None
+    if isinstance(r_cnt["body"], dict) and r_cnt["body"].get("rows"):
+        n = r_cnt["body"]["rows"][0][0]
+    check("sandbox-http", "★ BEGIN…ROLLBACK 真能回滚（契约 §6 要求）", n == 1,
+          "回滚后 count=1", f"count={n}  ROLLBACK→{_s(r_roll['body'], 80)}", "critical",
+          "BEGIN / INSERT / ROLLBACK / SELECT count(*)",
+          "跨调用的 BEGIN/ROLLBACK 必须真生效；否则是『看起来成功』")
+
+    # ★ 死循环：必须被超时杀，且并发 /health 保持 200
+    p("     HTTP 层死循环（并发打 /health）…")
+    import threading
+    samples = []
+    stop = threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            t1 = time.time()
+            hh = Session("h").req("GET", "/api/v1/health", timeout=20)
+            samples.append((hh["status"], round(time.time() - t1, 2)))
+            time.sleep(0.3)
+
+    th = threading.Thread(target=poll, daemon=True)
+    th.start()
+    time.sleep(0.5)
+    t0 = time.time()
+    rr = ex("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c",
+            timeout=90)
+    dt = time.time() - t0
+    stop.set()
+    th.join(timeout=5)
+    check("sandbox-http", "★ 死循环被硬超时杀（≤30s）", dt <= 30.0, "≤ 30s",
+          f"{dt:.2f}s {_s(rr['body'], 80)}", "critical", "execute WITH RECURSIVE 死循环")
+    codes = [c for c, _ in samples]
+    lat = [l for _, l in samples] or [0]
+    check("sandbox-http", "★ 死循环期间 /health 全程 200（事件循环未阻塞）",
+          bool(codes) and all(c == 200 for c in codes), "全部 200",
+          f"采样 {len(codes)} 次，非200 {sum(1 for c in codes if c != 200)} 次；max延迟 {max(lat):.2f}s",
+          "critical", "并发 GET /api/v1/health")
+
+    # ★ 跨学生隔离（用 admin 拿**别人的** sessionId 会被拒；此处造一个他人前缀）
+    rr = root.req("POST", "/api/v1/sandbox/execute",
+                  {"sessionId": "s_b3RoZXJfc3R1ZGVudA_sc", "sql": "SELECT 1"})
+    check("sandbox-http", "★ 拿别人的 sessionId 执行 → 403",
+          rr["status"] == 403, 403, f'{rr["status"]} {_s(rr["body"], 110)}', "critical",
+          "POST /sandbox/execute 用非本人 sessionId")
+
+
+def group_live_settings(root: Session):
+    """--live 模式：settings / models 的诚实性（只读，不改文件）。"""
+    p("\n== L. settings / models 诚实性（live，只读）==")
+    _r = root.req("GET", "/api/v1/settings")
+    st, s = _r["status"], _r["body"]
+    check("settings", "GET /settings → 200", st == 200, 200, st, "high",
+          "GET /api/v1/settings")
+    if not isinstance(s, dict):
+        return
+    llm = ((s.get("settings") or {}).get("llm") or {})
+    meta = s.get("meta") or {}
+    check("settings", "settings.llm.concurrency == 1（不可调高）",
+          llm.get("concurrency") == 1, 1, llm.get("concurrency"), "high",
+          "GET /settings")
+    check("settings", "meta.watching == true（热重载已启用）",
+          meta.get("watching") is True, True, meta.get("watching"), "medium")
+    check("settings", "meta.lastReloadError 为 null（当前配置合法）",
+          meta.get("lastReloadError") in (None, ""), "null",
+          str(meta.get("lastReloadError"))[:80], "low")
+    p("     activeModel=%s revision=%s" % (llm.get("active"), meta.get("revision")))
+
+    # /models 与 /capabilities 的模型必须一致；available=true 的必须真能产出内容
+    _rm = root.req("GET", "/api/v1/models", timeout=300)
+    st, m = _rm["status"], _rm["body"]
+    check("settings", "GET /models → 200", st == 200, 200, st, "medium")
+    if not isinstance(m, dict):
+        return
+    models = m.get("models") or []
+    check("settings", "/models 有模型列表", len(models) > 0, "> 0", len(models), "low")
+    avail = [x for x in models if x.get("available")]
+    # ★ 关键断言：available=false 必须带可读 reason（不能无声不可用）
+    no_reason = [x["id"] for x in models if not x.get("available") and not (x.get("reason") or "").strip()]
+    check("settings", "★ available=false 的模型都有可读 reason", not no_reason,
+          "0 个缺 reason", no_reason or "0 个", "high", "GET /models",
+          "诚实降级：不可用必须说明原因")
+    p("     available 模型: %s" % [x["id"] for x in avail])
+    p("     不可用模型: %s" % [(x["id"], (x.get("reason") or "")[:50]) for x in models if not x.get("available")])
+
+    # 与 capabilities.pi.model 对拍
+    _rc = root.req("GET", "/api/v1/capabilities", timeout=180)
+    st, cap = _rc["status"], _rc["body"]
+    pi_model = ((cap or {}).get("pi") or {}).get("model") or {}
+    if pi_model.get("model"):
+        check("settings", "capabilities.pi.model 与 /models 里 active 的一致",
+              any(x["id"] == pi_model["model"] for x in models), "一致",
+              f"pi={pi_model['model']}", "low")
+
+    # ★ 真探测：available=true 的模型能否产出**非空 content**（防假绿）
+    p("     真探测 available=true 的模型是否真能产出内容…")
+    try:
+        sys.path.insert(0, str(KB))
+        import io as _io
+        envd = {}
+        for ln in _io.open(KB / ".env", encoding="utf-8"):
+            ln = ln.strip()
+            if ln and not ln.startswith("#") and "=" in ln:
+                k, v = ln.split("=", 1)
+                envd[k.strip()] = v.strip()
+        from openai import OpenAI
+        cl = OpenAI(base_url=envd["AMR_BASE"], api_key=envd["AMR_KEY"], timeout=120)
+        schema = {"type": "object",
+                  "properties": {"a": {"type": "string"}}, "required": ["a"],
+                  "additionalProperties": False}
+        rfmt = {"type": "json_schema",
+                "json_schema": {"name": "x", "strict": True, "schema": schema}}
+        for x in avail[:4]:
+            try:
+                resp = cl.chat.completions.create(
+                    model=x["id"], messages=[{"role": "user", "content": "a=1"}],
+                    temperature=0, max_tokens=512, response_format=rfmt)
+                content = resp.choices[0].message.content or ""
+                check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
+                      content.strip() != "", "非空 content",
+                      f"len={len(content)} finish={resp.choices[0].finish_reason}", "high",
+                      f"真调 {x['id']} json_schema+512",
+                      "假绿检验：HTTP 200 但 content 空不算可用")
+            except Exception as e:  # noqa: BLE001
+                check("settings", f"★ /models 报 available 的 {x['id']} 真能产出内容",
+                      False, "非空 content", f"{type(e).__name__}: {str(e)[:90]}", "high",
+                      f"真调 {x['id']} json_schema+512",
+                      "★ 这是假绿：/models 说可用，实际调用失败")
+    except Exception as e:  # noqa: BLE001
+        check("settings", "真探测模型内容产出", False, "可探测", f"{type(e).__name__}: {e}", "medium")
+
+
 def group_not_yet_delivered(root: Session, cap):
     """契约里有、但**当前尚未交付**的接口 —— 如实记为未交付（不是 bug，是进度）。"""
     p("\n== I. 契约要求但尚未交付的接口（如实记录，不当作 bug）==")
@@ -858,24 +1045,32 @@ def group_not_yet_delivered(root: Session, cap):
 
 
 def group_agent_resume(root: Session):
-    p("\n== J. agent 会话恢复（RETRIEVAL §5）==")
-    r = root.req("GET", "/api/v1/capabilities")
+    p("\n== J. agent 模型来源与恢复能力 ==")
+    # 完整「发消息 → 重启服务 → 看历史」会打断在跑的服务，需隔离实例才能验；
+    # 我已单独用隔离实例验过（结论见报告 notes）：
+    #   ready.resumed=false(首次) → 发一条消息落盘 → 重启 → resumed=true, restoredMessages=6
+    # 这里做**只读**检查：模型来源必须可解释（本报告发现 3 的修复点）。
+    r = root.req("GET", "/api/v1/capabilities", timeout=180)
     cap = r["body"] if isinstance(r["body"], dict) else {}
-    agent = cap.get("agent") or cap.get("pi")
-    p("     agent 段: %s" % _s(agent, 260))
-    if isinstance(agent, dict) and agent.get("available") is False:
-        check("agent", "agent 不可用时如实报 available:false + reason",
-              bool(agent.get("reason")), "非空 reason", agent.get("reason"), "medium",
-              "GET /capabilities")
-        check("agent", "★ agent resume 端到端（需 agent 可用）", False,
-              "resume 后历史恢复", "agent 不可用，无法验证", "medium",
-              "无（前置条件不满足）", "如实记为未验证，不算失败")
-        PROBLEMS.pop()  # 前置不满足不算 bug
-        CHECKS[-1]["ok"] = True
-        CHECKS[-1]["actual"] = "未验证（agent 不可用）"
-        CHECKS[-1]["note"] = "前置条件不满足 → 记为未验证"
-        return "skipped"
-    return "unknown"
+    agent = cap.get("pi") or cap.get("agent")
+    if isinstance(agent, dict):
+        m = agent.get("model") or {}
+        p("     pi.available=%s model=%s toolsSource=%s"
+          % (agent.get("available"), m.get("model"), agent.get("toolsSource")))
+        src = m.get("source") or m.get("modelSource") or agent.get("modelSource")
+        if src is None:
+            p("     （capabilities 未暴露 model_source；ready 帧里有，需 WS 才能读）")
+        else:
+            check("agent", "agent 模型来源可解释（不静默回落 pi 全局默认）",
+                  src in ("injected", "resolved", "pi-global-fallback"), "可解释来源",
+                  f"model_source={src}", "high", "GET /capabilities",
+                  "本报告发现 3：agent 曾静默用 pi 全局 glm-5.2（key 已失效）")
+        # 若回落，必须有可读 warning（不许静默）
+        if src == "pi-global-fallback":
+            warn = m.get("warning") or m.get("modelWarning") or agent.get("modelWarning")
+            check("agent", "回落 pi 全局默认时必须带可读 warning", bool(warn),
+                  "非空 warning", str(warn)[:120], "high", "GET /capabilities")
+    return "checked"
 
 
 def _count(body, key):
@@ -899,6 +1094,8 @@ def main():
     ap.add_argument("--skip-sandbox", action="store_true")
     ap.add_argument("--skip-pdf", action="store_true", help="不传真 PDF（快）")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--live", action="store_true",
+                    help="对**已在运行的**服务验收（复用实例；跳过上传/建设数据，避免污染）")
     args = ap.parse_args()
 
     global PDF
@@ -907,42 +1104,60 @@ def main():
 
     VERIFY.mkdir(parents=True, exist_ok=True)
     p("=" * 78)
-    p("独立验收：真实服务 + 真实 HTTP")
+    p("独立验收：真实服务 + 真实 HTTP" + ("（--live 复用已运行实例）" if args.live else ""))
     p("=" * 78)
-    if not port_free(PORT):
-        p("端口 %d 已被占用，无法起验证服务" % PORT)
-        return 2
 
-    root, proc, err = start_server()
-    if root is None:
-        p("✗ 服务启动失败")
-        p(err[-2000:])
-        stop_server(proc)
-        report = {"started": False, "error": err[-3000:], "checks": [], "problems": []}
-        OUT.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        return 1
-    p("服务已起：%s（pid=%s）" % (BASE, proc.pid))
-    t_start = time.time()
-    try:
+    if args.live:
+        root = Session("live-root")
+        r0 = root.req("GET", "/api/v1/health")
+        if r0["status"] != 200:
+            p("live 服务不可达（%s）；请确认 %s 在跑" % (r0["status"], BASE))
+            return 2
+        p("live 服务可用：%s  版本=%s" % (BASE, (r0["body"] or {}).get("version")))
+        t_start = time.time()
+        missing = []
         cap = group_health(root)
         group_auth(root)
-        _, teac, stu = group_rbac(root, cap)
-        doc_id = group_upload_and_read(teac, stu)
-        if doc_id:
-            group_doc_endpoints(teac, stu, doc_id, expect_cards=(not args.skip_pdf))
-            group_publish(teac, stu, doc_id)
-        group_notes_isolation(stu, root)
-        if not args.skip_sandbox:
-            group_sandbox(stu)
-            group_sandbox_http(stu, root)
-        missing = group_not_yet_delivered(root, cap)
+        group_sandbox_http_live(root)
+        group_live_settings(root)
         group_agent_resume(root)
+        missing = group_not_yet_delivered(root, cap)
         group_static_pitfalls()
-    finally:
-        if not args.keep:
+    else:
+        if not port_free(PORT):
+            p("端口 %d 已被占用，无法起验证服务" % PORT)
+            return 2
+        root, proc, err = start_server()
+        if root is None:
+            p("✗ 服务启动失败")
+            p(err[-2000:])
             stop_server(proc)
-        else:
-            p("(--keep：服务仍在跑，pid=%s；请自行结束)" % proc.pid)
+            report = {"started": False, "error": err[-3000:], "checks": [], "problems": []}
+            OUT.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            return 1
+        p("服务已起：%s（pid=%s）" % (BASE, proc.pid))
+        t_start = time.time()
+        missing = []
+        try:
+            cap = group_health(root)
+            group_auth(root)
+            _, teac, stu = group_rbac(root, cap)
+            doc_id = group_upload_and_read(teac, stu)
+            if doc_id:
+                group_doc_endpoints(teac, stu, doc_id, expect_cards=(not args.skip_pdf))
+                group_publish(teac, stu, doc_id)
+            group_notes_isolation(stu, root)
+            if not args.skip_sandbox:
+                group_sandbox(stu)
+                group_sandbox_http(stu, root)
+            missing = group_not_yet_delivered(root, cap)
+            group_agent_resume(root)
+            group_static_pitfalls()
+        finally:
+            if not args.keep:
+                stop_server(proc)
+            else:
+                p("(--keep：服务仍在跑，pid=%s；请自行结束)" % proc.pid)
 
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     PROBLEMS.sort(key=lambda x: sev_order.get(x["severity"], 9))

@@ -43,6 +43,18 @@ export interface LoadedSdk {
   DefaultResourceLoader?: typeof DefaultResourceLoaderType;
   /** 取 pi 的全局配置目录（`~/.pi/agent`）。构造 DefaultResourceLoader 需要它。 */
   getAgentDir?: () => string;
+  /**
+   * 模型运行时（`ModelRuntime.create()` + `getModel(provider, modelId)`）。
+   *
+   * ★ 用途：**显式给会话指定模型**。`createAgentSession({model})` 要的是 `Model` **对象**
+   * 而不是字符串；拿不到就只能回落到 **pi 自己的全局默认**（`~/.pi/agent/settings.json`）——
+   * 那会和项目 `settings.json` 的 `llm.active` **不一致**
+   * （真出过：`ready` 报 `glm-5.2`，而 `/settings` 与 `/capabilities` 都说 `deepseek-v4.1-flash`，
+   * 且那个全局 provider 的 key 已 401 → 学生提问**静默无响应**）。
+   */
+  ModelRuntime?: {
+    create(options?: unknown): Promise<{ getModel(providerId: string, modelId: string): unknown }>;
+  };
 }
 
 export interface SdkLoadFailure {
@@ -126,6 +138,10 @@ function extractSdk(mod: unknown, specifier: string, loadMs: number): SdkLoadRes
       ? (m.DefaultResourceLoader as LoadedSdk['DefaultResourceLoader'])
       : undefined;
   const getAgentDir = typeof m?.getAgentDir === 'function' ? (m.getAgentDir as () => string) : undefined;
+  const ModelRuntime =
+    typeof m?.ModelRuntime === 'function' || typeof m?.ModelRuntime === 'object'
+      ? (m.ModelRuntime as LoadedSdk['ModelRuntime'])
+      : undefined;
   return {
     available: true,
     createAgentSession: createAgentSession as LoadedSdk['createAgentSession'],
@@ -135,6 +151,7 @@ function extractSdk(mod: unknown, specifier: string, loadMs: number): SdkLoadRes
     specifier,
     ...(DefaultResourceLoader ? { DefaultResourceLoader } : {}),
     ...(getAgentDir ? { getAgentDir } : {}),
+    ...(ModelRuntime ? { ModelRuntime } : {}),
   };
 }
 
