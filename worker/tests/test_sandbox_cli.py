@@ -55,9 +55,13 @@ def test_engines_job_reports_honestly(sandbox_root: str) -> None:
     assert data["defaultEngine"] == "sqlite"
     engines = {e["id"]: e for e in data["engines"]}
     assert engines["sqlite"]["available"] is True
-    assert engines["sqlite"]["capabilities"] == {
-        "crud": True, "ddl": True, "transactions": True, "procedures": False,
-        "maxRowsDefault": 200}
+    caps = engines["sqlite"]["capabilities"]
+    assert caps["crud"] is True and caps["ddl"] is True and caps["procedures"] is False
+    assert caps["maxRowsDefault"] == 200
+    # ★ 事务：结构化上报（same_call 可以，cross_call 不行 + 给出可用参数）
+    assert caps["transactions"]["same_call"] is True
+    assert caps["transactions"]["cross_call"] is False
+    assert caps["transactions"]["batch_param"] == "multi"
     for eid in ("mysql", "postgres", "opengauss"):
         assert engines[eid]["available"] is False
         assert engines[eid]["reason"], "不可用必须给可读原因"
@@ -128,6 +132,21 @@ def test_exec_crud_over_cli(session: dict) -> None:
     assert d["affected"] == 1
     code, d, _ = run_cli("sandbox.exec", {**session, "sql": "SELECT COUNT(*) AS n FROM t_cli"})
     assert d["rows"] == [[1]]
+
+
+def test_single_statement_tx_control_rejected_via_cli(session: dict) -> None:
+    """★ 单发事务控制 → `E_SQL_UNSUPPORTED`（HTTP/CLI 两侧语义一致，且**不是学生的错**）。"""
+    for sql in ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT sp1"):
+        code, d, _ = run_cli("sandbox.exec", {**session, "sql": sql})
+        assert code == 0, sql                       # 仍然是"这条 SQL 失败"，不是 job 失败
+        assert d["ok"] is False, sql
+        assert d["error"]["code"] == "E_SQL_UNSUPPORTED", sql
+        assert d["error"]["who"] == "rules"
+        assert d["txUnsupported"] is True
+        assert "multi" in d["error"]["hint"]
+    # 数据没被动过
+    code, d, _ = run_cli("sandbox.exec", {**session, "sql": "SELECT COUNT(*) AS n FROM students"})
+    assert d["rows"] == [[6]]
 
 
 def test_exec_transaction_batch(session: dict) -> None:

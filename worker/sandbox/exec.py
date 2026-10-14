@@ -26,7 +26,7 @@ from typing import Any
 
 from worker.sandbox import history as history_mod
 from worker.sandbox.errmsg import interpret_error
-from worker.sandbox.guard import check_sql, dialect_hints
+from worker.sandbox.guard import check_sql, dialect_hints, is_tx_control
 from worker.sandbox.paths import SandboxRoots
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -81,6 +81,35 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
                     error=verdict.msg, code=verdict.code, kind=verdict.kind, elapsed_ms=0,
                     row_count=0)
         return result
+
+    # ①b ★**单独发**的事务控制语句：诚实拒绝（不是静默失败、也不是假成功）
+    #    为什么必须拒：每次执行都是**独立进程 + 独立连接**（这是硬超时安全的代价），
+    #    所以 `BEGIN` 开的事务在连接关闭时就没了 —— 单发 BEGIN 报成功，随后 ROLLBACK
+    #    报 "no transaction is active"，而中间的 INSERT **已被提交**（backend-api 独立复现：
+    #    期望 1 行、实际 2 行）。这是"看起来成功"的最坏形态，必须显式说清。
+    #    同一次调用内的批次（`multi:true`）**事务语义完全正确**，所以引导到批次。
+    if not allow_multi and is_tx_control(verdict.kind):
+        msg = ("沙箱每次执行都是独立进程，事务状态无法跨调用保留 → "
+               f"单发的 {verdict.kind} 不会生效（后续语句会被立即提交）")
+        if record_history:
+            _record(roots, user_id, session_id, sql=sql, ok=False, error=msg,
+                    code="E_SQL_UNSUPPORTED", kind=verdict.kind, elapsed_ms=0, row_count=0)
+        return {
+            "columns": [], "rows": [], "rowCount": 0, "elapsedMs": 0,
+            "engine": "sqlite", "hints": hints, "ok": False,
+            "killedBy": None, "hardKilled": False, "txUnsupported": True,
+            "error": {
+                "code": "E_SQL_UNSUPPORTED",
+                "message": msg,
+                "raw": msg,
+                "hint": ("做事务实验请把整批语句放进**同一次**请求："
+                         '{"sql":"BEGIN; INSERT …; ROLLBACK;","multi":true}（已实测可用）；'
+                         "或用 sandbox.reset 恢复初始数据"),
+                "localReading": "沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）",
+                "localMatched": True,
+                "who": "rules",
+            },
+        }
 
     payload = {
         "db_path": str(path),

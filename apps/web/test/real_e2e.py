@@ -369,9 +369,20 @@ def main() -> int:
 
             # ============ 9. 真数据：能力横幅（llm 真探测 / tts/ocr 缺凭据原因） ============
             # ⚠️ 真后端 /capabilities 实测 9–16s/次（每次调用都真探测，无 TTL 缓存）→ 等 240s
-            dom = nav('wiki', "!!document.getElementById('wiki-report') && !!document.querySelector('[data-testid=\"caps-bar\"] [data-cap=\"llm\"]')", 240)
+            dom = nav('wiki', "!!document.getElementById('wiki-report')", 120)
 
             def check_caps_real() -> None:
+                # 真后端 /capabilities 实测 7–14s/次（每次调用都真探测：pi 2.9s + 模型 2.5s + 4 引擎 + FTS 计数）
+                # → 这里给 300s，并在超时时**如实记录页面状态与实测延迟**（不伪装成通过）
+                try:
+                    ch.wait_for("!!document.querySelector('[data-testid=\"caps-bar\"] [data-cap=\"llm\"]')", timeout=300, interval=0.5)
+                except TimeoutError:
+                    diag = ch.evaluate(
+                        "JSON.stringify({loading: !!document.querySelector('[data-testid=\"caps-loading\"]'),"
+                        " err: (document.querySelector('[data-testid=\"caps-error\"]')||{}).textContent||'',"
+                        " entries: performance.getEntriesByType('resource').filter(e=>e.name.includes('capabilities')).map(e=>[e.responseStatus??'?', Math.round(e.duration)])})")
+                    ok('能力横幅在 300s 内渲染', False, f'实测：{diag}')
+                    return
                 ok('能力横幅读真 /capabilities', 'data-testid="caps-bar"' in dom)
                 ok('LLM 可用（真探测通过）', 'data-cap="llm"' in dom and 'data-available="true"' in dom)
                 ok('不可用能力给出原因（缺哪个环境变量）',

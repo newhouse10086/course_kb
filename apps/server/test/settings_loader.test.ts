@@ -28,6 +28,7 @@ import {
   validateSettings,
   writeSettingsFile,
   HARD_LLM_CONCURRENCY,
+  SANDBOX_ENGINES,
   defaultSettings,
   sandboxLimitsOf,
 } from '../src/settings/index.ts';
@@ -529,13 +530,48 @@ test('sandboxLimitsOf() 给出平铺视图（供 routes/sandbox.ts 直接消费�
   });
 });
 
+test('★ COURSE_KB_SETTINGS_FILE 可把配置指向别处（测试/多环境隔离，避免改到真实配置）', () => {
+  const d = dir();
+  const f = path.join(d, 'elsewhere.json');
+  writeJson(f, { version: 1, llm: { active: 'env-file-model' } });
+  const prev = process.env.COURSE_KB_SETTINGS_FILE;
+  process.env.COURSE_KB_SETTINGS_FILE = f;
+  try {
+    // root 指向一个**不存在** config 的目录：只有环境变量生效才读得到
+    const r = loadSettings({ root: path.join(d, 'no-such-root') });
+    assert.equal(r.source, 'file');
+    assert.equal(r.settings.llm.active, 'env-file-model');
+    assert.equal(r.path, f);
+    // 显式 file 参数优先于环境变量（不被劫持）
+    const other = path.join(d, 'explicit.json');
+    writeJson(other, { version: 1, llm: { active: 'explicit-wins' } });
+    const r2 = loadSettings({ root: d, file: other });
+    assert.equal(r2.settings.llm.active, 'explicit-wins');
+  } finally {
+    if (prev === undefined) delete process.env.COURSE_KB_SETTINGS_FILE;
+    else process.env.COURSE_KB_SETTINGS_FILE = prev;
+  }
+  // 清理后不应再影响其它用例
+  const after = loadSettings({ root: d });
+  assert.equal(after.source, 'default', '环境变量清理后应回到"文件缺失→默认"');
+});
+
 test('真实仓库的 config/settings.json 能通过校验（防止我自己的示例文件非法）', () => {
   const root = path.resolve(import.meta.dirname, '..', '..', '..');
   const r = loadSettings({ root });
   assert.equal(r.source, 'file', `仓库里应有合法的 config/settings.json（实际 source=${r.source}）`);
-  assert.equal(r.settings.llm.active, 'deepseek-v4.1-flash');
-  assert.equal(r.settings.llm.concurrency, 1);
-  assert.equal(r.settings.sandbox.engine, 'sqlite');
-  assert.equal(r.ignored.length, 0, '仓库文件不该触发任何钳制');
+  // ⚠️ **不断言具体模型名**：`llm.active` 是**运行期故意可改**的（热切换 / 设置页 PUT）——
+  //    断言具体值会让"教师正常切换模型"把测试搞红。**实测踩到**：04:07 有人把 active
+  //    从 deepseek-v4.1-flash 切成 glm-5.3（正好证明热切换在真应用里生效），于是这条断言变红。
+  //    这里只断言**结构性不变量**。
+  assert.ok(r.settings.llm.active.trim().length > 0, 'active 必须是非空模型名');
+  assert.equal(r.settings.llm.concurrency, 1, '并发硬要求：任何情况下都是 1');
+  assert.ok(
+    SANDBOX_ENGINES.includes(r.settings.sandbox.engine),
+    `engine 必须是封闭枚举之一，实际 ${r.settings.sandbox.engine}`,
+  );
+  assert.ok(r.settings.sandbox.limits.maxRows > 0);
+  // 配置健康闸：谁把 maxTokens 调太小 / 触发钳制，会在这里被发现
+  assert.equal(r.ignored.length, 0, `仓库文件不该触发钳制，实际：${JSON.stringify(r.ignored)}`);
   assert.deepEqual(r.warnings, [], `仓库文件不该有告警，实际：${JSON.stringify(r.warnings)}`);
 });

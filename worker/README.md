@@ -445,10 +445,49 @@ worker 外壳统一保证协议格式与退出码。
 | `sandbox.datasets` | `{with_sql?}` | `sc` / `employees` / `orders`（含教学点与方言说明） |
 | `sandbox.init` | `{user_id, session_id, dataset?, root?}` | 建/取会话；`created` 区分"新建/复用"；带 `schema` + `capabilities` |
 | `sandbox.reset` | 同上 | **真 reset**：先 DROP 掉库里**所有**用户表，再重建数据集 |
-| `sandbox.exec` | `{user_id, session_id, sql, multi?, max_rows?, timeout_ms?}` | `{columns, rows, rowCount, truncated, elapsedMs, affected?, ok, error?}` |
+| `sandbox.exec` | `{user_id, session_id, sql, multi?, max_rows?, timeout_ms?}` | `{columns, rows, rowCount, truncated, elapsedMs, affected?, ok, error?}`；`multi:true` 时 `statements[]` 逐条回报；事务见 §10.1.1 |
 | `sandbox.schema` | `{user_id, session_id, with_text?}` | `{dialect, tables:[{name, columns:[{name,type,pk,notnull,fk}], rows}]}` |
 | `sandbox.history` | `{user_id, session_id, limit?, request_user_id?}` | `[{at, sql, ok, error?, rowCount?, elapsedMs?}]`（**只读 + 隔离**） |
 | `sandbox.logs` | `{…, limit?, since?, with_text?, request_user_id?}` | `{source, entries:[LogEntry], count, boundary?, text?}`（L1） |
+
+### 10.1.1 ★ 事务：**同一次执行内可用，跨调用不支持**（如实说明，别当成 bug 去"修"）
+
+```jsonc
+// ✅ 正确用法：整批语句放**同一次**请求（multi:true）—— 同进程同连接，语义完全正确
+{"job":"sandbox.exec","sql":"BEGIN; INSERT INTO students(sid,sname) VALUES(555,'x'); ROLLBACK;",
+ "multi":true, ...}
+//   ROLLBACK 版：行数**不变**；COMMIT 版：行数 **+1**（两条都有测试）
+
+// ❌ 跨调用（单发）会**被明确拒绝**，而不是假成功
+{"job":"sandbox.exec","sql":"BEGIN"}       // → ok:false, error.code="E_SQL_UNSUPPORTED"
+{"job":"sandbox.exec","sql":"ROLLBACK"}    // → 同上（不会出现"no transaction is active"这种底层错）
+```
+
+**为什么不做跨调用事务**（架构取舍，不是没做）：
+每次执行都是**独立进程 + 独立连接**，这是**两条安全属性的前提** ——
+① **硬超时能真杀**（`WITH RECURSIVE` 死循环不拖死服务）；② **学生之间天然隔离**（无共享连接状态）。
+为了一个语法糖引入会话级长连接，等于**拿两条安全属性换一个便利**。→ 不换。
+
+**原 bug（backend-api 独立复现）**：单发 `BEGIN` 报 `ok:true`、`INSERT` 报 `ok:true`、
+随后 `ROLLBACK` 报 `cannot rollback - no transaction is active`，**而数据已被提交**
+（期望 1 行、实际 2 行）—— "看起来成功"的最坏形态。现在单发即拒：
+
+```jsonc
+{"ok":false, "txUnsupported":true,
+ "error":{"code":"E_SQL_UNSUPPORTED",
+   "message":"沙箱每次执行都是独立进程，事务状态无法跨调用保留 → 单发的 BEGIN 不会生效（后续语句会被立即提交）",
+   "localReading":"沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）",
+   "hint":"做事务实验请把整批语句放进**同一次**请求：{\"sql\":\"BEGIN; INSERT …; ROLLBACK;\",\"multi\":true}（已实测可用）；或用 sandbox.reset 恢复初始数据",
+   "who":"rules"}}
+```
+`who:"rules"` = **规则限制，不是学生的错**（与 S4 的责任方枚举一致）。
+`/capabilities` 也如实上报（**不再是裸 bool**）：
+
+```jsonc
+"capabilities": {"crud":true, "ddl":true, "procedures":false, "maxRowsDefault":200,
+  "transactions": {"same_call":true, "cross_call":false, "batch_param":"multi",
+    "note":"事务需在**同一次执行内**完成（每次 execute 独立进程 —— 这是硬超时强杀与学生隔离的前提）"}}
+```
 
 ### 10.2 安全（**每条都有负例测试**）
 

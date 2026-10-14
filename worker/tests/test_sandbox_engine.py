@@ -163,8 +163,17 @@ def test_engines_report_shape_for_capabilities() -> None:
     sqlite = report["sqlite"]
     assert sqlite["available"] is True
     assert sqlite["runtime"] == "embedded" and sqlite["dialect"] == "sqlite"
-    assert sqlite["capabilities"] == {"crud": True, "ddl": True, "transactions": True,
-                                      "procedures": False, "maxRowsDefault": 200}
+    # ★ 事务能力必须**结构化**：布尔值 `transactions: true` 是误导信号
+    #   （单发 BEGIN 在"每次执行独立进程"的沙箱里不可能生效 —— Lead 裁定）
+    caps = sqlite["capabilities"]
+    assert caps["crud"] is True and caps["ddl"] is True
+    assert caps["procedures"] is False and caps["maxRowsDefault"] == 200
+    tx = caps["transactions"]
+    assert isinstance(tx, dict), "transactions 不能是裸 bool（会误导 /capabilities 与前端）"
+    assert tx["same_call"] is True and tx["cross_call"] is False
+    assert tx["batch_param"] == "multi"
+    assert "同一次执行" in tx["note"] and "独立进程" in tx["note"]
+    assert "multi" in tx["note"]
     # 不可用的一定有 reason（UI 要显示"为什么不能选 + 指向文档"）
     for eid in ("mysql", "postgres", "opengauss"):
         assert report[eid]["available"] is False

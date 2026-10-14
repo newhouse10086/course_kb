@@ -228,6 +228,18 @@ def split_statements(sql: str) -> list[str]:
     return out
 
 
+#: 事务控制类语句。**单独发**时在"每次执行一个新进程/新连接"的沙箱里**无法生效** ——
+#: 见 `exec.py::execute` 的诚实拒绝（E_SQL_UNSUPPORTED），这是 backend-api 独立复现的 bug：
+#: 单发 `BEGIN` 报成功、随后 `ROLLBACK` 报 "no transaction is active"，而数据**已被提交**。
+TX_CONTROL_KINDS = ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "END")
+
+
+def is_tx_control(kind: str) -> bool:
+    """这一句（或这一批）是不是**纯事务控制**语句。"""
+    kinds = [k for k in str(kind or "").split(";") if k]
+    return bool(kinds) and all(k in TX_CONTROL_KINDS for k in kinds)
+
+
 def statement_kind(clean: str) -> str:
     m = _KIND_RE.match(clean.strip())
     return m.group(0).upper() if m else ""

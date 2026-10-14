@@ -536,6 +536,7 @@ test('★ 跨调用事务：单发 BEGIN/COMMIT/ROLLBACK → **如实拒绝**（
       assert.equal(e.code, 'E_SQL_UNSUPPORTED', `${sql} 错误码`);
       assert.equal(e.who, 'rules', `${sql} 责任方 = 沙箱能力限制（不是学生写错）`);
       assert.match(String(e.hint), /multi/, `${sql} 必须指出可用路径（multi:true）`);
+      assert.match(String(e.hint), /独立进程/, `${sql} hint 必须解释"为什么"（安全前提），不是"能力缺失"`);
       assert.equal(e.interim, true, '标明这是过渡期的诚实闸');
     }
 
@@ -621,6 +622,10 @@ test('/capabilities 的 sandbox 段：真探测（engine 可用 + 逐引擎原�
     assert.equal(seg.defaultEngine, 'sqlite');
     assert.equal(seg.available, true, JSON.stringify(seg).slice(0, 200));
     assert.ok((seg.engines as unknown[]).length >= 4, '应逐引擎上报（sqlite/mysql/postgres/opengauss）');
+    // ★ 临时诚实标注（Lead 裁定）：不许让 /capabilities 宣称"支持事务"而不说清是**同次执行内**
+    assert.equal(seg.transactions_cross_call, false, '必须如实标注"跨调用事务不支持"');
+    assert.match(String(seg.transactions_note), /独立进程/);
+    assert.match(String(seg.transactions_note), /multi:true/);
   } finally {
     await live.built.close();
   }

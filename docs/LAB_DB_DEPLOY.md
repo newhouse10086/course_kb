@@ -245,12 +245,39 @@ gsql -d postgres -p 5432 -U labadmin -W '改我' -c 'select version();'
 | 建表 / 改表 / 删表 | ✅ | ✅ | DDL |
 | 插入 / 更新 / 删除 | ✅ | ✅ | **增删改** |
 | 查询（含 JOIN/子查询/聚合/窗口） | ✅（窗口函数 3.25+ 支持） | ✅ | 查 |
-| 事务 / 回滚 | ✅ | ✅ | `BEGIN…ROLLBACK` |
+| 事务 / 回滚 | ✅ **仅同一次执行内** | ✅ | `BEGIN…ROLLBACK` —— ⚠️ **必须整批提交**，见下方说明 |
 | 视图 / 索引 / 触发器 | 视图索引✅ 触发器✅ | ✅ | |
 | 存储过程 | ❌ | ✅ | **差异要在 UI 标注** |
 | 权限/角色演练 | ❌ | ✅ | 用实验账号（非超管）可演示 GRANT |
 
 **每个数据集带 `reset`**：一键回到初始 schema，学生搞坏了可恢复。
+
+### ⚠️ 事务**必须整批提交**（这是设计，不是缺陷）
+
+**实测发现的问题**（`polysemy-prober` 独立验收 + `backend-api` 独立复现）：
+```
+跨调用： BEGIN → ok=True | INSERT → ok=True | ROLLBACK → ok=False "no transaction is active"
+        回滚后 count=2  ← 期望 1：**数据已被提交**
+```
+**根因**：`worker/sandbox/runner.py` 每次 `execute` **新进程新连接**（`isolation_level=None` 即 autocommit），
+`BEGIN` 开启的事务随连接关闭而消失。
+
+**为什么不修成会话级长连接**（裁定记录）：
+> 「**每次执行一个独立进程**」不是实现细节，而是**两条安全属性的前提**：
+> ① **硬超时能真杀**（学生写 `WITH RECURSIVE` 死循环不会拖死服务）
+> ② **学生之间天然隔离**（无共享连接状态）
+> 为了"跨调用事务"引入会话级连接，等于**拿两条安全属性换一个语法糖** —— 不换。
+
+**正确用法**（已实测）：把整个事务放进**一次**执行，`multi:true`：
+```jsonc
+{"sql": "BEGIN; INSERT INTO t VALUES (1); ROLLBACK;", "multi": true}   // 行数不变 ✅ 真回滚
+{"sql": "BEGIN; INSERT INTO t VALUES (1); COMMIT;",  "multi": true}   // 行数 +1   ✅ 真提交
+```
+**前端必须提供"整批执行"入口**（否则学生做不了事务实验）。
+
+**能力上报**：`sandbox.engines[].capabilities.transactions` 形如
+`{same_call: true, cross_call: false, note: "…"}` —— **不许只报一个 `true`**（那是误导）。
+单发事务控制语句会被拒：`E_SQL_UNSUPPORTED` + `who='rules'` + 可读 hint（**不是学生的错**）。
 
 ---
 

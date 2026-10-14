@@ -75,10 +75,44 @@ export function sanitizeIdPart(value: string): string {
  *   → ok=True，行数 +1 ✅
  * ```
  *
- * ⚠️ **worker 实现会话级事务后请把它改成 `false`**（或在 `sandbox.engines` 的能力报告里
- *    给出 `transactions.cross_call=true` 后自动判定）—— 那时单发 `BEGIN` 才有意义。
+ * ## worker 侧**也**已拒绝（backend-core 修完）→ 本闸自动降级为"纵深防御"
+ * worker 的 `sandbox.engines` 现在给**结构化**能力：`transactions:{same_call:true, cross_call:false, batch_param:'multi'}`。
+ * 本闸据此**自动判定**：`cross_call === true` → 自动放开（零改动）；`false`/探测不到 → 保持拦截（fail-safe）。
+ * 保留它的价值：① 少起一个子进程就给出可读错误；② 万一 worker 回退，HTTP 层仍然不会说谎。
  */
 export const REJECT_CROSS_CALL_TX = true;
+
+/** 探测结果缓存（TTL 内不重复起 worker；worker 升级后**无需重启**即可自动放开）。 */
+const TX_PROBE_TTL_MS = 60_000;
+let txProbeCache: { at: number; crossCall: boolean | null } | null = null;
+
+/**
+ * 是否应当拦截"跨调用事务控制语句"（**纯函数**，便于单测穷尽）。
+ *
+ * @param enabled 总开关（`REJECT_CROSS_CALL_TX`）
+ * @param crossCall worker 的能力报告：`true` 支持跨调用事务 / `false` 不支持 / `null` 探测不到
+ */
+export function shouldGuardCrossCallTx(enabled: boolean, crossCall: boolean | null): boolean {
+  if (!enabled) return false;
+  // 只有 worker **明确**说支持时才放开；说不支持或探测不到都保持拦截（fail-safe）
+  return crossCall !== true;
+}
+
+/** 从 `sandbox.engines` 结果里读"跨调用事务是否支持"（新形状是对象；旧布尔形状也兼容读）。 */
+export function readCrossCallTx(enginesResult: unknown): boolean | null {
+  const engines = (enginesResult as { engines?: unknown[] } | null)?.engines;
+  if (!Array.isArray(engines)) return null;
+  const sqlite = engines.find((e) => (e as { id?: string }).id === 'sqlite') as
+    | { capabilities?: { transactions?: unknown } }
+    | undefined;
+  const tx = sqlite?.capabilities?.transactions;
+  if (typeof tx === 'boolean') return tx;
+  if (tx && typeof tx === 'object' && 'cross_call' in tx) {
+    const cc = (tx as { cross_call?: unknown }).cross_call;
+    return typeof cc === 'boolean' ? cc : null;
+  }
+  return null;
+}
 
 /** 跨调用事务控制语句（词法判定，足够严格：只认"整条语句就是它"）。 */
 const TX_CONTROL_RE = /^\s*(begin(\s+(deferred|immediate|exclusive|transaction))?|commit(\s+transaction)?|rollback(\s+transaction)?|savepoint\s+\S+|release(\s+savepoint)?\s+\S+)\s*;?\s*$/i;
@@ -105,18 +139,20 @@ export function crossCallTxRejection(sessionId: string, sql: string): Record<str
     error: {
       code: 'E_SQL_UNSUPPORTED',
       message:
-        '沙箱每次执行都是**独立进程**，事务状态无法跨调用保留：单独发 BEGIN/COMMIT/ROLLBACK 不具备事务语义',
+        '沙箱每次执行都在**独立进程**中运行，事务状态无法跨调用保留：单独发 BEGIN/COMMIT/ROLLBACK 不具备事务语义',
       raw: sql,
       hint:
-        '做事务实验请把整批语句放在**同一次**请求里：{"sql":"BEGIN; INSERT …; ROLLBACK;","multi":true}（已在同一次调用内实测可用）；或用 POST /sandbox/reset 恢复初始数据',
-      localReading: '沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）',
+        '本沙箱**每次执行都在独立进程中运行**（这是硬超时能强杀查询、且学生之间互不影响的前提），因此事务必须在**同一次执行内**完成。请整批提交：{"sql":"BEGIN; INSERT …; ROLLBACK;","multi":true}（已实测可用；或用 POST /sandbox/reset 恢复初始数据）。',
+      localReading:
+        '沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）——这是**有意设计的安全属性**，不是功能残缺',
       localMatched: true,
-      // 责任方 = 沙箱规则/能力限制（**不是学生的错**），与 §10.3 的 who 枚举一致
+      // 责任方 = 沙箱规则/设计约束（**不是学生的错**），与 §10.3 的 who 枚举一致
       who: 'rules',
-      who_label: '沙箱能力限制',
+      who_label: '沙箱设计约束',
       who_source: 'http-layer-guard',
-      interim: true,
-      see_also: 'worker/sandbox/runner.py（每次调用独立进程 + autocommit）',
+      // worker 侧也已拒绝（同码同语义）；这里是**纵深防御**：少起一个子进程 + HTTP 层永不说谎
+      defense_in_depth: true,
+      see_also: 'worker/sandbox/runner.py（每次调用独立进程 + autocommit）；worker/README.md §10.1.1',
     },
   };
 }
@@ -182,7 +218,8 @@ export function sandboxSseFrame(event: string, data: Record<string, unknown>): s
   return `event: ${event}\ndata: ${safeJsonStringify(data)}\n\n`;
 }
 
-/** worker 结果 → 学生可读的 `error`（含 `who` 透传）。 */export function decorateError(raw: unknown): Record<string, unknown> | null {
+/** worker 结果 → 学生可读的 `error`（含 `who` 透传）。 */
+export function decorateError(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== 'object') return null;
   const e = raw as Record<string, unknown>;
   const code = typeof e.code === 'string' ? e.code : '';
@@ -218,6 +255,24 @@ export function registerSandboxRoutes(app: FastifyInstance, deps: AppDeps): void
    * 传到 dataDir 下还有一个好处：清库/备份/迁移 `data/` 一次搞定。
    */
   const sandboxRoot = (): string => path.join(deps.cfg.dataDir, 'sandbox');
+
+  /**
+   * 探测 worker 是否支持**跨调用**事务（带 TTL 缓存；探测失败 → `null` = 保持拦截的 fail-safe）。
+   * 目的：worker 将来真接了会话级事务（`transactions.cross_call=true`）时，本闸**零改动自动放开**。
+   */
+  const crossCallTxSupport = async (): Promise<boolean | null> => {
+    const now = Date.now();
+    if (txProbeCache && now - txProbeCache.at < TX_PROBE_TTL_MS) return txProbeCache.crossCall;
+    try {
+      const out = await callWorker('sandbox.engines', { root: sandboxRoot() }, 30_000);
+      const cc = readCrossCallTx(out);
+      txProbeCache = { at: now, crossCall: cc };
+      return cc;
+    } catch {
+      txProbeCache = { at: now, crossCall: null }; // 探测失败：不放开（fail-safe）
+      return null;
+    }
+  };
 
   /** 调 worker 并**如实**处理两类失败（job 失败 vs 引擎不可用）。 */
   async function callWorker(
@@ -296,10 +351,15 @@ export function registerSandboxRoutes(app: FastifyInstance, deps: AppDeps): void
       const maxRows = num(body.maxRows, lim.maxRows, 1, 5000);
       const timeoutMs = num(body.timeoutMs, lim.timeoutMs, 100, 60_000);
 
-      // ★ 临时诚实闸：单发的 BEGIN/COMMIT/ROLLBACK… 在"每次一进程"的沙箱里**不具备事务语义**
-      //   （worker 连接一关事务就没了）→ 宁可如实拒绝，也不返回一个假的 ok:true。
+      // ★ 纵深防御闸：单发的 BEGIN/COMMIT/ROLLBACK… 在"每次一进程"的沙箱里**不具备事务语义**。
+      //   是否拦截由 worker 的能力报告自动决定（`cross_call===true` 时自动放开）；
+      //   worker 现在也会拒（同码同语义），这里只是**少起一个子进程**并保证 HTTP 层永不说谎。
       //   `multi:true`（整批在同一次调用内）不受影响，那是**真正可用**的事务实验路径。
-      if (REJECT_CROSS_CALL_TX && body.multi !== true && isCrossCallTxControl(sql)) {
+      if (
+        body.multi !== true &&
+        shouldGuardCrossCallTx(REJECT_CROSS_CALL_TX, await crossCallTxSupport()) &&
+        isCrossCallTxControl(sql)
+      ) {
         return reply.send(crossCallTxRejection(sessionId, sql));
       }
 

@@ -25,6 +25,27 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 
+#: ★ 事务能力必须**结构化上报**（Lead 裁定）：
+#: 单发 `BEGIN` 在"每次执行独立进程"的沙箱里**不可能生效**（连接一关事务就没了），
+#: 所以 `transactions: true` 这种布尔值是**误导信号** —— `/capabilities` 与前端
+#: 会据此宣称"支持事务"。而"每次执行独立进程"是**两条安全属性的前提**：
+#: ① 硬超时能真杀（死循环不拖死服务）② 学生之间天然隔离（无共享连接状态）。
+#: → 我们选择**保住安全属性**，把能力说清楚，并把可用路径（同一次调用内）指出来。
+TRANSACTIONS_SQLITE: dict[str, Any] = {
+    "same_call": True,
+    "cross_call": False,
+    "batch_param": "multi",
+    "note": ("事务需在**同一次执行内**完成（每次 execute 独立进程 —— 这是硬超时强杀"
+             "与学生隔离的前提）：{\"sql\":\"BEGIN; …; ROLLBACK;\",\"multi\":true}"),
+}
+#: server 类引擎（PG/MySQL）在同一层也还没接会话级连接 → 同样如实报 cross_call=False
+TRANSACTIONS_SERVER: dict[str, Any] = {
+    "same_call": True,
+    "cross_call": False,
+    "batch_param": "multi",
+    "note": "adapter 尚未接入；接入后按各自驱动如实上报",
+}
+
 @dataclass
 class EngineInfo:
     """引擎自述（字段与契约 §2 ``EngineInfo`` 一一对应）。"""
@@ -36,8 +57,8 @@ class EngineInfo:
     available: bool
     reason: str = ""
     capabilities: dict[str, Any] = field(default_factory=lambda: {
-        "crud": True, "ddl": True, "transactions": True, "procedures": False,
-        "maxRowsDefault": 200,
+        "crud": True, "ddl": True, "transactions": TRANSACTIONS_SQLITE,
+        "procedures": False, "maxRowsDefault": 200,
     })
     target: dict[str, Any] = field(default_factory=dict)   # **脱敏**：不含密码
 
@@ -179,7 +200,8 @@ class SQLiteEngine:
             dialect="sqlite",
             runtime="embedded",
             available=True,
-            capabilities={"crud": True, "ddl": True, "transactions": True,
+            capabilities={"crud": True, "ddl": True,
+                          "transactions": dict(TRANSACTIONS_SQLITE),
                           "procedures": False, "maxRowsDefault": 200},
         )
 
@@ -328,7 +350,8 @@ class _ServerEngineStub:
         self.info = EngineInfo(
             id=engine_id, label=label, dialect=dialect, runtime="server",
             available=False, reason=self._reason(),
-            capabilities={"crud": True, "ddl": True, "transactions": True,
+            capabilities={"crud": True, "ddl": True,
+                          "transactions": dict(TRANSACTIONS_SERVER),
                           "procedures": procedures, "maxRowsDefault": 500},
             # 脱敏：只有 host/port/database（不含密码、不含账号等凭据）
             target={k: v for k, v in (("host", host or None), ("port", port or None),

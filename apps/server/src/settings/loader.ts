@@ -41,12 +41,27 @@ export interface LoadOptions {
 }
 
 /**
+ * `COURSE_KB_SETTINGS_FILE` 覆盖（**测试/多环境隔离**用）。
+ *
+ * 为什么需要它：`SettingsStore` 默认落在 `<root>/config/settings.json`，而**任何 PUT / 热切换
+ * 都会重写该文件**。测试若拿真实 root 建 app，就会**改掉开发者的真实配置**
+ * —— 实测发生过：`config/settings.json` 在跑测试期间被重写（值相同但被重新格式化）。
+ * 有了这个变量，测试只需 `COURSE_KB_SETTINGS_FILE=<tmp>/settings.json` 即可完全隔离。
+ *
+ * ⚠️ 只在 `opts.file` 未显式给出时生效（显式参数优先，避免"传了路径却被环境变量劫持"）。
+ */
+function envSettingsFile(): string | undefined {
+  const trimmed = process.env.COURSE_KB_SETTINGS_FILE?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
  * 读一次设置。
  *
  * @throws SettingsError 文件存在但**非法**（类型错/未知键/凭据）—— 让调用方**拒绝启动**
  */
 export function loadSettings(opts: LoadOptions): LoadResult {
-  const file = resolveSettingsPath(opts.root, opts.file);
+  const file = resolveSettingsPath(opts.root, opts.file ?? envSettingsFile());
   const schemaPath = resolveSchemaPath(opts.root);
   const base = { path: file, schemaPath, loadedAt: Date.now() };
 

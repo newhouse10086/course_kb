@@ -88,16 +88,69 @@ def test_row_limit_truncates_with_flag(sc_db: Path) -> None:
 # ★ 事务（BEGIN … ROLLBACK 真生效）
 # ═══════════════════════════════════════════════════════════════════════
 def test_transaction_rollback_and_commit(sc_db: Path) -> None:
+    """★ `multi:true` 的**同一次调用内**事务语义**完全正确**（Lead 要求钉住两条）。
+
+    为什么必须"同一次调用内"：每次执行都是**独立进程 + 独立连接**（硬超时强杀与学生隔离的
+    前提）→ 连接一关，事务就没了。所以可用路径是"整批语句放同一次请求"。
+    """
     before = ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0]
+    # ① 回滚：行数**不变**
     r = ex(sc_db, "BEGIN; INSERT INTO students(sid, sname) VALUES(555,'回滚'); ROLLBACK;",
            allow_multi=True)
     assert r["ok"] is True
     assert [(s["kind"], s["ok"]) for s in r["statements"]] == [("BEGIN", True), ("INSERT", True), ("ROLLBACK", True)]
     assert ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0] == before
 
+    # ② 提交：行数 **+1**
     r2 = ex(sc_db, "BEGIN; INSERT INTO students(sid, sname) VALUES(556,'提交'); COMMIT;",
             allow_multi=True)
     assert r2["ok"] is True
+    assert ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0] == before + 1
+
+
+@pytest.mark.parametrize("sql,kind", [
+    ("BEGIN", "BEGIN"),
+    ("BEGIN TRANSACTION", "BEGIN"),
+    ("COMMIT", "COMMIT"),
+    ("ROLLBACK", "ROLLBACK"),
+    ("SAVEPOINT sp1", "SAVEPOINT"),
+    ("RELEASE sp1", "RELEASE"),
+])
+def test_single_statement_tx_control_is_honestly_rejected(sc_db: Path, sql: str, kind: str) -> None:
+    """★ **单发**事务控制语句必须**诚实拒绝**（不能假成功）。
+
+    原 bug（backend-api 独立复现）：单发 `BEGIN` 报 ok=true、`INSERT` 报 ok=true、
+    随后 `ROLLBACK` 报 "no transaction is active"，**而数据已被提交**（期望 1 行、实际 2 行）——
+    "看起来成功"的最坏形态。现在单发即拒，并引导到 `multi:true` 批次。
+    """
+    r = ex(sc_db, sql)
+    assert r["ok"] is False
+    assert r["error"]["code"] == "E_SQL_UNSUPPORTED"
+    assert kind in r["error"]["message"]
+    assert "跨调用" in r["error"]["localReading"]
+    assert r["error"]["who"] == "rules"           # 规则限制，**不是学生的错**
+    assert r["txUnsupported"] is True
+    assert "multi" in r["error"]["hint"]          # 给出可用路径
+    # 拒绝后数据不变（不能"报错还写进去"）
+    assert ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0] == 6
+
+
+def test_cross_call_tx_is_not_fake_success(sc_db: Path) -> None:
+    """★ 回归：**跨调用**事务不再产生"假成功 + 数据已提交"的组合。"""
+    before = ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0]
+    # 学生按直觉分三次发（跨调用）——第一句就被明确拒绝
+    r1 = ex(sc_db, "BEGIN")
+    assert r1["ok"] is False and r1["error"]["code"] == "E_SQL_UNSUPPORTED"
+    # 后续语句照常执行（autocommit），但学生**已经被提前告知**事务没生效
+    r2 = ex(sc_db, "INSERT INTO students(sid, sname) VALUES(777,'跨调用')")
+    assert r2["ok"] is True
+    r3 = ex(sc_db, "ROLLBACK")
+    assert r3["ok"] is False and r3["error"]["code"] == "E_SQL_UNSUPPORTED"
+    # 数据确实被提交了 —— 这正是为什么必须**提前**说清，而不是让学生以为回滚了
+    assert ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0] == before + 1
+    # 正确写法（同一次调用）能真回滚
+    r4 = ex(sc_db, "BEGIN; DELETE FROM students WHERE sid=777; ROLLBACK;", allow_multi=True)
+    assert r4["ok"] is True
     assert ex(sc_db, "SELECT COUNT(*) AS n FROM students")["rows"][0][0] == before + 1
 
 
