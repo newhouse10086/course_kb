@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * Docs —— 文档管理（上传 / 列表 / 进度 / 打开）
  *   · 上传走 POST /api/v1/documents（multipart），XHR 给上传进度
@@ -6,8 +6,9 @@
  *   · 长任务必须能"看到进度"，而不是转圈等（C4 断点在服务端，前端负责可见）
  *   · 删除走 DELETE（级联）
  */
-import { computed, nextTick, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { setAssistantContext } from '../composables/useAssistantContext'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client'
 import { TaskStream } from '../api/sse'
 import { useDocuments } from '../composables/useCorpus'
@@ -15,6 +16,7 @@ import { fmtBytes, fmtMs } from '../utils/text'
 import { testBarrier, testBarrierDone, writeReport } from '../utils/report'
 import type { DocumentInfo } from '../api/types'
 
+const route = useRoute()
 const router = useRouter()
 const docsApi = useDocuments()
 const busy = ref(false)
@@ -25,6 +27,12 @@ const taskInfo = ref<{ id: string; text: string; progress: number | null; done: 
 const fileInput = ref<HTMLInputElement | null>(null)
 const dragOver = ref(false)
 const streams: TaskStream[] = []
+
+/** 未登录（401）与"没有文档"要分开说 —— 真后端 auth.required=true 时前者才是常态 */
+const authError = computed(() => {
+  const e = String(docsApi.error.value || '')
+  return /E_UNAUTHENTICATED|未登录|401/.test(e) ? `未登录（401）：${e}` : ''
+})
 
 const rows = computed(() =>
   docsApi.docs.value.slice().sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0)))
@@ -102,6 +110,11 @@ function openDoc(d: DocumentInfo, view: 'wiki' | 'graph' | 'video') {
   void router.push({ path: `/${view}`, query: { doc: d.id } })
 }
 
+// ★ 小助手上下文：当前选中的 doc
+watch(() => route.query.doc, (d: unknown) => {
+  setAssistantContext(d ? { doc_id: String(d) } : {}, d ? '当前文档' : '')
+}, { immediate: true })
+
 onMounted(async () => {
   testBarrier()
   await docsApi.load()
@@ -163,7 +176,13 @@ onMounted(async () => {
           </tr>
         </tbody>
       </table>
-      <div v-if="!rows.length && !docsApi.loading.value" class="note info" data-testid="docs-empty">
+      <!-- ⚠️ 401（未登录）与"真的没有文档"是两回事：不能都说"还没有文档"（对着真后端实测踩到）
+           模板里 ref 自动解包 → 写 `authError` 而不是 `authError.value` -->
+      <div v-if="!rows.length && authError" class="note bad" data-testid="docs-unauthenticated">
+        {{ authError }}
+        <RouterLink :to="{ path: '/login', query: { next: '/docs' } }" style="margin-left: 6px">去登录 →</RouterLink>
+      </div>
+      <div v-else-if="!rows.length && !docsApi.loading.value" class="note info" data-testid="docs-empty">
         还没有文档。上传一份 PDF 或视频，服务端会跑解析 + 抽取；长任务有断点，可以中断后再续。
       </div>
       <div class="small faint" style="margin-top: 8px">
@@ -184,6 +203,8 @@ onMounted(async () => {
 .table th, .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
 .ops { display: flex; gap: 4px; flex-wrap: wrap; }
 </style>
+
+
 
 
 

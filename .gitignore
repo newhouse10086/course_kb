@@ -1,4 +1,4 @@
-﻿# ═══════════════ 课程知识平台 · 仓库排除规则 ═══════════════
+# ═══════════════ 课程知识平台 · 仓库排除规则 ═══════════════
 # ⚠️ 提交前务必跑： python tools/precommit_secret_scan.py
 
 # ── 凭据（最重要）──
@@ -46,4 +46,5 @@ apps/web/test/screenshots/*.png
 # ── 临时 ──
 *.log
 *.tmp
-_*.py
+# ⚠️ 不要用 _*.py：它会匹配 __init__.py，导致包标记不被跟踪、clone 后 worker 直接坏掉（真实踩过）
+_scratch_*.py

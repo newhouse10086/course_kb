@@ -32,12 +32,14 @@
 
 import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { AgentSession, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
 
-import { AGENT_ERROR_CODES, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
+import { AGENT_ERROR_CODES, HINT_SDK_OK, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
+import { composeMessageWithContext, sanitizeUntrusted } from './guards.ts';
+import { KB_TOOL_NAMES, type KbProvider } from './kb_tools.ts';
 import { loadSdk, type SdkLoadResult } from './sdk.ts';
 import {
   beginRound,
@@ -56,6 +58,7 @@ import {
 /** 默认空闲回收：30 分钟（契约 §7.4 的 v2 等价物） */
 export const DEFAULT_IDLE_TTL_MS = 30 * 60 * 1000;
 /** `prompt()` resolve 之后，再等 settled 的上限（正常应立刻拿到） */
+export const DEFAULT_PROMPT_TIMEOUT_MS = 120_000;
 export const DEFAULT_SETTLE_GRACE_MS = 5_000;
 
 /** 我们用到的 `AgentSession` 成员（结构化声明，避免与 SDK 类型版本强耦合）。 */
@@ -82,12 +85,71 @@ export interface AgentManagerOptions {
   sessionDir?: string | null;
   /** 是否持久化（默认 true；`sessionDir === null` 时自动 ephemeral） */
   persist?: boolean;
-  /** 显式工具白名单（`null`/缺省 = 用 pi 默认；`[]` = 全关） */
+  /**
+   * 工具白名单（**默认 `[]` = 不给任何工具**，fail-safe）。
+   *
+   * ⚠️ 为什么默认必须是空：pi 不传 `tools` 时会用它自己的**默认全集**
+   * （实测 `["read","bash","edit","write"]`）。学生面向的 chat 一旦走这个默认，
+   * 学生只要说一句"用 bash 执行 X"，**服务器就真的执行并把输出贴回去** ——
+   * 独立验收在 live 8787 上用 `student` 角色复现了（还能 `read` 任意文件、`edit`/`write` 同在）。
+   * 这等于绕过整个 RBAC 与沙箱设计。
+   *
+   * - `[]`（默认）→ 显式关掉全部工具
+   * - `['read', 'search_kb']` → 只给白名单里这些
+   * - 想用 pi 的默认全集 → 必须**显式**开 `allowPiDefaultTools: true`（危险，仅限可信角色）
+   */
   tools?: string[] | null;
+  /**
+   * ★ 显式允许回落到 **pi 的默认工具全集**（`read`/`bash`/`edit`/`write`）。
+   *
+   * 默认 **false**（fail-safe）：不设置 `tools` 时我们传 `[]`，把工具关掉。
+   * 只有确实需要（例如管理员在本机使用的运维会话）才打开 —— 打开前后务必确认调用方已按角色收窄。
+   */
+  allowPiDefaultTools?: boolean;
   excludeTools?: string[];
+  /**
+   * ★ 允许白名单里出现 **危险内置工具**（`bash`/`edit`/`write`/`read`）。
+   *
+   * 默认 **false**：即使调用方显式列了这几个名字，也会被**丢出白名单**并记诊断。
+   * 理由（真事故）：`read`/`bash` 能读主机任意文件、执行任意命令 ——
+   * 学生面向的会话里出现任何一个，都等于绕过 RBAC 与 SQL 沙箱。
+   * 需要"读知识库原文"请给**专用只读工具**（如 `kb_read`），不要用主机 `read`。
+   */
+  allowDangerousTools?: boolean;
   thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   idleTtlMs?: number;
   settleGraceMs?: number;
+  /**
+   * ★ 本轮**硬超时**（默认 120s）：到点仍未收到 `agent_settled` / 拒绝 → 发 `E_PI_TIMEOUT`
+   * + 一条 synthetic `settled`，**绝不让客户端无限等待**。
+   *
+   * 为什么必须有：SDK 的 `prompt()` 在**上游失败**（如 401）时可能既不 resolve、
+   * 也不发出可映射的失败事件 —— 真机验收里学生就是"发完提问永远转圈、一帧都没有"。
+   * 宁可如实报超时，也不要静默悬挂（"看起来成功"那类最危险）。
+   */
+  promptTimeoutMs?: number;
+  /**
+   * ★ **显式指定模型**（`Model` 对象，或 `'providerId/modelId'` 字符串）。
+   *
+   * 不设时尝试用 `resolveConfiguredModelRef()`（项目 config 的 active LLM）解析；
+   * 再不行就**只能**回落 pi 的全局默认 —— 那时 `ready` 帧会如实标
+   * `modelSource:'pi-global-fallback'` + `modelWarning`（不许静默用错模型）。
+   */
+  model?: unknown;
+  /** 注入模型运行时（不传则用 SDK 的 `ModelRuntime.create()`） */
+  modelRuntime?: unknown;
+  /** 解析模型用的 pi 模型目录（`models.json`；默认走 agentDir） */
+  modelsPath?: string;
+  /**
+   * ★ 知识库**只读**查询能力（`agent` 模式的 `kb_search`/`kb_get` 用它；`context` 帧解析 id 也用它）。
+   *
+   * **内部必须已按 `userId` 过滤可见性**（backend-api 的 `kbQuery` 走 `docScopeSql()`）；
+   * 工具这边只透传**服务端身份**，绝不接受客户端给的 userId。
+   * 缺省 = kb 工具不可用 → `agent` 模式如实降级（工具集为空 + 可读原因）。
+   */
+  kb?: KbProvider | null;
+  /** 单条原文下发到工具/上下文的上限（默认 4000 字；超出截断并**如实标注**） */
+  kbMaxTextChars?: number;
   /**
    * **替换** pi 默认的系统提示词（不设置就用 pi 默认的 coding-agent 提示词）。
    *
@@ -121,6 +183,25 @@ export interface SessionInit {
   persistence: 'native' | 'ephemeral';
   persistenceReason: string;
   version: string | null;
+  /**
+   * 是否**从磁盘恢复**了历史（RETRIEVAL.md §5 要求 3）。
+   * `false` + `resumeReason` 一起看：可能是"本来就没有历史"，也可能是"读不了"。
+   */
+  resumed?: boolean;
+  /** 恢复出来的历史消息条数（`message` 类条目） */
+  restoredMessages?: number;
+  /** `resumed=false` 时的**可读原因**（损坏/不兼容/首次），不许静默 */
+  resumeReason?: string;
+  /**
+   * 模型是从哪来的：
+   * - `injected`       = 调用方显式传了 `Model` 对象
+   * - `resolved`       = 由 `provider/model` 字符串或项目配置解析而来
+   * - `pi-global-fallback` = ★ **没能解析**，回落到了 pi 自己的全局默认
+   *   （`~/.pi/agent/settings.json`）—— 可能与项目 `settings.json` 的 `llm.active` 不一致
+   */
+  modelSource?: 'injected' | 'resolved' | 'pi-global-fallback';
+  /** 模型来源相关的**警告**（非空时要外显给前端/日志，不许静默） */
+  modelWarning?: string;
 }
 
 /** 会话运行统计（诊断用） */
@@ -158,10 +239,269 @@ function defaultCwd(): string {
   }
 }
 
-/** 浏览器会话 id 校验（同时防止把 id 拼进文件路径） */
-const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/**
+ * 解析"本次会话该用哪个模型"。
+ *
+ * 顺序：
+ *  1. `opts.model` 已是 `Model` 对象 → 直接用（`injected`）
+ *  2. `opts.model` 是 `'provider/model'` 字符串 → 用 ModelRuntime 解析（`resolved`）
+ *  3. `opts.model` 没给 → 读**项目配置**的 active LLM（`resolveConfiguredModelRef()`）→ 解析（`resolved`）
+ *  4. 都失败 → `pi-global-fallback` + **可读 warning**（绝不静默用错模型）
+ *
+ * 为什么不能省孤儿步：`createAgentSession` 不传 `model` 时，pi 用 `~/.pi/agent/settings.json`
+ * 里的全局默认。真机事故：全局是 `glm-5.2`/`opencode-go`（key 已 401），而项目配置是
+ * `amr/deepseek-v4.1-flash` → `ready` 帧、`/settings`、`/capabilities` 三处两个答案，
+ * 学生提问**静默无响应**。
+ */
+async function resolveSessionModel(
+  sdk: SdkLoadResult & { available: true },
+  opts: {
+    model?: unknown;
+    modelRuntime?: unknown;
+    modelsPath?: string;
+  },
+  agentDir: string | undefined,
+): Promise<{ model: unknown; source: SessionInit['modelSource']; warning?: string }> {
+  const explicit = opts.model;
+  // 1) 已经是 Model 对象（有 provider/id 之类结构或就是对象）
+  if (explicit !== undefined && typeof explicit === 'object' && explicit !== null) {
+    return { model: explicit, source: 'injected' };
+  }
+
+  // 2/3) 需要一个运行时才能把字符串解析成 Model
+  let runtime = opts.modelRuntime as { getModel?: (p: string, m: string) => unknown } | undefined;
+  if (!runtime && typeof sdk.ModelRuntime?.create === 'function') {
+    try {
+      runtime = (await sdk.ModelRuntime.create({
+        ...(agentDir ? { authPath: join(agentDir, 'auth.json') } : {}),
+        ...(opts.modelsPath
+          ? { modelsPath: opts.modelsPath }
+          : agentDir
+            ? { modelsPath: join(agentDir, 'models.json') }
+            : {}),
+        refreshOnCreate: false,
+      })) as { getModel?: (p: string, m: string) => unknown };
+    } catch (err) {
+      return {
+        model: null,
+        source: 'pi-global-fallback',
+        warning: `模型运行时创建失败（${err instanceof Error ? err.message : String(err)}）→ 回落 pi 全局默认`,
+      };
+    }
+  }
+  const ref = typeof explicit === 'string' && explicit.trim() !== '' ? explicit : await resolveConfiguredModelRef();
+  if (ref && runtime && typeof runtime.getModel === 'function') {
+    const slash = ref.indexOf('/');
+    const provider = slash > 0 ? ref.slice(0, slash) : '';
+    const modelId = slash > 0 ? ref.slice(slash + 1) : ref;
+    const found = provider ? runtime.getModel(provider, modelId) : undefined;
+    if (found) return { model: found, source: 'resolved' };
+    return {
+      model: null,
+      source: 'pi-global-fallback',
+      warning: `模型 ${ref} 在当前模型目录里找不到（provider=${provider || '?'}）→ 回落 pi 全局默认，可能与项目设置不一致`,
+    };
+  }
+  return {
+    model: null,
+    source: 'pi-global-fallback',
+    warning: ref
+      ? `无法解析模型 ${ref}（缺少 ModelRuntime）→ 回落 pi 全局默认，可能与项目设置不一致`
+      : '未能从项目配置里解析出 active 模型 → 回落 pi 全局默认（可能与 /settings 显示的模型不一致）',
+  };
+}
+
+/**
+ * 从**项目配置**里解析出 active LLM 的 `provider/model` 引用。
+ *
+ * 动态 import `../config.ts`（T-BACKEND 的写域，只读不改）；拿不到就返回 null。
+ * 与 `/capabilities` 的凭据解析走**同一条**来源，避免"三处两个答案"。
+ */
+export async function resolveConfiguredModelRef(): Promise<string | null> {
+  const envRef =
+    process.env.LLM_PROVIDER && process.env.LLM_MODEL
+      ? `${process.env.LLM_PROVIDER}/${process.env.LLM_MODEL}`
+      : process.env.LLM_MODEL
+        ? `amr/${process.env.LLM_MODEL}`
+        : null;
+  if (envRef) return envRef;
+  try {
+    const mod = (await import('../config.ts')) as {
+      loadConfig?: () => { llm?: { active?: string; providerId?: string; model?: string } };
+    };
+    const cfg = mod.loadConfig?.();
+    const llm = cfg?.llm;
+    if (llm) {
+      if (typeof llm.active === 'string' && llm.active.includes('/')) return llm.active;
+      if (typeof llm.providerId === 'string' && typeof llm.model === 'string') {
+        return `${llm.providerId}/${llm.model}`;
+      }
+      if (typeof llm.providerId === 'string' && typeof llm.active === 'string') {
+        return `${llm.providerId}/${llm.active}`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 校验 pi 的 `auth.json` **形状**（不是内容安全，只看结构）。
+ *
+ * 为什么需要：形状错时 pi **不报错也不作答**（静默挂死），排查成本极高。
+ * 实测（backend-api 的四形状对照）：
+ * ```
+ * {"amr":{"type":"api_key","key":"…"}}                  → ❌ 静默挂死（25s 零帧 → E_PI_TIMEOUT）
+ * {"amr":{"type":"api_key","apiKey":"…"}}               → ❌ No API key found for amr
+ * {"amr":"<key>"}                                        → ⚠️ 不报错但零内容
+ * {"providers":{"amr":{"type":"api_key","key":"…"}}}    → ✅ 唯一可用形状
+ * ```
+ *
+ * 策略（保守，不误伤）：
+ * - 文件**不存在** → 放行（生产可能走 env / 其他凭据来源，不能替 pi 判死）
+ * - JSON 解析失败 → 拒绝（明确给解析错）
+ * - 有 `providers` 层：每个条目必须是对象且 `type` + `key` 齐备（`apiKey` 单独不算）
+ * - **没有 `providers` 层**（顶层直接是 provider 名）→ 拒绝（这就是静默挂死的那个形状）
+ * - 值是字符串（`{"amr":"sk-…"}`）→ 拒绝（不报错但零内容）
+ *
+ * ⚠️ 报错信息里**绝不含 key 值**。
+ */
+export function checkAuthShape(agentDir: string | undefined): { ok: boolean; problem?: string; note?: string } {
+  if (!agentDir) return { ok: true };
+  const authPath = join(agentDir, 'auth.json');
+  if (!existsSync(authPath)) return { ok: true, note: `未发现 auth.json（${authPath}）→ 交给 pi 自行解析凭据` };
+
+  let raw: string;
+  try {
+    raw = readFileSync(authPath, 'utf8');
+  } catch (err) {
+    return { ok: true, note: `auth.json 读取失败（${err instanceof Error ? err.message : String(err)}）→ 交给 pi 处理` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return {
+      ok: false,
+      problem: `pi 凭据文件形状不合法：${authPath} 不是合法 JSON（${err instanceof Error ? err.message : String(err)}）—— pi 在这种情况下会**静默挂死**（既不报错也不作答），请修正该文件`,
+    };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      problem: `pi 凭据文件形状不合法：${authPath} 顶层必须是对象（实际 ${Array.isArray(parsed) ? '数组' : typeof parsed}）`,
+    };
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  const wrongShapeHint =
+    `${authPath} 需要这一形状：{"providers":{"<providerId>":{"type":"api_key","key":"<KEY>"}}}。` +
+    `实测：缺 providers 层会让 pi **静默挂死**（既不报错也不作答），只有 providers 包裹的形状可用`;
+
+  // 没有 providers 层：顶层直接写 provider → 就是会挂死的那个形状
+  if (!('providers' in obj)) {
+    const names = Object.keys(obj);
+    // 空的 `{}` 不拦（可能只是没写凭据，pi 会走 env）；但"有 provider 名却没 providers 层"要拦
+    if (names.length === 0) return { ok: true, note: `auth.json 为空对象（${authPath}）` };
+    return {
+      ok: false,
+      problem: `pi 凭据文件形状不合法：${authPath} 缺少 \`providers\` 层（发现顶层键：${names
+        .slice(0, 5)
+        .join(', ')}）。${wrongShapeHint}`,
+    };
+  }
+
+  const providers = obj.providers;
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
+    return { ok: false, problem: `pi 凭据文件形状不合法：${authPath} 的 \`providers\` 必须是对象。${wrongShapeHint}` };
+  }
+
+  for (const [id, entry] of Object.entries(providers as Record<string, unknown>)) {
+    if (typeof entry === 'string') {
+      return {
+        ok: false,
+        problem: `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 是字符串 —— 这种形状 pi 不报错但**不产生任何内容**。${wrongShapeHint}`,
+      };
+    }
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return {
+        ok: false,
+        problem: `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 必须是对象。${wrongShapeHint}`,
+      };
+    }
+    const cred = entry as Record<string, unknown>;
+    if (typeof cred.type !== 'string' || cred.type === '') {
+      return {
+        ok: false,
+        problem: `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 缺少 \`type\`（如 "api_key"）。${wrongShapeHint}`,
+      };
+    }
+    if (typeof cred.key !== 'string' || cred.key === '') {
+      const hadApiKey = typeof cred.apiKey === 'string' && cred.apiKey !== '';
+      return {
+        ok: false,
+        problem:
+          `pi 凭据文件形状不合法：${authPath} 的 providers.${id} 缺少 \`key\`` +
+          `${hadApiKey ? '（写成 `apiKey` 不算 —— 实测 pi 会报 "No API key found"）' : ''}。${wrongShapeHint}`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/** pi 内置的**危险工具**（主机文件读写 / 任意命令执行）。默认一律拒之门外。 */
+export const DANGEROUS_PI_TOOLS = ['bash', 'edit', 'write', 'read'] as const;
+
+/**
+ * 过滤工具白名单：默认把危险内置工具踢掉（除非调用方显式 `allowDangerousTools`）。
+ * 返回 `{ tools, dropped }`；`dropped` 要记诊断（**不许静默**）。
+ */
+export function sanitizeToolList(
+  tools: readonly string[],
+  allowDangerous: boolean,
+): { tools: string[]; dropped: string[] } {
+  if (allowDangerous) return { tools: [...tools], dropped: [] };
+  const dangerous = new Set<string>(DANGEROUS_PI_TOOLS);
+  const dropped = tools.filter((t) => dangerous.has(t));
+  return { tools: tools.filter((t) => !dangerous.has(t)), dropped };
+}
+
+/** 浏览器会话 id 校验（同时防止把 id 拼进文件路径） */const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 export function isValidSessionId(sessionId: string): boolean {
   return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId);
+}
+
+/**
+ * 在会话目录里找某个会话的历史文件（RETRIEVAL.md §5）。
+ *
+ * pi 的命名是 `<ISO时间戳>_<sessionId>.jsonl`；我们用 `NewSessionOptions.id`
+ * 把 pi 的 session id 设成自己的 key，所以直接用后缀匹配即可（不需要映射文件）。
+ * 找不到 → null（调用方据此新建）。
+ */
+export function findSessionFile(sessionDir: string, sessionId: string): string | null {
+  try {
+    const suffix = `_${sessionId}.jsonl`;
+    const matches = readdirSync(sessionDir)
+      .filter((name) => name.endsWith(suffix))
+      .sort(); // ISO 时间戳前缀 → 字典序即时间序
+    const latest = matches.at(-1);
+    return latest ? join(sessionDir, latest) : null;
+  } catch {
+    return null; // 目录不存在/无权限 → 当作没有历史（调用方会新建）
+  }
+}
+
+/** 安全地读会话条目（损坏/结构不同都返回 []，绝不抛）。 */
+function readEntries(sessionManager: unknown): unknown[] {
+  try {
+    const getEntries = (sessionManager as { getEntries?: () => unknown }).getEntries;
+    if (typeof getEntries !== 'function') return [];
+    const entries = getEntries.call(sessionManager);
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
 }
 
 /** 一个被管理的 pi 会话。 */
@@ -181,6 +521,15 @@ export class ManagedAgentSession implements ChatSessionLike {
   private _persistenceReason: string;
   private _version: string | null;
   private _restarted = false;
+  /** ★ 是否从磁盘恢复了历史（RETRIEVAL.md §5 要求 3：可观测） */
+  private _resumed = false;
+  private _restoredMessages = 0;
+  private _resumeReason = '';
+  private _modelSource: SessionInit['modelSource'] = 'pi-global-fallback';
+  private _kbToolsWarning: string | undefined;
+  private _modelWarning: string | undefined;
+  /** 本轮是否被看门狗判超时（之后丢弃迟到事件，避免第二条 settled） */
+  private timedOutRound = false;
   /** 本轮 settled 是否已收到 */
   private settledSeen = false;
   /** 本轮是否以"中断"结束（由 settled 帧固化，供 prompt() 返回值用） */
@@ -195,6 +544,11 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._persistence = init.persistence;
     this._persistenceReason = init.persistenceReason;
     this._version = init.version;
+    this._resumed = init.resumed === true;
+    this._restoredMessages = init.restoredMessages ?? 0;
+    this._resumeReason = init.resumeReason ?? '';
+    this._modelSource = init.modelSource ?? 'pi-global-fallback';
+    this._modelWarning = init.modelWarning;
     // ★ 先订阅（坑 14）：在任何人拿到这个对象、发第一条 prompt 之前就挂好
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
   }
@@ -202,6 +556,10 @@ export class ManagedAgentSession implements ChatSessionLike {
   // ------------------------------------------------------------------
   private onPiEvent(event: SdkEventLike): void {
     this.touch();
+    // ★ 本轮已由**看门狗**结束（超时）→ 丢弃迟到事件：
+    //   否则上游稍后恢复时会把一条迟到的 `agent_settled` 再映射成一帧 settled，
+    //   前端会收到"第二次结束"（也违背契约 §7.2 一轮一条 settled）。
+    if (this.timedOutRound) return;
     let frames: AgentFrame[];
     try {
       frames = mapSdkEvent(event, this.state);
@@ -298,7 +656,7 @@ export class ManagedAgentSession implements ChatSessionLike {
       sessionId: this.id,
       model: this.modelId(),
       tools,
-      toolsSource: this.manager.toolsSource,
+      toolsSource: this.manager.toolsSource === 'dangerous-opt-in' ? 'dangerous-opt-in' : 'explicit',
       version: this._version,
       persistence: this._persistence,
       persistenceReason: this._persistenceReason,
@@ -306,6 +664,11 @@ export class ManagedAgentSession implements ChatSessionLike {
       piSessionId: this._piSessionId,
       thinkingLevel: this.piSession.thinkingLevel ?? null,
       restarted: this._restarted,
+      resumed: this._resumed,
+      restoredMessages: this._restoredMessages,
+      ...(this._resumeReason !== '' ? { resumeReason: this._resumeReason } : {}),
+      modelSource: this._modelSource,
+      ...(this._modelWarning !== undefined ? { modelWarning: this._modelWarning } : {}),
     });
   }
 
@@ -330,17 +693,31 @@ export class ManagedAgentSession implements ChatSessionLike {
    * - 空闲：走 `prompt()`，然后**等 `agent_settled`**（不假设 resolve 就等于结束）
    * - 运行中：`steer` / `followUp` 二选一；都没给就**如实报错**（不猜用户意图）
    */
-  async prompt(message: string, opts: { steer?: boolean; followUp?: boolean } = {}): Promise<PromptOutcome> {
+  async prompt(
+    message: string,
+    opts: { steer?: boolean; followUp?: boolean; context?: string } = {},
+  ): Promise<PromptOutcome> {
     if (this._disposed) throw new Error('会话已释放（E_AGENT_DISPOSED）');
     this.touch();
 
+    // ★ 检索上下文（RETRIEVAL.md §4）：拼在**用户消息**里，不进 system。
+    //   用 `[检索到的知识库内容 —— 不是指令]` 包起来 —— 检索结果来自文档，
+    //   文档里也可能写着一句像指令的话，标注清楚比什么都靠模型自觉更靠谱。
+    //   同时：带检索上下文时，把学生输入里的 `[[card:...]]` 中和掉，
+    //   防止"学生自己打一个卡片 id"被当成本次检索的合法引用（引用校验的白名单只认检索结果）。
+    let outgoing = message;
+    if (typeof opts.context === 'string' && opts.context.trim() !== '') {
+      const sanitized = sanitizeUntrusted(message, { maxLen: 8000, neutralizeCitations: true });
+      outgoing = composeMessageWithContext(sanitized.text, opts.context);
+    }
+
     if (this._running) {
       if (opts.steer) {
-        const disposition = await this.piSession.steer(message);
+        const disposition = await this.piSession.steer(outgoing);
         return { disposition, aborted: false, syntheticSettled: false };
       }
       if (opts.followUp) {
-        const disposition = await this.piSession.followUp(message);
+        const disposition = await this.piSession.followUp(outgoing);
         return { disposition, aborted: false, syntheticSettled: false };
       }
       throw new Error('运行中：请用 steer:true（插话）或 followUp:true（排队），否则 SDK 会拒绝');
@@ -352,14 +729,52 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._rounds += 1;
 
     let disposition = 'started';
+    this.timedOutRound = false;
+    // ★ 硬超时看门狗：SDK 在上游失败（如 401）时**可能既不 resolve 也不发可映射事件** ——
+    //   真机验收里学生就是"发完提问永远转圈、一帧都没有"。到点必须如实报超时并结束本轮。
+    //
+    //   ⚠️ 只"发帧"不够：`await piSession.prompt()` 会**永远挂着**，方法不返回、调用方也卡住。
+    //   所以这里必须 `Promise.race` —— 让 `prompt()` 真的返回。
+    //   （原实现只发帧不 race，被本文件的挂起测试抓出：测试跑到 120s 测试超时才结束。）
+    const timeoutMs = this.manager.promptTimeoutMs;
+    let watchdog: NodeJS.Timeout | undefined;
+    const timeoutMarker = new Promise<'timeout'>((resolve) => {
+      watchdog = setTimeout(() => {
+        this.timedOutRound = true;
+        this._running = false;
+        this.settledSeen = true; // 本轮已结束（看门狗收尾），别再等 settled
+        this.emit(
+          agentError(AGENT_ERROR_CODES.E_PI_TIMEOUT, `本轮运行超过 ${Math.round(timeoutMs / 1000)} 秒仍无结束信号`, {
+            hint: `${HINT_SDK_OK}运行超时/上游无响应（常见：模型凭据失效、网络挂起）—— 已终止本轮，可重试`,
+            detail: `promptTimeoutMs=${timeoutMs}；model=${this.modelId() ?? '?'}；modelSource=${this._modelSource}`,
+          }),
+        );
+        this.emit({ type: 'settled', aborted: false, synthetic: true, disposition: 'timeout' });
+        resolve('timeout');
+      }, timeoutMs);
+      if (typeof (watchdog as { unref?: () => void }).unref === 'function') {
+        (watchdog as { unref: () => void }).unref();
+      }
+    });
     try {
-      await this.piSession.prompt(message, {
-        // SDK 用它告诉我们"这条 prompt 是被受理成 run，还是被 extension 处理掉了"
-        preflightResult: (d) => {
-          if (typeof d === 'string' && d !== '') disposition = d;
-        },
-      });
+      const raced = await Promise.race([
+        this.piSession
+          .prompt(outgoing, {
+            // SDK 用它告诉我们"这条 prompt 是被受理成 run，还是被 extension 处理掉了"
+            preflightResult: (d) => {
+              if (typeof d === 'string' && d !== '') disposition = d;
+            },
+          })
+          .then(() => 'done' as const),
+        timeoutMarker,
+      ]);
+      if (raced === 'timeout') {
+        // 看门狗已发过 error+settled → 立即返回，**不等**那个永不 resolve 的 SDK promise
+        return { disposition: 'timeout', aborted: false, syntheticSettled: true };
+      }
     } catch (err) {
+      if (watchdog) clearTimeout(watchdog);
+      if (this.timedOutRound) return { disposition: 'timeout', aborted: false, syntheticSettled: true };
       this._running = false;
       // prompt() **拒绝**（未受理）：转成分类后的 error 帧，并把本轮视为结束
       const classified = classifyFailure(err, { where: '发送 prompt', model: this.modelId() });
@@ -367,6 +782,7 @@ export class ManagedAgentSession implements ChatSessionLike {
       this.emit({ type: 'settled', aborted: false, synthetic: true, disposition: 'rejected' });
       throw err;
     }
+    if (watchdog) clearTimeout(watchdog);
 
     // `disposition === 'handled'` = 没有启动运行 → 不会有 agent_settled（v1 同款处理）
     if (disposition === 'handled') {
@@ -436,6 +852,12 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._persistenceReason = init.persistenceReason;
     this._version = init.version ?? this._version;
     this._restarted = true;
+    // `new_session` 的语义是"开一个全新的上下文" → createInit 会新建（resumed=false）
+    this._resumed = init.resumed === true;
+    this._restoredMessages = init.restoredMessages ?? 0;
+    this._resumeReason = init.resumeReason ?? '';
+    this._modelSource = init.modelSource ?? 'pi-global-fallback';
+    this._modelWarning = init.modelWarning;
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
     try {
       oldUnsub();
@@ -484,24 +906,62 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   readonly cwd: string;
   readonly agentDir: string | undefined;
   readonly sessionDir: string | null;
-  readonly toolsSource: 'explicit' | 'none';
+  /** 工具从哪来：explicit（我们显式给的，含默认的空集）/ pi-default（**仅当显式放行**） */
+  readonly toolsSource: 'explicit' | 'dangerous-opt-in';
   readonly idleTtlMs: number;
   readonly settleGraceMs: number;
 
   private readonly sessions = new Map<string, ManagedAgentSession>();
   private readonly opts: AgentManagerOptions;
-  private readonly tools: string[] | null;
+  private readonly toolsConfig: string[] | null;
+  private readonly allowPiDefaultTools: boolean;
   private readonly excludeTools: string[] | undefined;
   private readonly onDiagnostic: (message: string) => void;
   private reaper: NodeJS.Timeout | null = null;
+  /** 每个会话本次实际用的工具集（诊断/审计用） */
+  private readonly lastToolsFor = new Map<string, string[] | null>();
+
+  /** 新会话会用的工具白名单（`null` = pi 默认全集）。`/capabilities` 如实上报要用它。 */
+  get tools(): string[] | null {
+    return this.toolsConfig;
+  }
+
+  /** 本轮硬超时（会话层用；没配就用默认 120s） */
+  get promptTimeoutMs(): number {
+    return this.opts.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
+  }
 
   constructor(opts: AgentManagerOptions = {}) {
     this.opts = opts;
     this.cwd = opts.cwd ?? defaultCwd();
     this.agentDir = opts.agentDir;
-    this.tools = opts.tools ?? null;
+    // ★ fail-safe 默认：不显式配置 = **不给任何工具**。
+    //
+    //   真事故（独立验收在 live 8787 用 student 角色复现）：原实现把"没配 tools"当成
+    //   "用 pi 默认"，而 pi 的默认是 `["read","bash","edit","write"]` —— 学生说一句
+    //   "用 bash 执行 X"，服务器就真的执行并把输出贴回去；还能 read 主机任意文件。
+    //   实测（真 SDK，`getActiveToolNames()`）：
+    //     不传 tools → ["read","bash","edit","write"]   ← 危险默认
+    //     tools: []  → []                               ← 空数组确实是"无工具"
+    //   所以这里默认就是 `[]`；要 pi 默认全集必须显式 `allowPiDefaultTools: true`。
+    this.allowPiDefaultTools = opts.allowPiDefaultTools === true;
+    const explicitTools = opts.tools ?? null;
+    if (explicitTools === null) {
+      this.toolsConfig = this.allowPiDefaultTools ? null : [];
+    } else {
+      const cleaned = sanitizeToolList(explicitTools, opts.allowDangerousTools === true);
+      if (cleaned.dropped.length > 0) {
+        (opts.onDiagnostic ?? (() => {}))(
+          `工具白名单里的危险内置工具已被移除：${cleaned.dropped.join(', ')}` +
+            `（read/bash 可读主机文件、执行任意命令；要读知识库请用专用只读工具，确需放开请显式 allowDangerousTools:true）`,
+        );
+      }
+      this.toolsConfig = cleaned.tools;
+    }
+    // ★ 诚实的来源标注：原实现把"没配"标成 'none'（读起来像"没有工具"），
+    //   而实际是 pi 的默认全集 —— 那个自相矛盾的信号（tools=[read,bash…] 而 source='none'）就是事故线索。
+    this.toolsSource = this.toolsConfig === null ? 'dangerous-opt-in' : 'explicit';
     this.excludeTools = opts.excludeTools;
-    this.toolsSource = this.tools !== null ? 'explicit' : 'none';
     this.idleTtlMs = opts.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
     this.settleGraceMs = opts.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
     this.onDiagnostic = opts.onDiagnostic ?? (() => {});
@@ -524,11 +984,25 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   }
 
   /** 造一个 SDK 会话（真路径）。测试可注入 `sessionFactory` 完全绕过。 */
-  async createInit(sessionId: string): Promise<SessionInit> {
+  async createInit(sessionId: string, perSessionTools?: string[] | null, kbUserId?: string): Promise<SessionInit> {
     if (!isValidSessionId(sessionId)) {
       throw new Error(`非法 session id：${sessionId}`);
     }
     if (this.opts.sessionFactory) return this.opts.sessionFactory(sessionId);
+
+    // ★ 前置校验**必须在加载 SDK 之前**：坏形状要"立刻"失败（~5ms），
+    //   而 SDK 动态 import 要 ~2s —— 学生等 2 秒才拿到一个配置错误是没必要的。
+    //   `auth.json` 形状不对时 pi **会静默挂死**（不是报错）。真机对照实验（backend-api 4 次定位）：
+    //     {"amr":{"type":"api_key","key":"…"}}              → 静默挂死（25s 零帧）
+    //     {"amr":"<key>"}                                    → 不报错但零内容
+    //     {"providers":{"amr":{"type":"api_key","key":"…"}}} → ✅ 唯一可用
+    const authCheck = checkAuthShape(this.agentDir);
+    if (!authCheck.ok) {
+      const err = new Error(authCheck.problem);
+      err.name = 'PiAuthShapeInvalid';
+      throw err;
+    }
+    if (authCheck.note) this.diagnostic(authCheck.note);
 
     const sdk = await this.sdkAvailable();
     if (!sdk.available) {
@@ -536,6 +1010,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     }
 
     const persistence: 'native' | 'ephemeral' = this.sessionDir ? 'native' : 'ephemeral';
+    let kbToolsWarning: string | null = null;
     let persistenceReason: string;
     let sessionManager: unknown;
     if (this.sessionDir) {
@@ -546,15 +1021,58 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       }
     }
     const SessionManagerCtor = sdk.SessionManager as unknown as {
-      create(cwd: string, sessionDir?: string): unknown;
+      create(cwd: string, sessionDir?: string, options?: { id?: string }): unknown;
+      open(path: string, sessionDir?: string, cwdOverride?: string): unknown;
       inMemory(cwd?: string): unknown;
     };
+    let resumed = false;
+    let restoredMessages = 0;
+    let resumeReason = '';
     if (this.sessionDir) {
-      sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir);
-      persistenceReason = `pi 原生 session：${this.sessionDir}（首次 prompt 后落盘，恢复用 SessionManager.open/continueRecent）`;
+      // ★ RETRIEVAL.md §5：先尝试**从磁盘恢复**，没有才新建。
+      //   pi 的文件名是 `<ISO时间戳>_<sessionId>.jsonl`，所以我们把**自己的会话 key**
+      //   作为 pi 的 session id 传进去（`NewSessionOptions.id`），文件名就变得可预测 ——
+      //   等价于 v1 的 `--session-id`，不需要额外的映射文件。
+      const existing = findSessionFile(this.sessionDir, sessionId);
+      if (existing) {
+        try {
+          const opened = SessionManagerCtor.open(existing, this.sessionDir, this.cwd);
+          const entries = readEntries(opened);
+          const messages = entries.filter((e) => (e as { type?: unknown }).type === 'message').length;
+          if (entries.length === 0) {
+            // 文件在但读不出条目（截断/损坏）→ 如实降级为新建，**不假装恢复成功**
+            resumeReason = `会话文件存在但读不到任何条目（可能被截断）：${existing}`;
+            this.diagnostic(`resume 失败（降级为新建）：${resumeReason}`);
+            sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir, { id: sessionId });
+            persistenceReason = `pi 原生 session：${this.sessionDir}（resume 失败已新建）`;
+          } else {
+            sessionManager = opened;
+            resumed = true;
+            restoredMessages = messages;
+            persistenceReason = `pi 原生 session：${this.sessionDir}（已从磁盘恢复 ${messages} 条消息）`;
+          }
+        } catch (err) {
+          resumeReason = `会话文件读取失败：${err instanceof Error ? err.message : String(err)}（${existing}）`;
+          this.diagnostic(`resume 失败（降级为新建，不抛）：${resumeReason}`);
+          try {
+            sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir, { id: sessionId });
+            persistenceReason = `pi 原生 session：${this.sessionDir}（原文件损坏，已新建）`;
+          } catch (err2) {
+            // 连新建都失败 → 如实回落 inMemory，并记原因
+            resumeReason = `${resumeReason}；新建也失败：${err2 instanceof Error ? err2.message : String(err2)}`;
+            sessionManager = SessionManagerCtor.inMemory(this.cwd);
+            persistenceReason = '持久化不可用，已回落 inMemory';
+          }
+        }
+      } else {
+        sessionManager = SessionManagerCtor.create(this.cwd, this.sessionDir, { id: sessionId });
+        resumeReason = '没有历史会话（首次创建）';
+        persistenceReason = `pi 原生 session：${this.sessionDir}（首次创建，首次 prompt 后落盘）`;
+      }
     } else {
       sessionManager = SessionManagerCtor.inMemory(this.cwd);
       persistenceReason = '未启用持久化（sessionDir=null 或 persist=false）→ 用 SessionManager.inMemory()，本轮不落盘';
+      resumeReason = '未启用持久化';
     }
 
     const options: CreateAgentSessionOptions = {
@@ -562,9 +1080,29 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       sessionManager: sessionManager as CreateAgentSessionOptions['sessionManager'],
     };
     if (this.agentDir) options.agentDir = this.agentDir;
-    if (this.tools !== null) options.tools = this.tools;
+    const effectiveTools = perSessionTools !== undefined ? perSessionTools : this.toolsConfig;
+    if (effectiveTools !== null) options.tools = effectiveTools;
     if (this.excludeTools) options.excludeTools = this.excludeTools;
     if (this.opts.thinkingLevel) options.thinkingLevel = this.opts.thinkingLevel;
+
+    // ★ 显式指定模型（否则 pi 会用它自己的全局默认，和项目 settings.json 的 llm.active 不一致）
+    let modelSource: SessionInit['modelSource'] = 'pi-global-fallback';
+    let modelWarning: string | undefined;
+    try {
+      const resolved = await resolveSessionModel(sdk, this.opts, this.agentDir);
+      if (resolved.model) {
+        options.model = resolved.model as CreateAgentSessionOptions['model'];
+        modelSource = resolved.source;
+        if (resolved.source === 'pi-global-fallback') modelWarning = resolved.warning;
+      } else {
+        modelWarning = resolved.warning;
+      }
+    } catch (err) {
+      modelWarning = `模型解析失败（回落 pi 全局默认，可能与项目设置不一致）：${
+        err instanceof Error ? err.message : String(err)
+      }`;
+    }
+    if (modelWarning) this.diagnostic(`模型来源=${modelSource}：${modelWarning}`);
 
     // 自定义系统提示词（教学答疑场景）：需要 DefaultResourceLoader；
     // 拿不到就**如实降级**（只用用户消息里的说明），并记诊断 —— 不假装设置成功。
@@ -572,7 +1110,38 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       typeof this.opts.systemPrompt === 'string' ||
       (this.opts.appendSystemPrompt?.length ?? 0) > 0 ||
       this.opts.noContextFiles === true;
-    if (wantsCustomPrompt) {
+
+    // ★ 知识库只读工具（`agent` 模式）：走 pi 的**扩展工厂**注册（`pi.registerTool`）。
+    //   只有真的在白名单里、且 provider 可用时才注册 —— 否则如实不注册（别让学生看到"有工具却查不到"）。
+    let kbExtension: ((pi: unknown) => void) | null = null;
+    let kbToolsUnavailable: string | null = null;
+    const wantsKbTools = effectiveTools !== null && effectiveTools.some((t) => (KB_TOOL_NAMES as readonly string[]).includes(t));
+    if (wantsKbTools) {
+      if (!this.opts.kb) {
+        kbToolsUnavailable = '知识库查询能力未接入（AgentSessionManager 未提供 kb provider）';
+      } else if (!kbUserId) {
+        kbToolsUnavailable = '缺少服务端用户身份，无法按权限过滤知识库（拒绝注册工具，避免越权读取）';
+      } else {
+        try {
+          const mod = await import('./kb_tools.ts');
+          kbExtension = mod.createKbExtension({
+            provider: this.opts.kb,
+            userId: kbUserId,
+            ...(this.opts.kbMaxTextChars !== undefined ? { maxTextChars: this.opts.kbMaxTextChars } : {}),
+            onDiagnostic: (m) => this.diagnostic(`[kb] ${m}`),
+          }) as (pi: unknown) => void;
+        } catch (err) {
+          kbToolsUnavailable = `kb 工具模块加载失败：${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      if (kbToolsUnavailable) {
+        // ★ 如实降级：**把工具从白名单里去掉**（不留一个"注册不了却有名字"的假工具）
+        options.tools = effectiveTools!.filter((t) => !(KB_TOOL_NAMES as readonly string[]).includes(t));
+        this.diagnostic(`知识库工具不可用 → 已从白名单移除：${kbToolsUnavailable}`);
+      }
+    }
+
+    if (wantsCustomPrompt || kbExtension) {
       const Loader = sdk.DefaultResourceLoader;
       const agentDir = this.agentDir ?? sdk.getAgentDir?.();
       if (typeof Loader === 'function' && agentDir) {
@@ -582,7 +1151,10 @@ export class AgentSessionManager implements ChatSessionManagerLike {
             agentDir,
             ...(typeof this.opts.systemPrompt === 'string' ? { systemPrompt: this.opts.systemPrompt } : {}),
             ...(this.opts.appendSystemPrompt?.length ? { appendSystemPrompt: this.opts.appendSystemPrompt } : {}),
-            // 教学答疑不需要扩展/skill/模板/主题；关掉既快又少一类注入面
+            // ★ 内联扩展工厂（kb 只读工具）。`noExtensions: true` 只关**磁盘/配置里**的扩展，
+            //   不影响这里显式传入的内联工厂（实测：kb 工具能出现在 getActiveToolNames 里）。
+            ...(kbExtension ? { extensionFactories: [kbExtension] } : {}),
+            // 教学答疑不需要其它扩展/skill/模板/主题；关掉既快又少一类注入面
             noExtensions: true,
             noSkills: true,
             noPromptTemplates: true,
@@ -593,15 +1165,16 @@ export class AgentSessionManager implements ChatSessionManagerLike {
           options.resourceLoader = loader as CreateAgentSessionOptions['resourceLoader'];
         } catch (err) {
           this.diagnostic(
-            `自定义系统提示词设置失败（降级为默认提示词 + 用户消息说明）：${err instanceof Error ? err.message : String(err)}`,
+            `资源加载器构造失败（降级）：${err instanceof Error ? err.message : String(err)}`,
           );
         }
       } else {
         this.diagnostic(
-          `SDK 未提供 DefaultResourceLoader/getAgentDir，无法替换系统提示词（降级为默认提示词 + 用户消息说明）`,
+          `SDK 未提供 DefaultResourceLoader/getAgentDir，无法设置自定义提示词/注册 kb 工具（降级）`,
         );
       }
     }
+    kbToolsWarning = kbToolsUnavailable;
 
     let created: { session: AgentSession; modelFallbackMessage?: string };
     try {
@@ -634,17 +1207,39 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       persistence,
       persistenceReason,
       version: sdk.version,
+      resumed,
+      restoredMessages,
+      resumeReason,
+      modelSource,
+      ...(modelWarning !== undefined ? { modelWarning } : {}),
     };
   }
 
   /** 取会话（同 id 复用；已 dispose 则重建）。 */
-  async getOrCreate(sessionId: string): Promise<ManagedAgentSession> {
+  async getOrCreate(sessionId: string, init?: { tools?: string[]; kbUserId?: string }): Promise<ManagedAgentSession> {
     const existing = this.sessions.get(sessionId);
     if (existing && !existing.disposed) {
+      // 已存在的会话保持原有工具集（避免半个会话中途换工具）。若请求的不同，记诊断说明**没生效**。
+      if (init?.tools && this.lastToolsFor.get(sessionId)?.join(',') !== init.tools.join(',')) {
+        this.diagnostic(
+          `会话 ${sessionId} 已存在，忽略本次工具白名单变更（原：${(this.lastToolsFor.get(sessionId) ?? []).join(',') || '无'}；` +
+            `请求：${init.tools.join(',') || '无'}）—— 换工具集请新建会话`,
+        );
+      }
       return existing;
     }
-    const init = await this.createInit(sessionId);
-    const session = new ManagedAgentSession(sessionId, this, init);
+    // ★ 按会话（= 按角色）的工具白名单：**只在创建时生效**。
+    //   危险内置工具仍会被过滤（除非 allowDangerousTools 显式放行）。
+    const perTools = init?.tools
+      ? sanitizeToolList(init.tools, this.opts.allowDangerousTools === true)
+      : null;
+    if (perTools && perTools.dropped.length > 0) {
+      this.diagnostic(`会话 ${sessionId} 请求的危险工具已被移除：${perTools.dropped.join(', ')}`);
+    }
+    const effectiveTools: string[] | null = perTools ? perTools.tools : this.toolsConfig;
+    this.lastToolsFor.set(sessionId, effectiveTools);
+    const created = await this.createInit(sessionId, effectiveTools, init?.kbUserId);
+    const session = new ManagedAgentSession(sessionId, this, created);
     this.sessions.set(sessionId, session);
     return session;
   }

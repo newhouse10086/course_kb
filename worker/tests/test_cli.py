@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -31,11 +32,24 @@ ROOT = Path(__file__).resolve().parents[2]
 # ═══════════════════════════════════════════════════════════════════════
 # 工具
 # ═══════════════════════════════════════════════════════════════════════
-def run_cli(args: list[str], stdin_text: str | None = None, timeout: int = 180):
+#: ★ 敌意环境：**不带** PYTHONIOENCODING/PYTHONUTF8（Windows 中文机默认 GBK）。
+#: 必须在敌意环境下测 —— 否则"测试恰好继承了正确 env"会掩盖编码 bug
+#: （历史上正是如此：stdin 中文乱码一直没被发现，因为 CI/开发机上有人设了 PYTHONIOENCODING）。
+def _hostile_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+    env["PYTHONUTF8"] = "0"          # 强制语言环境模式（最坏情况）
+    return env
+
+
+def run_cli(args: list[str], stdin_text: str | None = None, timeout: int = 180,
+            stdin_bytes: bytes | None = None):
+    payload = stdin_bytes if stdin_bytes is not None else (
+        stdin_text.encode("utf-8") if stdin_text is not None else None)
     proc = subprocess.run(
         [sys.executable, "-m", "worker.cli", *args],
-        input=(stdin_text.encode("utf-8") if stdin_text is not None else None),
-        capture_output=True, cwd=str(ROOT), timeout=timeout,
+        input=payload,
+        capture_output=True, cwd=str(ROOT), timeout=timeout, env=_hostile_env(),
     )
     out = proc.stdout.decode("utf-8", "replace")
     events = [json.loads(ln) for ln in out.split("\n") if ln.strip()]
@@ -740,3 +754,69 @@ class _collector:
 
     def warn(self, msg: str) -> None:
         pass
+
+# ═══════════════════════════════════════════════════════════════════════
+# ★ 中文编码回归（stdin 是我们**推荐**的大 payload 通道 —— 坑 18）
+# ═══════════════════════════════════════════════════════════════════════
+def test_stdin_chinese_payload_is_not_mojibake() -> None:
+    """★ 回归：中文 payload 走 **stdin**（大 payload 的推荐通道）必须**精确**还原。
+
+    原 bug：`cli.py` 用 `sys.stdin.read()` → Windows 上按 **GBK** 解码 UTF-8 字节
+    → `terms = ['任?', '?务']`，**而且 JSON 照样解析成功**（静默数据损坏）。
+    修复：`sys.stdin.buffer.read()` + 显式 UTF-8（BOM 识别）。
+    """
+    code, events, _o, _e = run_cli(["--job", "search"], stdin_text='{"job":"search","q":"任务"}')
+    assert code == 0
+    assert result_of(events)["terms"] == ["任务"]        # 精确值，不是"非空"
+
+
+def test_all_three_input_paths_handle_chinese(tmp_path) -> None:
+    """三条输入路径（argv 内联 / --in 文件 / stdin）都要显式 UTF-8。"""
+    # ① argv 内联
+    code, ev1, _o, _e = run_cli(["--job", "search", "--in", '{"job":"search","q":"索引优化"}'])
+    assert code == 0 and result_of(ev1)["terms"] == ["索引", "引优", "优化"]
+    # ② --in 文件（UTF-8 无 BOM）
+    f = tmp_path / "p.json"
+    f.write_bytes('{"job":"search","q":"事务隔离"}'.encode("utf-8"))
+    code, ev2, _o, _e = run_cli(["--job", "search", "--in", str(f)])
+    assert code == 0 and result_of(ev2)["terms"] == ["事务", "务隔", "隔离"]
+    # ③ stdin
+    code, ev3, _o, _e = run_cli(["--job", "search"], stdin_text='{"job":"search","q":"隔离级别"}')
+    assert code == 0 and result_of(ev3)["terms"][0] == "隔离"
+
+
+def test_bom_file_is_accepted(tmp_path) -> None:
+    """带 BOM 的文件（Windows 编辑器/PowerShell 常见）按 BOM 声明的编码解。"""
+    f = tmp_path / "bom.json"
+    f.write_bytes(b"\xef\xbb\xbf" + '{"job":"search","q":"索引"}'.encode("utf-8"))
+    code, events, _o, _e = run_cli(["--job", "search", "--in", str(f)])
+    assert code == 0 and result_of(events)["terms"] == ["索引"]
+
+    # UTF-16LE：PowerShell 的 `Set-Content -Encoding Unicode` **会写 BOM** → 按 BOM 识别
+    f2 = tmp_path / "u16.json"
+    f2.write_bytes(b"\xff\xfe" + '{"job":"search","q":"事务"}'.encode("utf-16-le"))
+    code2, events2, _o, _e = run_cli(["--job", "search", "--in", str(f2)])
+    assert code2 == 0 and result_of(events2)["terms"] == ["事务"]
+
+    # ⚠️ **无 BOM** 的 UTF-16 **不做猜测**（猜编码会引入更隐蔽的错误）→ 明确失败
+    f3 = tmp_path / "u16_nobom.json"
+    f3.write_bytes('{"job":"search","q":"事务"}'.encode("utf-16-le"))
+    code3, events3, _o, _e = run_cli(["--job", "search", "--in", str(f3)])
+    assert code3 == 2 and last(events3)["code"] == "E_PAYLOAD"
+    assert "UTF-8" in last(events3)["msg"]
+
+
+def test_invalid_utf8_fails_loudly_not_silently() -> None:
+    """★ 坏字节（GBK 写的中文）→ **明确报错**，绝不 `errors="replace"` 静默变 `?`。
+
+    若用 replace：坏字节能落进 JSON 字符串值 → `json.loads` 照样成功 →
+    内容被悄悄改坏（正是原 bug 的表现）。所以选 strict + 可读错误。
+    """
+    code, events, _o, _e = run_cli(["--job", "search"],
+                                   stdin_bytes='{"job":"search","q":"任务"}'.encode("gbk"))
+    assert code == 2
+    assert last(events)["code"] == "E_PAYLOAD"
+    msg = last(events)["msg"]
+    assert "UTF-8" in msg and "GBK" in msg
+    detail = last(events).get("detail") or ""
+    assert "坏字节" in detail and "hex" in detail

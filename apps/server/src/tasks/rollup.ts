@@ -546,6 +546,8 @@ export function createRollupHandler(deps: RollupHandlerDeps): TaskHandler {
     let llmUsed = 0;
     let deterministic = 0;
     let failed = 0;
+    /** worker 调用失败次数（批级）。用于如实区分"worker 全程不可用"与"偶发失败若干批"。 */
+    let workerFailures = 0;
     const failures: string[] = [];
 
     // ── 无 LLM：**整篇确定性回退**（不产假 intro，如实标 source）──
@@ -638,11 +640,23 @@ export function createRollupHandler(deps: RollupHandlerDeps): TaskHandler {
         const raw = await runner({ job: 'rollup.plan', input: { nodes: planNodes }, signal: ctx.signal });
         plan = raw as unknown as RollupPlanResult;
       } catch (err) {
-        // worker 侧还不可用（rollup.plan 未注册）→ 如实记录并整体回退，不产假数据
+        /**
+         * ⚠️ **批级失败不得中止整篇**（长任务断点友好）。
+         *
+         * 原错误写法：这里直接 `for (allInternal) 全篇确定性回退 + return`。
+         * 实测后果（refman 376 节点，真实 21 分钟跑）：worker 在某一批**偶发**退出码 1
+         * （`worker 异常退出（exit code 1）`）→ **后续所有批全部放弃**，
+         * 最终 `worker_ok:false` 且 156/376 个节点退化成确定性，而本来大部分能跑成。
+         *
+         * 正确行为：只把**这一批**退化为确定性，记录失败，**继续跑剩下的批**；
+         * 只有"第一批就失败且从未成功过"才可能是真的 worker 不可用（那时也会如实报 worker_ok）。
+         */
         const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`rollup.plan 不可用：${msg} → 确定性回退`, 'warn');
-        failures.push(`rollup.plan: ${msg}`);
-        for (const n of allInternal) {
+        ctx.log(`rollup.plan 失败（本批 ${batch.length} 个节点）：${msg} → 本批确定性回退`, 'warn');
+        if (failures.length < 20) failures.push(`rollup.plan: ${msg}`);
+        workerFailures += 1;
+        failed += batch.length;
+        for (const n of batch) {
           // 不覆盖已有的 LLM 成果（与"LLM 不可用"分支同一条纪律）
           if (hasLlmIntro(n.unit.id)) continue;
           rollup[n.unit.id] = {
@@ -652,21 +666,10 @@ export function createRollupHandler(deps: RollupHandlerDeps): TaskHandler {
           } satisfies RollupEntry;
           cp.done[n.unit.id] = { intro_len: 0, source: ROLLUP_SOURCE.deterministic, at: Date.now() };
         }
+        // 本批落盘后**继续下一批**
         repo.mergeDocumentMeta(docId, { rollup });
         await saveCheckpoint();
-        ctx.progress(1, '完成（worker 不可用，确定性回退）');
-        const entriesW = allInternal.map((n) => asRecord(rollup[n.unit.id]) ?? {});
-        const llmW = entriesW.filter((e) => e.source === ROLLUP_SOURCE.llm && typeof e.intro === 'string' && e.intro.trim()).length;
-        return {
-          rollup: {
-            llm_configured: true, llm_available: true, worker_ok: false,
-            reason: msg, internal_nodes: allInternal.length,
-            llm_generated: llmW, deterministic: allInternal.length - llmW,
-            with_intro: allInternal.length, intro_coverage: allInternal.length > 0 ? 1 : 0,
-            intro_sources: { deterministic: allInternal.length - llmW, llm: llmW },
-            failures,
-          },
-        };
+        continue;
       }
 
       if (!Array.isArray(plan.items) || plan.items.length === 0) {
@@ -853,7 +856,9 @@ export function createRollupHandler(deps: RollupHandlerDeps): TaskHandler {
       rollup: {
         llm_configured: true,
         llm_available: true,
-        worker_ok: true,
+        // worker_ok = **所有** worker 调用都成功（有偶发失败就如实 false，不粉饰）
+        worker_ok: workerFailures === 0,
+        ...(workerFailures > 0 ? { worker_failed_batches: workerFailures } : {}),
         internal_nodes: allInternal.length,
         layers: depths.length,
         llm_generated: generated.length,

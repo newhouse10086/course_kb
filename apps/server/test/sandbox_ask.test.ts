@@ -20,6 +20,8 @@ import {
   auditCitations,
   createAskHandler,
   createSerialGate,
+  describeBlame,
+  describeKill,
   detectDirectAnswer,
   explainDbError,
   extractCitations,
@@ -111,7 +113,7 @@ class FakeAskSession implements ChatSessionLike {
       session_id: this.id,
       model: null,
       tools: [],
-      tools_source: 'none',
+      tools_source: 'explicit',
       version: null,
       mode: 'sdk',
       persistence: 'ephemeral',
@@ -129,7 +131,7 @@ class FakeAskSession implements ChatSessionLike {
       session_id: this.id,
       model: null,
       tools: [],
-      tools_source: 'none',
+      tools_source: 'explicit',
       version: null,
       mode: 'sdk',
       persistence: 'ephemeral',
@@ -183,9 +185,12 @@ const RECENT: ExecutionRecord[] = [
 function makeLogSource(over: Partial<{ info: LogSourceLike['info']; entries: DbLogEntry[]; throws: boolean }> = {}): LogSourceLike {
   return {
     info: over.info ?? (() => ({ id: 'sqlite', layers: ['L1'], available: true })),
-    async fetch() {
+    async fetch(req) {
       if (over.throws) throw new Error('日志文件读不到：EACCES');
-      return over.entries ?? [];
+      const all = over.entries ?? [];
+      // 真实日志源会**遵守 layers 参数**；这里也照做（否则测不出消费侧的层级策略）
+      const wanted = req.layers;
+      return wanted && wanted.length > 0 ? all.filter((e) => wanted.includes(e.source)) : all;
     },
   };
 }
@@ -322,7 +327,7 @@ test('★ 日志：模型没说 → 系统补一句如实说明（代码兜底�
 
 test('★ 日志：模型自己如实说了 → 不再重复补（不啰嗦）', async () => {
   const session = new FakeAskSession();
-  session.answer = '我暂时读不到该实例的引擎日志（原因：未配置日志路径），下面的分析仅基于你的报错与 SQL。\n\n**提示**：…';
+  session.answer = '我暂时读不到该实例的引擎日志（原因：未配置日志路径），下面的分析仅基于你的报错与 SQL。\n\n**相关知识点**：[[card:crd_0001]]';
   const handler = createAskHandler(
     baseDeps({
       manager: fakeManager(session),
@@ -330,7 +335,7 @@ test('★ 日志：模型自己如实说了 → 不再重复补（不啰嗦）',
     }),
   );
   const { sink } = collectFrames();
-  const out = await handler.handle({ sessionId: 's1', error: 'no such table: x' }, sink);
+  const out = await handler.handle({ sessionId: 's1', userId: 'u1', error: 'no such table: x' }, sink);
   assert.equal(out.logDisclaimerPresent, true);
   assert.equal(out.logDisclaimerAppended, false);
   assert.equal(out.systemAppended.length, 0);
@@ -354,7 +359,7 @@ test('★ 日志：可读但为空 ≠ 读不到（状态 empty，不补"读不�
     baseDeps({ manager: fakeManager(session), logSource: makeLogSource({ entries: [] }) }),
   );
   const { sink } = collectFrames();
-  const out = await handler.handle({ sessionId: 's1', error: 'no such table: x' }, sink);
+  const out = await handler.handle({ sessionId: 's1', userId: 'u1', error: 'no such table: x' }, sink);
   assert.equal(out.logAccess.status, 'empty');
   assert.match(out.logAccess.reason, /没有匹配的日志记录/);
   assert.equal(out.logDisclaimerAppended, false, 'empty 不是 unavailable，不许说"读不到"');
@@ -367,7 +372,7 @@ test('★ 日志：拉取抛异常 → unavailable + 异常原因（如实降级
     baseDeps({ manager: fakeManager(session), logSource: makeLogSource({ throws: true }) }),
   );
   const { sink } = collectFrames();
-  const out = await handler.handle({ sessionId: 's1', error: 'x' }, sink);
+  const out = await handler.handle({ sessionId: 's1', userId: 'u1', error: 'x' }, sink);
   assert.equal(out.logAccess.status, 'unavailable');
   assert.match(out.logAccess.reason, /日志拉取失败/);
   assert.match(out.logAccess.reason, /EACCES/);
@@ -398,9 +403,9 @@ test('★ 越权：别的 sessionId 的日志条目被丢弃，且**绝不进提
   const entries: DbLogEntry[] = [
     { source: 'L1', level: 'error', message: 'no such table: student', sessionId: 's1', sql: 'SELECT * FROM student' },
     {
-      source: 'L2',
+      source: 'L1',
       level: 'warning',
-      message: '别人的慢查询',
+      message: '别人的报错',
       sessionId: 's2',
       sql: 'SELECT * FROM secret_payroll WHERE salary > 99999',
     },
@@ -422,7 +427,7 @@ test('★ 越权：别的 sessionId 的日志条目被丢弃，且**绝不进提
 
   const message = session.promptCalls[0] ?? '';
   assert.ok(!message.includes('secret_payroll'), '★ 别人的 SQL 泄漏进提示词了');
-  assert.ok(!message.includes('别人的慢查询'));
+  assert.ok(!message.includes('别人的报错'));
   assert.equal(out.logAccess.crossSessionDropped, 1);
   assert.ok(out.contextWarnings.some((w) => w.includes('其它会话')));
 });
@@ -451,9 +456,11 @@ test('★ 越权：L3 无法确认归属的行一律丢弃（文件日志是别�
 
 test('★ 上下文按 §8.4 的优先级排列，L1 报错在最前', async () => {
   const ctx = await assembleAskContext(
-    { sessionId: 's1', sql: 'SELECT * FROM student', error: 'no such table: student' },
+    { sessionId: 's1', userId: 'u1', sql: 'SELECT * FROM student', error: 'no such table: student' },
     baseDeps({
       logSource: makeLogSource({
+        // L1 + L3 都声明可用（假日志源会按 layers 过滤，声明了才拿得到 L3）
+        info: () => ({ id: 'sqlite', layers: ['L1', 'L3'], available: true }),
         entries: [
           { source: 'L1', level: 'error', message: 'no such table: student', code: 'SQLITE_ERROR', sessionId: 's1' },
           { source: 'L3', level: 'error', message: 'error.log: table missing', sessionId: 's1' },
@@ -475,13 +482,13 @@ test('★ 上下文按 §8.4 的优先级排列，L1 报错在最前', async () 
 test('★ L2 只在报错疑似锁/超时时才带（§8.4 第 4 项）', async () => {
   const l2Entries: DbLogEntry[] = [{ source: 'L2', level: 'warning', message: '慢查询 1.2s', sessionId: 's1' }];
   const withLockErr = await assembleAskContext(
-    { sessionId: 's1', error: 'database is locked' },
+    { sessionId: 's1', userId: 'u1', error: 'database is locked' },
     baseDeps({ logSource: makeLogSource({ info: () => ({ id: 'sqlite', layers: ['L1', 'L2'], available: true }), entries: l2Entries }) }),
   );
   assert.ok(withLockErr.sections.some((s) => s.id === 'l2_summary'), '锁错误应带 L2');
 
   const withSyntaxErr = await assembleAskContext(
-    { sessionId: 's1', error: 'near "FROM": syntax error' },
+    { sessionId: 's1', userId: 'u1', error: 'near "FROM": syntax error' },
     baseDeps({ logSource: makeLogSource({ info: () => ({ id: 'sqlite', layers: ['L1', 'L2'], available: true }), entries: l2Entries }) }),
   );
   assert.ok(!withSyntaxErr.sections.some((s) => s.id === 'l2_summary'), '语法错不该带 L2');
@@ -589,6 +596,9 @@ test('依赖失败不阻断答疑：记 contextWarnings，仍能回答', async (
   assert.equal(out.contextWarnings.length, 3, `应记 3 条告警，实际 ${JSON.stringify(out.contextWarnings)}`);
   assert.ok(out.contextWarnings.some((w) => w.includes('schema 服务挂了')));
   assert.ok(out.contextWarnings.some((w) => w.includes('检索挂了')));
+  // 出口拦截是**输出侧安全事件**，单独计数（不混进"上下文缺哪块"的清单）
+  assert.equal(out.leakedFramesBlocked, 1, '假会话发了 system 的 message_end，应被出口拦下');
+  assert.ok(!out.contextWarnings.some((w) => w.includes('出口拦截')), '语义不能混');
   assert.ok(frames.some((f) => f.type === 'settled'), '仍然要正常结束');
 });
 
@@ -597,10 +607,11 @@ test('依赖失败不阻断答疑：记 contextWarnings，仍能回答', async (
 // ===========================================================================
 
 test('★ 本地报错解读：真实 SQLite 报错 → 归类 + 中文含义', () => {
-  assert.deepEqual(explainDbError('no such table: student'), {
-    kind: '对象不存在',
-    zh: '表不存在 —— 表名拼错，或还没建表，或建在了别的库/别的连接里',
-  });
+  // 形状新增了 who（责任方，见第 8 节）→ 改为逐字段断言，不用 deepEqual
+  const reading = explainDbError('no such table: student')!;
+  assert.equal(reading.kind, '对象不存在');
+  assert.equal(reading.zh, '表不存在 —— 表名拼错，或还没建表，或建在了别的库/别的连接里');
+  assert.equal(reading.who, 'student');
   assert.match(explainDbError('UNIQUE constraint failed: students.id')!.zh, /唯一约束冲突/);
   assert.match(explainDbError('near "FROM": syntax error')!.zh, /语法错误/);
   assert.match(explainDbError('datatype mismatch')!.zh, /类型不匹配/);
@@ -770,4 +781,207 @@ test('outcome 形状：可 JSON 序列化（要能直接进 HTTP/日志）', asy
   assert.equal(typeof parsed.elapsedMs, 'number');
   assert.equal(parsed.logAccess.status, 'empty');
   assert.equal(Array.isArray(parsed.contextWarnings), true);
+});
+
+// ===========================================================================
+// 7. ★ 超时/被杀语义（backend-core 的 `killedBy`/`hardKilled`）
+// ===========================================================================
+
+test('★ 超时**不是语法错**：E_SQL_TIMEOUT 的本地解读要明确这一点', () => {
+  const real = '执行超过 1000ms 被中断（SQLite progress_handler；父进程 0.75s 后硬杀）';
+  const reading = explainDbError(real);
+  assert.ok(reading, '必须能认出来（否则模型只能猜）');
+  assert.match(reading!.zh, /不是语法错/);
+  assert.match(reading!.zh, /递归 CTE|终止条件|LIMIT/);
+  assert.ok(!/语法错误/.test(reading!.zh), '绝不能读成语法错');
+  // backend-core 的 code 形式
+  assert.equal(explainDbError('E_SQL_TIMEOUT')!.kind, '执行超时');
+  assert.equal(explainDbError('interrupted')!.kind, '执行超时');
+  assert.equal(explainDbError('hardKilled=true')!.kind, '执行超时');
+  // 假日志源用例：先加 LIMIT 的建议要在里面
+  assert.match(explainDbError('E_SQL_TIMEOUT')!.zh, /LIMIT/);
+});
+
+test('★ describeKill：progress=中断、process=硬杀，两者都说"不是语法错"', () => {
+  assert.match(describeKill('progress', false)!, /中断/);
+  assert.match(describeKill('progress', false)!, /不是语法错/);
+  assert.match(describeKill('process', true)!, /强制终止|硬杀/);
+  assert.match(describeKill('process', true)!, /不是语法错/);
+  // 只给了 hardKilled 也要能说清楚
+  assert.match(describeKill(undefined, true)!, /硬杀/);
+  // 非超时场景返回 null（不污染提示词）
+  assert.equal(describeKill(undefined, undefined), null);
+  assert.equal(describeKill(undefined, false), null);
+});
+
+test('★ 提示词里带上 killedBy/hardKilled/timeoutMs 与终止解读（照抄 backend-core 的真形状）', async () => {
+  const session = new FakeAskSession();
+  session.answer = '**问题归类**：执行超时';
+  const handler = createAskHandler(
+    baseDeps({
+      manager: fakeManager(session),
+      logSource: makeLogSource({
+        entries: [
+          {
+            source: 'L1',
+            level: 'error',
+            sessionId: 's1',
+            code: 'E_SQL_TIMEOUT',
+            message: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断（SQLite progress_handler；父进程 0.75s 后硬杀）',
+            hint: '给学生看的提示：递归 CTE 需要终止条件（WHERE 里的递归约束），先加 LIMIT 试小范围',
+            sql: 'WITH RECURSIVE c(x) AS (…)',
+            context: {
+              localReading: '执行被中断（通常是超时）',
+              localMatched: true,
+              elapsedMs: 1000,
+              kind: 'WITH',
+              killedBy: 'progress',
+              hardKilled: false,
+              timeoutMs: 1000,
+            },
+          },
+        ],
+      }),
+      getRecentExecutions: async () => [
+        {
+          at: Date.now(),
+          sql: 'WITH RECURSIVE c(x) AS (…)',
+          ok: false,
+          error: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断（…）',
+          rowCount: 0,
+          elapsedMs: 1000,
+          kind: 'WITH',
+          killedBy: 'progress',
+          hardKilled: false,
+          timeoutMs: 1000,
+        },
+      ],
+    }),
+  );
+  const { sink } = collectFrames();
+  await handler.handle(
+    { sessionId: 's1', userId: 'u1', sql: 'WITH RECURSIVE c(x) AS (…)', error: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断' },
+    sink,
+  );
+  const message = session.promptCalls[0] ?? '';
+  assert.match(message, /killedBy=progress hardKilled=false/, '超时字段必须进提示词');
+  assert.match(message, /timeoutMs=1000/);
+  assert.match(message, /终止解读=/, '要有确定性话术');
+  assert.match(message, /本地解读=执行被中断/, 'backend-core 的 localReading 也要在');
+  assert.match(message, /不是语法错/);
+  // 最近执行记录段也要有
+  assert.match(message, /killedBy=progress hardKilled=false/);
+});
+
+test('★ 系统提示词明确要求：超时不得当语法错，且要告诉学生"不是你语法写错了"', () => {
+  assert.match(ASK_SYSTEM_PROMPT, /不要把所有报错都当语法错/);
+  assert.match(ASK_SYSTEM_PROMPT, /killedBy=progress/);
+  assert.match(ASK_SYSTEM_PROMPT, /killedBy=process/);
+  assert.match(ASK_SYSTEM_PROMPT, /不是语法错/);
+});
+
+test('★ 超时场景会带上 L2 摘要（报错疑似超时/锁 → §8.4 第 4 项）', async () => {
+  const ctx = await assembleAskContext(
+    { sessionId: 's1', userId: 'u1', error: 'E_SQL_TIMEOUT：执行超过 1000ms 被中断' },
+    baseDeps({
+      logSource: makeLogSource({
+        info: () => ({ id: 'sqlite', layers: ['L1', 'L2'], available: true }),
+        entries: [{ source: 'L2', level: 'warning', message: '慢查询 1.2s', sessionId: 's1' }],
+      }),
+    }),
+  );
+  assert.ok(ctx.sections.some((s) => s.id === 'l2_summary'), '超时错误应带 L2');
+  assert.match(ctx.sections[0]!.text, /不是语法错/);
+});
+
+// ===========================================================================
+// 8. ★ 错误码分类表（backend-core `sandbox/README §10.3`）：**"是谁的错"**
+// ===========================================================================
+
+test('★ 分类表全量：每个 code 都认得，且责任方正确（谁的问题决定话术）', () => {
+  const table: [string, string, string][] = [
+    ['E_SQL_SYNTAX', '语法错', 'student'],
+    ['E_SQL_NO_OBJECT', '对象不存在', 'student'],
+    ['E_SQL_EXEC', '运行时错', 'student'],
+    ['E_SQL_TIMEOUT', '执行超时', 'student_logic'],
+    ['E_SANDBOX_SIZE', '超出库大小上限', 'student'],
+    ['E_SQL_FORBIDDEN', '被安全闸拒绝', 'rules'],
+    ['E_SQL_PRAGMA', 'PRAGMA 不在白名单', 'rules'],
+    ['E_SQL_MULTI', '多语句', 'rules'],
+    ['E_SQL_KIND', '语句类型不允许', 'rules'],
+    ['E_SQL_TOO_LONG', 'SQL 太长', 'student'],
+    ['E_SQL_EMPTY', '空语句', 'student'],
+    ['E_SANDBOX_RUNNER', '沙箱系统故障', 'system'],
+    ['E_ENGINE_UNAVAILABLE', '引擎不可用', 'config'],
+    ['E_ENGINE_UNKNOWN', '引擎未配置', 'config'],
+    ['E_SANDBOX_PATH', '沙箱路径不合法', 'caller'],
+    ['E_LOG_ISOLATION', '日志隔离拦截', 'caller'],
+  ];
+  for (const [code, kind, who] of table) {
+    const reading = explainDbError(code);
+    assert.ok(reading, `${code} 必须认得（否则模型只能猜）`);
+    assert.equal(reading!.kind, kind, `${code} 的归类`);
+    assert.equal(reading!.who, who, `${code} 的责任方`);
+    assert.equal(reading!.code, code);
+  }
+  // 真实报错码混在文本里也能认出来（backend-core 的 message 就是这种形态）
+  const mixed = explainDbError('E_SQL_TIMEOUT：执行超过 1000ms 被中断（SQLite progress_handler；父进程 0.75s 后硬杀）');
+  assert.equal(mixed!.code, 'E_SQL_TIMEOUT');
+});
+
+test('★★ 系统故障（E_SANDBOX_RUNNER）必须说"不是你的 SQL 的问题"', () => {
+  const reading = explainDbError('E_SANDBOX_RUNNER')!;
+  assert.equal(reading.who, 'system');
+  assert.match(reading.zh, /不是你的 SQL 的问题|不是你的问题/);
+  assert.match(reading.zh, /重试|反馈/);
+  assert.match(describeBlame('system'), /不是学生的问题/);
+  // 绝不能让学生去改 SQL —— 提示词模板也一样
+  assert.ok(!/请检查你的/.test(reading.zh));
+});
+
+test('★ 沙箱规则类的 code：话术要说"不是他写错了 SQL"', () => {
+  for (const code of ['E_SQL_FORBIDDEN', 'E_SQL_PRAGMA', 'E_SQL_MULTI', 'E_SQL_KIND']) {
+    const reading = explainDbError(code)!;
+    assert.equal(reading.who, 'rules', code);
+    assert.match(reading.zh, /不是|规则/, `${code} 要说清是规则限制`);
+  }
+  assert.match(describeBlame('rules'), /不是学生写错 SQL|规则不允许/);
+  // 多语句那条顺带把"教学习惯"讲出来（学生学到东西）
+  assert.match(explainDbError('E_SQL_MULTI')!.zh, /单条|一次只测一条/);
+});
+
+test('★ 库大小超限要说清"本次写入已回滚"（否则学生会以为数据进去了）', () => {
+  const reading = explainDbError('E_SANDBOX_SIZE')!;
+  assert.equal(reading.who, 'student');
+  assert.match(reading.zh, /回滚/);
+  assert.match(reading.zh, /数据没变/);
+});
+
+test('★ 责任方全部有中文话术（没有 undefined 漏网）', () => {
+  for (const who of ['student', 'student_logic', 'rules', 'system', 'config', 'caller'] as const) {
+    const text = describeBlame(who);
+    assert.ok(typeof text === 'string' && text.length > 4, `${who} 要说人话`);
+  }
+});
+
+test('★ 提示词里带"责任方"与错误码；系统故障场景不许出现"检查你的 SQL"', async () => {
+  const session = new FakeAskSession();
+  session.answer = '**问题归类**：沙箱系统故障';
+  const handler = createAskHandler(baseDeps({ manager: fakeManager(session), logSource: makeLogSource({ entries: [] }) }));
+  const { sink } = collectFrames();
+  await handler.handle({ sessionId: 's1', userId: 'u1', error: 'E_SANDBOX_RUNNER' }, sink);
+  const message = session.promptCalls[0] ?? '';
+  assert.match(message, /责任方=/, '必须给模型"是谁的错"');
+  assert.match(message, /不是学生的问题/, '系统故障要说清不是学生的错');
+  assert.match(message, /引擎错误码：E_SANDBOX_RUNNER/);
+  // 系统提示词里也有对应规则
+  assert.match(ASK_SYSTEM_PROMPT, /先看"责任方"/);
+  assert.match(ASK_SYSTEM_PROMPT, /这不是你的 SQL 的问题/);
+});
+
+test('★ 引擎原文（无 code）也能定责：约束冲突/列名歧义等默认归学生', () => {
+  assert.equal(explainDbError('no such table: students')!.who, 'student');
+  assert.equal(explainDbError('UNIQUE constraint failed: students.sid')!.who, 'student');
+  assert.equal(explainDbError('ambiguous column name: sid')!.who, 'student');
+  assert.equal(explainDbError('database is locked')!.who, 'student');
 });

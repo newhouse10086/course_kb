@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """沙箱执行子进程 —— **真正的执行体**（父进程用 ``subprocess`` + 硬超时杀它）。
 
 为什么要单独一个进程（规格 §3 资源限制）：
@@ -54,10 +54,12 @@ def _authorizer(action: int, arg1: Any, arg2: Any, dbname: Any, source: Any) -> 
         return sqlite3.SQLITE_OK if lower in PRAGMA_WHITELIST else sqlite3.SQLITE_DENY
     if action in (sqlite3.SQLITE_CREATE_VTABLE, sqlite3.SQLITE_DROP_VTABLE):
         return sqlite3.SQLITE_DENY
-    # 写 sqlite_master（SQLite 自身也会拒，这里是双保险 + 更清楚的错误）
-    if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE) \
-            and lower in ("sqlite_master", "sqlite_schema", "sqlite_temp_master"):
-        return sqlite3.SQLITE_DENY
+    # ⚠️ 不要在这里拦 sqlite_master 的 INSERT/UPDATE/DELETE：
+    #    **DDL 自己就会写 sqlite_master**（CREATE TABLE 触发 SQLITE_INSERT on sqlite_master），
+    #    第一版加了这条 → `CREATE TABLE …` 直接 `not authorized`，学生连表都建不了。
+    #    直写 sqlite_master 本来就由 SQLite 自身禁止（"table sqlite_master may not be
+    #    modified"），而打开这扇门的 `PRAGMA writable_schema=ON` 已被白名单 +
+    #    FORBIDDEN_TOKENS 双杀 —— 所以这里放行是安全的。
     return sqlite3.SQLITE_OK
 
 
@@ -84,6 +86,13 @@ def _connect(db_path: Path, timeout_s: float) -> sqlite3.Connection:
     try:
         conn.enable_load_extension(False)
     except Exception:  # noqa: BLE001 - 某些构建没编译该开关
+        pass
+    # ★ 外键**固定开启**（与 MySQL 对齐；SQLite 默认是 OFF，这是著名方言差异）。
+    #   必须在装 authorizer **之前**设置 —— 装完后学生的 `PRAGMA foreign_keys`
+    #   会被白名单拒（不允许关掉约束，否则"外键约束"实验就没意义了）。
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+    except sqlite3.Error:
         pass
     conn.set_authorizer(_authorizer)
     # defensive：限制单条 SQL 的长度与可挂载的库数量
@@ -136,8 +145,8 @@ def run_payload(payload: dict[str, Any]) -> dict[str, Any]:
     batch = split_statements(verdict.statement) if payload.get("multi") else [verdict.statement]
     batch = [b for b in batch if b.strip()]
     statement = verdict.statement
-    is_write = verdict.kind in ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER") or \
-        any(k in verdict.kind for k in ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER"))
+    _WRITE_KINDS = ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER")
+    is_write = (not payload.get("multi")) and verdict.kind in _WRITE_KINDS
 
     started = time.monotonic()
     deadline = started + timeout_ms / 1000.0
@@ -164,7 +173,7 @@ def run_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
         # 事务批次（BEGIN … ROLLBACK）必须在**同一个连接**里逐条执行 ——
         # 这也是"事务/回滚"实验能做的前提（LAB_DB_DEPLOY §6）
-        implicit_tx = is_write and not payload.get("multi")
+        implicit_tx = is_write
         if implicit_tx:
             conn.execute("BEGIN IMMEDIATE")
         try:
@@ -270,7 +279,15 @@ def run_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     """子进程入口：stdin 一行 JSON payload → stdout 一行 JSON 结果。"""
-    raw = sys.stdin.read()
+    # ★ 显式 UTF-8（不用 sys.stdin.read()：它按语言环境解码 —— Windows 中文机=GBK，
+    #   中文 SQL 会静默乱码。沙箱里学生的 SQL/数据全是任意文本，必须显式解码）
+    from worker.stdio import read_stdin_text
+    try:
+        raw = read_stdin_text(source="沙箱执行体 stdin")
+    except Exception as exc:  # noqa: BLE001 - 编码错误也要变成 JSON 错误帧
+        print(json.dumps({"error": {"code": "E_PAYLOAD", "msg": str(exc)}},
+                         ensure_ascii=True))
+        return 2
     try:
         payload = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:

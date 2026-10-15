@@ -67,6 +67,32 @@ export interface CreateProviderLayerOptions {
   glossary?: Record<string, string>;
   /** 未注册 type 的告警（会进日志，不抛错） */
   onSkip?: (entry: import('./types.ts').ProviderConfigEntry, reason: string) => void;
+
+  /**
+   * ★ **运行期模型覆盖**（模型热切换的接点）。
+   *
+   * ## 为什么需要它（真实的"看起来成功"缺口）
+   * `config/settings.json` 的 `llm.active` 与 `config/providers.yaml` 的 `model` 是**两个真相源**：
+   * - `/capabilities`、`/settings`、热切换响应 → 读 `settings.llm.active`
+   * - **真正发请求的** → `providers.yaml` 的 `model: ${LLM_MODEL}`（即 `.env` 的 `LLM_MODEL`）
+   *
+   * 于是：教师在后台"切换模型" → 探测通过 + 审计留痕 + 界面显示新模型 →
+   * **但抽取/翻译/对话仍在用旧模型**。**只改了一个真相源**。
+   * 这与 `/models` 假绿同源（两个真相源 + 只改一个），同属最该消灭的那类 bug。
+   *
+   * ## 接法
+   * 传入一个**每次组装 provider 时调用**的取值函数（例如
+   * `() => settingsStore.get().llm.active`）：
+   * - 返回**非空字符串** → 用它覆盖该 LLM provider 的 `model`（热切换**真正生效**）
+   * - 返回 `undefined` / `''` → 沿用 `providers.yaml` 配置（**不改变既有行为**）
+   *
+   * ⚠️ **只作用于 `kind === 'llm'`**：翻译 provider 的 `type` 也是 `llm`，
+   * 但它有自己的模型选择语义，不应被全局 LLM 覆盖（否则会出现"切了 LLM，翻译跟着变"的隐式耦合）。
+   *
+   * ⚠️ **不在这里读 settings**：本层不依赖配置层（避免循环依赖），
+   * 由调用方（`index.ts` / `app-deps.ts`）注入。**这是唯一一处真相源收敛点。**
+   */
+  modelOverride?: () => string | undefined;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -269,14 +295,37 @@ export class ProviderLayer {
  * 用户不会看到"配置了却用不了"的困惑。
  */
 export function createProviderLayer(opts: CreateProviderLayerOptions): ProviderLayer {
-  const { config, runWorker, glossary, onSkip } = opts;
+  const { config, runWorker, glossary, onSkip, modelOverride } = opts;
+
+  /**
+   * ★ 模型热切换的**唯一接点**：把 `settings.llm.active` 送进真正发请求的那一层。
+   * 详见 `CreateProviderLayerOptions.modelOverride` 的注释（两个真相源的缺口）。
+   * 未注入 → 原样返回 entry（**行为与注入前完全一致**，可安全回退）。
+   */
+  const withModelOverride = (
+    entry: import('./types.ts').ProviderConfigEntry,
+  ): import('./types.ts').ProviderConfigEntry => {
+    if (typeof modelOverride !== 'function') return entry;
+    let picked: string | undefined;
+    try {
+      picked = modelOverride();
+    } catch {
+      // 取值失败**不阻断组装**（否则一个配置层的小故障会让整个 provider 层起不来）——
+      // 但也不静默：沿用配置并留给调用方在 /capabilities 里如实上报。
+      return entry;
+    }
+    if (typeof picked !== 'string' || picked.trim() === '') return entry;
+    // ⚠️ `model` 在 `entry.options` 里（`ProviderConfigEntry.options: Record<string, unknown>`），
+    //    不是顶层字段 —— 写成顶层会被 tsc 拦下（已实测）。
+    return { ...entry, options: { ...entry.options, model: picked.trim() } };
+  };
 
   const registry = buildRegistry({
     config,
     onSkip,
     factories: {
-      // LLM
-      openai_compatible: createOpenAiCompatible,
+      // LLM —— 仅这一类受 modelOverride 影响（翻译的 type 也是 llm，但语义独立，见上）
+      openai_compatible: (e) => createOpenAiCompatible(withModelOverride(e)),
       // ASR
       local_worker: (e) => createAsrProvider(e, { runWorker }),
       aliyun_nls: (e) => createAsrProvider(e, { runWorker }),

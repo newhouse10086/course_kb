@@ -14,13 +14,16 @@ import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
+import path from 'node:path';
 
-import { loadConfig, ensureDirs, redact } from './config.ts';
+import { loadConfig, ensureDirs, redact, materializePiModels } from './config.ts';
 import type { ServerConfig } from './config.ts';
 import { Db } from './store/db.ts';
 import { Repo } from './store/repo.ts';
 import { loadSchemaEnums } from './store/schema-enums.ts';
 import type { SchemaEnums } from './store/schema-enums.ts';
+import { search as searchKb } from './store/search.ts';
+import type { SearchHit } from './store/search.ts';
 import { TaskEventBus } from './tasks/bus.ts';
 import { TaskQueue } from './tasks/queue.ts';
 import { createHandlers } from './tasks/handlers.ts';
@@ -38,6 +41,8 @@ import { registerCardRoutes } from './routes/cards.ts';
 import { registerSearchRoutes } from './routes/search.ts';
 import { registerTaskRoutes } from './routes/tasks.ts';
 import { registerChatRoute } from './routes/chat.ts';
+import { registerSandboxRoutes, DEFAULT_LIMITS, ownerOfSession, readCrossCallTx } from './routes/sandbox.ts';
+import { createKbQuery } from './store/kb-query.ts';
 import { registerAuthRoutes } from './routes/auth.ts';
 import { registerRbacRoutes } from './routes/rbac.ts';
 import { installAuth } from './auth/middleware.ts';
@@ -112,6 +117,45 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   // ── 封闭枚举（C3：来自 schema/*.json，不内置兜底）─────────────────
   const enums: SchemaEnums = loadSchemaEnums(cfg.root);
 
+  // ── 系统设置（video-pipeline 交付；**必须在 providers 之前加载**）──────────
+  // 为什么提前：provider 层的 `modelOverride` 要读 `settings.llm.active` —— 那是"热切换"的
+  // **唯一真相源**（否则出现"界面显示新模型、实际请求还在用 providers.yaml 的旧模型"）。
+  // 分工：`settings.json` 运行期可改（热重载）· `providers.yaml` 部署期 · `.env` 只放凭据。
+  // ⚠️ **非法配置 → 拒绝启动 + 可读原因**：`watchSettings` 抛错时**必须**抛出去，
+  //    绝不"静默用默认值"跑起来 —— 那会让运维以为自己的改动生效了。
+  const settingsMod = await tryImport<{
+    watchSettings?: (opts: { root: string }) => { get: () => unknown };
+    sandboxLimitsOf?: (s: unknown) => Record<string, unknown>;
+  }>('./settings/index.ts');
+  let settingsStore: { get: () => unknown } | null = null;
+  if (typeof settingsMod.mod?.watchSettings === 'function') {
+    try {
+      settingsStore = settingsMod.mod.watchSettings({ root: cfg.root });
+      process.stderr.write('[settings] settings.json 已加载并开启热重载\n');
+    } catch (err) {
+      throw new Error(
+        `settings.json 配置非法，拒绝启动：${redact(err instanceof Error ? err.message : String(err))}`,
+      );
+    }
+  } else {
+    process.stderr.write('[settings] 未接入（watchSettings 不可用）→ 模型选择走 providers.yaml/.env\n');
+  }
+
+  /**
+   * 热切换的唯一真相源：`settings.llm.active`。
+   * - 返回 `undefined`（设置层未接入 / 字段缺失）→ provider 层**沿用 providers.yaml**（不改变既有行为）
+   * - 取值抛错 → 也返回 `undefined`（provider 层承诺不因此中断组装）
+   */
+  const activeModelOverride = (): string | undefined => {
+    try {
+      const s = settingsStore?.get() as { llm?: { active?: unknown } } | undefined;
+      const active = s?.llm?.active;
+      return typeof active === 'string' && active.trim() !== '' ? active.trim() : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   // ── providers（T-PROVIDERS 的写域，动态 import）────────────────────
   let providers: ProviderFacade | null = null;
   let providersError: string | null = null;
@@ -120,6 +164,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       config: unknown;
       runWorker: unknown;
       onSkip?: (entry: unknown, reason: string) => void;
+      /** ★ 热切换接点（Lead 铺好）：非空 → 覆盖 LLM provider 的 model；空/抛错 → 沿用配置 */
+      modelOverride?: () => string | undefined;
     }) => ProviderFacade;
   }>('./providers/index.ts');
   if (providerMod.mod?.createProviderLayer) {
@@ -127,6 +173,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       providers = providerMod.mod.createProviderLayer({
         config: cfg.providers,
         runWorker: runner,
+        // ★ 热切换接点：**唯一真相源** = `settings.llm.active`（Lead 已在 providers 侧实现覆盖）
+        modelOverride: activeModelOverride,
         onSkip: (entry, reason) => {
           const id = (entry as { id?: string } | undefined)?.id ?? '?';
           process.stderr.write(`[providers] 跳过 ${id}：${redact(reason)}\n`);
@@ -206,13 +254,81 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     else agentError = capsMod.error ?? 'agent/capabilities.ts 未导出 capabilities()';
   }
 
+  /**
+   * ★ **只读知识库查询**（agent 模式的 `kb_search`/`kb_get` 用它）。
+   *
+   * 为什么在这里构造而不是让 agent 层自己查库：
+   * 可见性过滤必须复用 RBAC 的 `docScopeSql()` —— **agent 工具不能成为绕过 RBAC 的后门**
+   * （否则学生用 `kb_get('crd_xxx')` 就能读别人/未发布的草稿）。
+   * 模块里只有 SELECT，没有写/删/执行 SQL 的入口（工具的能力边界 = 该模块的导出）。
+   *
+   * ⚠️ **必须早于 agent 会话管理器构造**：`kb` 要注入 `AgentSessionManager`
+   * （`kb_search`/`kb_get` 的注册在那一层）。我第一版只把它放在**每次连接**的选项里 →
+   * 实测 `ready.tools=[]` + `tools_source=kb-readonly`：**代码以为开了 kb 工具，实际没注册**
+   * （模型回"当前会话没有这两个工具"）—— 正是"看起来成功"那类坑。
+   */
+  const kb: AppDeps['kb'] = createKbQuery({ db, repo });
+  process.stderr.write('[kb] 只读知识库查询已接入（kb_search/kb_get；按 userId 过滤可见性）\n');
+
+  /**
+   * 物化后的 pi 会话管理器（`agentDir` = `data/pi-agent/`）。
+   * **chat 与 /sandbox/ask 必须共用同一个** —— 否则答疑走 pi 的默认会话 → 全局默认模型 + 失效 key → 403。
+   */
+  let agentManager: unknown = null;
+
   if (opts.chatFactory !== undefined) {
     chatFactory = opts.chatFactory;
     if (opts.chatFactory === null) agentError = agentError ?? '聊天通道被显式禁用（测试注入）';
   } else {
     const streamMod = await tryImport<{ createChatConnection?: ChatConnectionFactory }>('./agent/stream.ts');
     if (streamMod.mod?.createChatConnection) {
-      chatFactory = streamMod.mod.createChatConnection;
+      const createConn = streamMod.mod.createChatConnection;
+      /**
+       * ★ 模型绑定（critical：不接这一步 = 学生发问后 **180s 零帧**）
+       *
+       * pi 的 `createAgentSession` 不传模型时会用它**自己的全局默认**
+       * （`~/.pi/agent/settings.json`，实测 `opencode-go/glm-5.2`，key 已 401），
+       * 而项目配置是 `amr/deepseek-v4.1-flash` → 模型根本没被喂给 pi。
+       * 我这边负责**物化一个 pi 格式的 `models.json`**（写在 `data/pi-agent/`，.gitignore 覆盖、不回显 key），
+       * 再把它交给 pi-bridge 的 `AgentSessionManager({ modelsPath, model })`。
+       */
+      const sessionMod = await tryImport<{
+        AgentSessionManager?: new (opts: Record<string, unknown>) => unknown;
+      }>('./agent/session.ts');
+      const piModels = materializePiModels(cfg);
+      if (piModels && typeof sessionMod.mod?.AgentSessionManager === 'function') {
+        try {
+          const manager = new sessionMod.mod.AgentSessionManager({
+            // ★ 必须给 `agentDir`（而不是只给 `modelsPath`）：pi 的**凭据**读的是 `<agentDir>/auth.json`，
+            //   与 `models.json`（模型目录）是两件事。只给 modelsPath 会得到
+            //   "No API key found for <provider>"；而 auth.json 形状不对时更糟 —— **静默挂死**（180s 零帧）。
+            agentDir: piModels.agentDir,
+            model: piModels.modelRef,
+            // ★ 只读知识库工具（`kb_search`/`kb_get`）—— **必须在建管理器时注入**，
+            //   否则 `ready.tools` 会是 `[]`（代码以为开了、实际没注册）
+            kb,
+          });
+          agentManager = manager;
+          chatFactory = (connOpts) => createConn({ ...connOpts, manager } as never);
+          process.stderr.write(
+            `[agent] 模型与凭据已绑定项目配置：${piModels.modelRef}` +
+              `（agentDir → ${path.relative(cfg.root, piModels.agentDir)}，apiKey 只写 data/，不回显）\n`,
+          );
+        } catch (err) {
+          chatFactory = createConn;
+          process.stderr.write(
+            `[agent] 模型绑定失败（${redact(err instanceof Error ? err.message : String(err))}）→ ` +
+              'pi 会回落它自己的全局默认模型（ready 帧会带 model_warning）\n',
+          );
+        }
+      } else {
+        chatFactory = createConn;
+        process.stderr.write(
+          piModels
+            ? '[agent] 未能构造会话管理器（AgentSessionManager 不可用）→ pi 回落全局默认\n'
+            : '[agent] 无可用 LLM 凭据 → 无法物化 models.json → pi 回落全局默认（chat 可能 401/无响应）\n',
+        );
+      }
     } else if (!agentError) {
       agentError = streamMod.error ?? 'agent/stream.ts 未导出 createChatConnection';
     }
@@ -270,14 +386,143 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   }
   Object.assign(handlers, extraHandlers);
 
+  // ── 检索层（`src/retrieval/**`，kg-rag-architect 交付）─────────────────
+  // 动态接入：未交付/导入失败 → deps.retrieval=null → chat 按 `retrieval:'none'` 走、不报错
+  // （与 providers/agent 同一策略："缺谁都能起"）。
+  const retrievalMod = await tryImport<{
+    createRetrievalFacade?: (opts: { db: Db; repo: Repo; edgeTypes?: string[] }) => NonNullable<AppDeps['retrieval']>;
+  }>('./retrieval/index.ts');
+  /**
+   * ★ **只读知识库查询**（agent 模式的 `kb_search`/`kb_get` 用它；**构造在上面**，因为要注入会话管理器）。
+   * 这里只做接线说明，不再重复构造（避免两处真相）。
+   */
+
+  let retrieval: AppDeps['retrieval'] = null;
+  if (typeof retrievalMod.mod?.createRetrievalFacade === 'function') {
+    try {
+      retrieval = retrievalMod.mod.createRetrievalFacade({
+        db,
+        repo,
+        // 边类型来自 contracts/schema（封闭枚举）→ kg 的"传递闭包只走 DEPENDS_ON/PART_OF"据此判定
+        ...(enums.edgeTypes?.length ? { edgeTypes: enums.edgeTypes } : {}),
+      });
+      process.stderr.write('[retrieval] 检索层已接入（wiki/kg/rag 三模式各自独立探测）\n');
+    } catch (err) {
+      process.stderr.write(
+        `[retrieval] 组装失败 → 按未接入处理（chat 走 none）：${redact(err instanceof Error ? err.message : String(err))}\n`,
+      );
+      retrieval = null;
+    }
+  } else {
+    process.stderr.write('[retrieval] 未接入（createRetrievalFacade 不可用）→ chat 按 none 走\n');
+  }
+
+  // ── 学生 SQL 沙箱：AI 答疑处理器（pi-bridge 的 `createAskHandler`）─────────
+  // 动态接入 → 未就绪时 `/sandbox/ask` 如实 503（不假装能答疑）。
+  const askMod = await tryImport<{
+    createAskHandler?: (deps: Record<string, unknown>) => AppDeps['sandboxAsk'];
+  }>('./sandbox/ask.ts');
+  let sandboxAsk: AppDeps['sandboxAsk'] = null;
+  if (typeof askMod.mod?.createAskHandler === 'function') {
+    try {
+      /** 会话 id → 所有者（可逆编码，见 `routes/sandbox.ts::ownerOfSession`）。 */
+      const ownerOf = (sid: string): string | null => ownerOfSession(sid);
+      /** 沙箱库根目录（必须与 `routes/sandbox.ts` 一致，否则答疑读到的是另一个库！）。 */
+      const sandboxRoot = path.join(cfg.dataDir, 'sandbox');
+      const workerCall = async (job: string, input: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        const r = await runner.raw({ job, input: { ...input, root: sandboxRoot }, timeoutMs: 30_000 });
+        return r.ok && r.result ? r.result : {};
+      };
+      sandboxAsk = askMod.mod.createAskHandler({
+        /**
+         * ★ 答疑必须用**同一个**物化会话管理器（`data/pi-agent/`）。
+         *
+         * 不传的后果（web-ui 实测到的 `E_LLM 403`）：`ask.ts` 会用它模块内的默认管理器 →
+         * pi 的**全局默认模型**（`~/.pi/agent`，key 已失效）→ 上游 401/403，
+         * 而 `/capabilities` 里 `providers.llm=amr(available=True)` 仍然正常（那是 providers 层，另一条路径）。
+         */
+        manager: agentManager ?? undefined,
+        // schema 与最近执行都走 **worker job**（与 /sandbox/schema、/sandbox/history 同源 → 不会有两套真相）
+        getSchema: async (sessionId: string) => {
+          const owner = ownerOf(sessionId);
+          if (!owner) return null;
+          const out = await workerCall('sandbox.schema', { user_id: owner, session_id: sessionId });
+          return Object.keys(out).length > 0 ? (out as never) : null;
+        },
+        getRecentExecutions: async (sessionId: string, limit: number) => {
+          const owner = ownerOf(sessionId);
+          if (!owner) return [] as never;
+          const out = await workerCall('sandbox.history', {
+            user_id: owner,
+            session_id: sessionId,
+            limit,
+            request_user_id: owner,
+          });
+          return ((out.entries as unknown[]) ?? []) as never;
+        },
+        resolveUserId: (sessionId: string) => ownerOf(sessionId),
+        // 知识库检索：复用 `store/search.ts`（bigram/坑 15、16 已处理），映射成 ask 要的形状
+        search: async (q: string, opts?: { limit?: number }) => {
+          const res = searchKb(db, repo, q, { limit: opts?.limit ?? 5 });
+          return res.hits.map((h: SearchHit) => ({
+            kind: h.kind,
+            ref_id: h.ref_id,
+            title: h.title,
+            snippet: (h as { snippet?: string }).snippet ?? '',
+            ...(typeof h.score === 'number' ? { score: h.score } : {}),
+            ...(h.doc_id ? { doc_id: h.doc_id } : {}),
+          })) as never;
+        },
+        onDiagnostic: (m: string) => process.stderr.write(`[sandbox.ask] ${redact(m)}\n`),
+        audit: (event: Record<string, unknown>) => {
+          try {
+            repo.rbac.audit({
+              userId: (event.userId as string | null) ?? null,
+              action: 'log_read',
+              target: String(event.sessionId ?? ''),
+              detail: event,
+            });
+          } catch {
+            /* 审计失败不影响答疑 */
+          }
+        },
+      });
+      process.stderr.write('[sandbox] AI 答疑已接入\n');
+    } catch (err) {
+      process.stderr.write(
+        `[sandbox] 答疑组装失败 → /sandbox/ask 会如实 503：${redact(err instanceof Error ? err.message : String(err))}\n`,
+      );
+      sandboxAsk = null;
+    }
+  } else {
+    process.stderr.write('[sandbox] 答疑未接入（createAskHandler 不可用）→ /sandbox/ask 如实 503\n');
+  }
+
+  // ── 系统设置：路由注册用的模块引用（**加载已在 providers 之前完成**，见上方注释）──
+  const settingsRoutesMod = await tryImport<{
+    createSettingsRoutes?: (deps: Record<string, unknown>) => (app: FastifyInstance) => Promise<void> | void;
+    settingsCapabilities?: (store: unknown, switcher?: unknown) => Record<string, unknown>;
+  }>('./routes/settings.ts');
+
+  /** `/capabilities` 的 settings 段数据（video-pipeline 提供；未接入时返回 null）。 */
+  const settingsCapabilitiesFn =
+    settingsStore && typeof settingsRoutesMod.mod?.settingsCapabilities === 'function'
+      ? (): Promise<Record<string, unknown>> =>
+          Promise.resolve(
+            settingsRoutesMod.mod!.settingsCapabilities!(settingsStore, null) as Record<string, unknown>,
+          )
+      : null;
+
   // ── RBAC：首个管理员引导（**仅当库里零用户**；不硬编码口令）──────────
-  let bootstrapState: 'initialized' | 'not_initialized' | 'just_created' = repo.rbac.countUsers() > 0
+  // 注：`/capabilities` 的 `auth.bootstrap` 按契约只报 **initialized | not_initialized**
+  //     （"刚创建"只是启动瞬间的内部状态，不进对外契约）。
+  let bootstrapState: 'initialized' | 'not_initialized' = repo.rbac.countUsers() > 0
     ? 'initialized'
     : 'not_initialized';
   try {
-    const boot = await bootstrapAdmin(repo, cfg);
+    const boot = await bootstrapAdmin(repo, cfg.auth);
     if (boot?.created) {
-      bootstrapState = 'just_created';
+      bootstrapState = 'initialized';
       process.stderr.write(`[auth] 已按 COURSE_KB_BOOTSTRAP_ADMIN 创建首个管理员：${boot.username}\n`);
     } else if (boot?.skippedReason) {
       process.stderr.write(`[auth] bootstrap 跳过：${boot.skippedReason}\n`);
@@ -321,6 +566,61 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     agentCapabilities,
     agentError,
     chatFactory,
+    retrieval,
+    // ★ 只读知识库查询（agent 模式的 kb_search/kb_get；已按 userId 过滤可见性）
+    kb,
+    sandboxAsk,
+    // 沙箱限制：**实时**取自 settings.json（热重载改了立刻生效）；未接入 → DEFAULT_LIMITS 兜底
+    sandboxLimits: () => {
+      const s = settingsStore?.get();
+      const fn = settingsMod.mod?.sandboxLimitsOf;
+      if (s !== undefined && typeof fn === 'function') {
+        try {
+          return fn(s) as never;
+        } catch (err) {
+          process.stderr.write(`[settings] sandboxLimitsOf 取值失败 → 用内置兜底：${redact(String(err))}\n`);
+        }
+      }
+      return DEFAULT_LIMITS;
+    },
+    settingsCapabilities: settingsCapabilitiesFn,
+    sandboxCapabilities: async () => {
+      const r = await runner.raw({ job: 'sandbox.engines', input: {}, timeoutMs: 30_000 });
+      if (!r.ok || !r.result) {
+        return {
+          available: false,
+          reason: `沙箱引擎探测失败：${r.error?.msg ?? r.error?.code ?? '未知原因'}`,
+          defaultEngine: null,
+          engines: [],
+        };
+      }
+      const out = r.result as { defaultEngine?: string; engines?: unknown[] };
+      const engines = Array.isArray(out.engines) ? out.engines : [];
+      const sqlite = engines.find((e) => (e as { id?: string }).id === 'sqlite') as
+        | { available?: boolean; reason?: string }
+        | undefined;
+      return {
+        available: sqlite?.available !== false,
+        ...(sqlite?.available === false ? { reason: sqlite.reason ?? 'sqlite 引擎不可用' } : {}),
+        defaultEngine: out.defaultEngine ?? 'sqlite',
+        engineCount: engines.length,
+        engines,
+        limits: DEFAULT_LIMITS,
+        // ★ 跨调用事务能力：**从 worker 的能力报告派生**（不写死），避免"两处真相"漂移。
+        //   worker 的 `capabilities.transactions` 是结构化对象 `{same_call, cross_call, batch_param, note}`
+        //   （backend-core 已锁字段名并加断言防退回裸 bool）→ 这里如实透传：
+        //   `cross_call:false` 时给出可读说明（这是"硬超时能强杀 + 学生间天然隔离"两条安全属性的
+        //   前提，**不是功能残缺**；事务实验用 `multi:true` 单次执行，已实测回滚行数不变 / 提交 +1）。
+        //   ⚠️ 若 worker 将来真接会话级事务（`cross_call:true`），这里**零改动自动变 true**。
+        transactions_cross_call: readCrossCallTx(out) === true,
+        ...(readCrossCallTx(out) === true
+          ? {}
+          : {
+              transactions_note:
+                '跨调用事务不支持：每次 execute 独立进程（硬超时强杀 + 学生间隔离的安全前提，有意设计）。事务实验请用 multi:true 单次执行。',
+            }),
+      };
+    },
     auth: { required: true, bootstrap: bootstrapState },
   };
 
@@ -363,6 +663,25 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   installAuth(app, { repo, cfg });
   registerAuthRoutes(app, deps);
   registerRbacRoutes(app, deps);
+  registerSandboxRoutes(app, deps);
+
+  // ── 注册 video-pipeline 的 `/settings/*` + `/models`（未交付/失败则跳过，不影响其余功能）──
+  if (settingsStore && typeof settingsRoutesMod.mod?.createSettingsRoutes === 'function') {
+    try {
+      await settingsRoutesMod.mod.createSettingsRoutes({
+        cfg,
+        store: settingsStore,
+        repo,
+        queue,
+        providers,
+      })(app);
+      process.stderr.write('[settings] /settings/* 与 /models 已注册\n');
+    } catch (err) {
+      process.stderr.write(
+        `[settings] 路由注册失败（其余功能不受影响）：${redact(err instanceof Error ? err.message : String(err))}\n`,
+      );
+    }
+  }
   registerDocumentRoutes(app, deps);
   registerCardRoutes(app, deps);
   registerSearchRoutes(app, deps);

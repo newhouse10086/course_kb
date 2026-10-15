@@ -23,18 +23,36 @@
  * T-BACKEND 接到 WebSocket 或 SSE 上（见文件末尾的使用示例）。
  */
 
+import { AGENT_ERROR_CODES, agentError, classifyFailure, sdkUnavailableError, type AgentErrorCode, type AgentErrorFrame } from './errors.ts';
+import { KB_TOOL_NAMES, resolvePageContext, type KbProvider } from './kb_tools.ts';
 import {
-  AGENT_ERROR_CODES,
-  agentError,
-  classifyFailure,
-  sdkUnavailableError,
-  type AgentErrorCode,
-  type AgentErrorFrame,
-} from './errors.ts';
+  describeCitationMode,
+  extractCitations,
+  formatRetrievalContext,
+  normalizeRetrievalMode,
+  safeJsonStringify,
+  validateAnswerCitations,
+  type CitationMode,
+  type RetrievalMode,
+  type RetrievedHitLike,
+} from './guards.ts';
 
 // ---------------------------------------------------------------------------
-// 帧类型（契约 §7.2；**只允许这 9 种**，多一种都算发明协议）
+// 帧类型（契约 §7.2 的 9 种 + `RETRIEVAL.md` §4 的 `retrieval`）
 // ---------------------------------------------------------------------------
+
+/**
+ * 工具策略三态（`ready.tools_source`），**必须与 `ready.tools` 一致**：
+ * - `disabled-by-role`：按角色策略关掉（student / teacher / **以及未显式放行的 admin**）
+ * - `explicit`：显式白名单（含默认的空集）
+ * - `dangerous-opt-in`：★ **危险**：有人显式开启了危险工具（pi 默认全集）。
+ *   命名刻意刺眼 —— **不要**把它做成"管理员就该有"的默认（lead 裁定：危险能力必须显式开启，
+ *   不能从角色推断；管理员要调试请直接在本机开终端，不必绕道浏览器）。
+ *
+ * ⚠️ 原实现标的是 `none` —— 读起来像"没有工具"，而当时实际是 pi 的默认全集
+ * （`read`/`bash`/`edit`/`write`）。那个自相矛盾的信号就是 shell 漏洞的线索。
+ */
+export type ToolsSource = 'disabled-by-role' | 'explicit' | 'dangerous-opt-in' | 'kb-readonly';
 
 export interface ReadyFrame {
   type: 'ready';
@@ -43,7 +61,19 @@ export interface ReadyFrame {
   model: string | null;
   tools: string[];
   /** 扩展（§7.3.1 ⚠️9） */
-  tools_source: 'explicit' | 'none';
+  /** ★ 工具策略（三态；**永远与实际 `tools` 一致**，见 `ToolsSource`） */
+  tools_source: ToolsSource;
+  /**
+   * ★ `tools_source='dangerous-opt-in'` 时的**刺眼警告**（in-band，不让它只活在枚举值里）。
+   *
+   * 来自独立验收的建议：让"本次会话具备主机命令执行能力"**在帧里就能被看到** ——
+   * 免得教师借用 admin 账号演示时把 shell 交到学生手里而没人察觉。
+   */
+  tools_warning?: string;
+  /** ★ 会话模式回显（`chat`/`agent`）——与 `mode`（执行模式，恒 `'sdk'`）**语义不同**，别混用 */
+  agent_mode?: AgentMode;
+  /** agent 模式下工具没能注册时的**可读原因**（如实降级，别让学生看到"有工具却查不到"） */
+  kb_tools_warning?: string;
   version: string | null;
   mode: 'sdk';
   persistence: 'native' | 'ephemeral';
@@ -53,6 +83,21 @@ export interface ReadyFrame {
   pi_session_id: string | null;
   thinking_level: string | null;
   restarted: boolean;
+  /** ★ 是否从磁盘恢复了历史（RETRIEVAL.md §5 要求 3：可观测） */
+  resumed?: boolean;
+  /** 恢复出来的历史消息条数 */
+  restoredMessages?: number;
+  /** `resumed=false` 时的可读原因（首次 / 损坏 / 未启用持久化）——**不许静默当新会话** */
+  resumeReason?: string;
+  /**
+   * ★ 模型来源：
+   * - `injected` / `resolved` = 用的是**项目配置/调用方指定**的模型
+   * - `pi-global-fallback` = ★ 没解析出来，回落到了 pi 自己的全局默认
+   *   （可能与 `/settings` 的 `llm.active` 不一致 —— 别让前端把它当成"当前模型"）
+   */
+  model_source?: 'injected' | 'resolved' | 'pi-global-fallback';
+  /** 模型来源相关警告（非空**必须外显**） */
+  model_warning?: string;
 }
 
 export interface TextDeltaFrame {
@@ -88,6 +133,66 @@ export interface MessageEndFrame {
   /** 权威完整消息；**只会是非 system 角色** */
   message: unknown;
 }
+/**
+ * ★ 检索元信息帧（契约 `RETRIEVAL.md` §4/§6）。
+ *
+ * 为什么必须有：模型自己在回答里说"这次没命中"只是**转述**；UI 需要**可验证的元信息**
+ * 才能渲染模式徽标、才能让学生区分 `none`（没查库）与 `empty`（查了没命中）——
+ * 后者正是"三种检索各自独立、可对比"的核心。
+ *
+ * `status` 是**关键区分字段**（`available` 不足以表达）：
+ * ```
+ * none        没查库（用户选了 none）        available=true  hits=0
+ * ok          查到并注入了                   available=true  hits>0
+ * empty       查了、可用，但 0 命中           available=true  hits=0   ← 与 none 视觉上必须不同
+ * unavailable 该模式不可用（未配置/缺数据）    available=false + reason
+ * error       检索过程抛错                    available=false + reason
+ * ```
+ * 每轮**恰好一帧**，在 `ready` 之后、`text_delta` 之前。
+ */
+export interface RetrievalFrame {
+  type: 'retrieval';
+  mode: RetrievalMode;
+  status: RetrievalStatus;
+  available: boolean;
+  /** 命中条数（`none` 与 `unavailable` 时恒为 0） */
+  hits: number;
+  /** 检索耗时（`none` 时为 null） */
+  elapsedMs: number | null;
+  /** 可解释性（字符串数组，UI 可展开）：为什么命中/为什么没命中 */
+  why: string[];
+  /** `available=false` 或 `empty` 时的可读原因（正常命中时为空串） */
+  reason: string;
+  /** 命中明细（最多 5 条，**不含正文片段**，只给跳转与展示需要的最小信息） */
+  sources: { kind: string; ref_id: string; title: string; score: number | null }[];
+}
+
+/**
+ * 会话模式（**用户可选**）：`chat` 不给工具；`agent` 给**只读知识库工具**。
+ * ⚠️ 与 `ready.mode`（执行模式，恒 `'sdk'`）**语义完全不同** —— 帧里用 `agent_mode` 回显它。
+ */
+export type AgentMode = 'chat' | 'agent';
+export const AGENT_MODES = ['chat', 'agent'] as const;
+
+/** 客户端请求的模式 → 合法值；未知一律 `null`（调用方必须**明确报错**，不许静默降级） */
+export function normalizeAgentMode(raw: unknown): AgentMode | null {
+  return typeof raw === 'string' && (AGENT_MODES as readonly string[]).includes(raw) ? (raw as AgentMode) : null;
+}
+
+/**
+ * `context` 帧（契约 §7.2 第 11 种）——**页面上下文**的可解释回执。
+ *
+ * 客户端只传 **id**；服务端用知识库解析成真实标题再注入；解析不到的**必须进 `dropped`**（别静默丢）。
+ * 与 `retrieval` **正交**：`retrieval:'none'` 时本帧依然存在，所以单开一帧。
+ */
+export interface ContextFrame {
+  type: 'context';
+  used: { doc_id?: string; unit_id?: string; session_id?: string; page?: number };
+  resolved: { doc_title?: string; unit_title?: string; unit_span?: Record<string, unknown> };
+  dropped: { field: string; value: string; reason: string }[];
+  note: string;
+}
+
 export interface SettledFrame {
   type: 'settled';
   aborted: boolean;
@@ -100,6 +205,8 @@ export interface SettledFrame {
 
 export type AgentFrame =
   | ReadyFrame
+  | ContextFrame
+  | RetrievalFrame
   | TextDeltaFrame
   | ThinkingDeltaFrame
   | ToolStartFrame
@@ -109,9 +216,11 @@ export type AgentFrame =
   | SettledFrame
   | AgentErrorFrame;
 
-/** 契约 §7.2 允许的帧类型（测试断言用） */
+/** 契约 §7.2 允许的帧类型（测试断言用；11 种 = 原 9 + `retrieval` + `context`） */
 export const AGENT_FRAME_TYPES = [
   'ready',
+  'context',
+  'retrieval',
   'text_delta',
   'thinking_delta',
   'tool_start',
@@ -444,12 +553,84 @@ function flushPendingError(state: MapperState, attempts: number): AgentFrame[] {
   ];
 }
 
+/**
+ * 构造 `retrieval` 帧（契约 §4："UI 要能展示这次用的是哪种检索、命中了什么"）。
+ *
+ * - `none` / `unavailable` / `error` **也要发帧**（否则"没发帧"与"没检索"分不清）
+ * - `why` 由命中项的 `why` 汇总；拿不到就给出**确定性的**说明（不编造）
+ * - `sources` 只带跳转/展示需要的最小信息（**不带正文片段**，别把知识库正文推给浏览器）
+ */
+export function makeRetrievalFrame(opts: {
+  mode: RetrievalMode;
+  status: RetrievalStatus;
+  hits: number;
+  elapsedMs: number | null;
+  reason: string;
+  items: RetrievedHitLike[];
+}): RetrievalFrame {
+  const why: string[] = [];
+  if (opts.status === 'ok') {
+    const explained = opts.items
+      .map((it) => (typeof it.why === 'string' && it.why.trim() !== '' ? it.why.trim() : null))
+      .filter((w): w is string => w !== null);
+    if (explained.length > 0) why.push(...explained.slice(0, 5));
+    else why.push(`${opts.mode} 检索命中 ${opts.hits} 条（检索器未提供 why）`);
+  } else if (opts.status === 'empty') why.push(`已执行 ${opts.mode} 检索，0 命中`);
+  else if (opts.status === 'none') why.push('用户选择了不使用知识库检索（none）');
+  else if (opts.status === 'unavailable') why.push(`${opts.mode} 检索不可用：${opts.reason}`);
+  else if (opts.status === 'error') why.push(`${opts.mode} 检索出错：${opts.reason}`);
+
+  return {
+    type: 'retrieval',
+    mode: opts.mode,
+    status: opts.status,
+    // `none` 不是"不可用"（用户主动不检索）→ available=true；`empty` 是"可用但没命中"→ true
+    available: opts.status === 'ok' || opts.status === 'empty' || opts.status === 'none',
+    hits: opts.hits,
+    elapsedMs: opts.elapsedMs,
+    why,
+    reason: opts.reason,
+    sources: opts.items.slice(0, 5).map((it) => ({
+      kind: typeof it.kind === 'string' ? it.kind : 'unknown',
+      ref_id: it.ref_id,
+      title: typeof it.title === 'string' ? it.title.slice(0, 120) : '',
+      score: typeof it.score === 'number' ? it.score : null,
+    })),
+  };
+}
+
+/**
+ * 把**策略标签**盖到 ready 帧上（工具策略由连接层按角色决定，会话层不知道角色）。
+ *
+ * `tools` 字段保持会话的**真实值**（`getActiveToolNames()`），只把 `tools_source` 标成
+ * 三态策略之一 —— 两者必须一致：`disabled-by-role` 时 `tools` 必然是 `[]`。
+ */
+export function withToolsPolicy(frame: ReadyFrame, policy: ToolsSource, agentMode?: AgentMode): ReadyFrame {
+  return {
+    ...frame,
+    tools_source: policy,
+    ...(agentMode ? { agent_mode: agentMode } : {}),
+    // 危险状态**必须在帧里说出来**（不只是枚举值）—— 独立验收建议
+    ...(policy === 'dangerous-opt-in'
+      ? {
+          tools_warning:
+            '本会话已开启主机工具（read/bash/edit/write）：浏览器用户可让 agent 执行服务器命令、读取主机文件。' +
+            '这是显式 opt-in 的结果，不是默认状态 —— 请勿在演示/共享账号下使用。',
+        }
+      : {}),
+    // agent 模式但工具没能注册（知识库未接入 / 缺身份）→ 如实说明，别静默变 chat
+    ...(policy === 'disabled-by-role' && agentMode === 'agent' && frame.kb_tools_warning
+      ? { tools_warning: `agent 模式已选，但只读知识库工具不可用：${frame.kb_tools_warning}` }
+      : {}),
+  };
+}
+
 /** 构造 `ready` 帧（把 ⚠️9 的可观测字段一次给全）。 */
 export function makeReadyFrame(opts: {
   sessionId: string;
   model: string | null;
   tools: string[];
-  toolsSource: 'explicit' | 'none';
+  toolsSource: ToolsSource;
   version: string | null;
   persistence: 'native' | 'ephemeral';
   persistenceReason: string;
@@ -457,6 +638,11 @@ export function makeReadyFrame(opts: {
   piSessionId: string | null;
   thinkingLevel: string | null;
   restarted: boolean;
+  resumed?: boolean;
+  restoredMessages?: number;
+  resumeReason?: string;
+  modelSource?: 'injected' | 'resolved' | 'pi-global-fallback';
+  modelWarning?: string;
 }): ReadyFrame {
   return {
     type: 'ready',
@@ -472,6 +658,11 @@ export function makeReadyFrame(opts: {
     pi_session_id: opts.piSessionId,
     thinking_level: opts.thinkingLevel,
     restarted: opts.restarted,
+    resumed: opts.resumed ?? false,
+    restoredMessages: opts.restoredMessages ?? 0,
+    ...(opts.resumeReason !== undefined ? { resumeReason: opts.resumeReason } : {}),
+    model_source: opts.modelSource ?? 'pi-global-fallback',
+    ...(opts.modelWarning !== undefined ? { model_warning: opts.modelWarning } : {}),
   };
 }
 
@@ -479,10 +670,17 @@ export function makeReadyFrame(opts: {
 // SSE 格式化（契约 §6：单行 JSON + keepalive）
 // ---------------------------------------------------------------------------
 
-/** 把帧变成一条 SSE 事件（`data:` 必须是**单行** JSON）。 */
+/**
+ * 把帧变成一条 SSE 事件（`data:` 必须是**单行** JSON）。
+ *
+ * ⚠️ 必须用 `safeJsonStringify`：`JSON.stringify` **不转义** U+2028/U+2029
+ * （它们在 JSON 里合法、**不报错**），而按行切帧的读取器会把它当行分隔符 →
+ * 一帧裂成两帧、第二段解析失败 → **静默丢事件**（看起来流还正常结束了）。
+ * 这是 AGENTS.md ⚠️坑 17；原实现直接 `JSON.stringify(frame)`，被独立验收抓出。
+ */
 export function formatSse(frame: AgentFrame, eventName?: string): string {
   const name = eventName ?? frame.type;
-  return `event: ${name}\ndata: ${JSON.stringify(frame)}\n\n`;
+  return `event: ${name}\ndata: ${safeJsonStringify(frame)}\n\n`;
 }
 
 /** 契约 §6：每 15 秒一次的 keepalive 注释帧。 */
@@ -500,7 +698,7 @@ export interface ChatSessionLike {
   subscribe(listener: (frame: AgentFrame) => void): () => void;
   prompt(
     message: string,
-    opts?: { steer?: boolean; followUp?: boolean },
+    opts?: { steer?: boolean; followUp?: boolean; context?: string },
   ): Promise<{ disposition: string; aborted: boolean; syntheticSettled: boolean }>;
   abort(): Promise<void>;
   setModel?(ref: string): Promise<{ ok: boolean; reason?: string }>;
@@ -509,8 +707,17 @@ export interface ChatSessionLike {
 }
 
 export interface ChatSessionManagerLike {
-  getOrCreate(sessionId: string): Promise<ChatSessionLike>;
+  /**
+   * 取/建会话。`init.tools` 是**按连接/角色**给的工具白名单：
+   * 只在会话**首次创建**时生效（已存在的会话不会被改写 —— 避免半个会话换工具集）。
+   */
+  getOrCreate(sessionId: string, init?: { tools?: string[]; kbUserId?: string }): Promise<ChatSessionLike>;
   release(sessionId: string): void;
+  /**
+   * 管理器**当前配置**的工具白名单（`null` = pi 默认全集）。
+   * 可选：连接层用它判断"管理员未指定白名单"时是否真的会落到 pi 默认。
+   */
+  readonly tools?: string[] | null;
 }
 
 export interface ChatConnection {
@@ -529,6 +736,98 @@ export interface CreateChatConnectionOptions {
   onClose?: (code: number, reason: string) => void;
   /** 注入会话管理器（测试用；不传则用 session.ts 的默认管理器） */
   manager?: ChatSessionManagerLike;
+  /**
+   * ★ 检索钩子（RETRIEVAL.md §4）——**只能在服务端调用**。
+   *
+   * ⚠️ **绝不能**接受客户端传来的检索文本：那等于把"可信的检索内容"这条通道交给客户端伪造，
+   * 而且比直接写 message 更危险（模型和我们自己的引用白名单都会认为它来自检索）。
+   * 客户端只能传**模式**（`none|wiki|kg|rag`），由这里用**服务端身份**去取内容。
+   */
+  retrieval?: RetrievalHook | null;
+  /** ★ 知识库只读能力：gent 模式的工具与 context 帧的 id 解析都靠它（内部按 userId 过滤可见性） */
+  kb?: KbProvider | null;
+  /** 初始会话模式（缺省 chat）；客户端可在每轮 prompt 里改 */
+  mode?: AgentMode;
+  /** 角色是否允许 gent 模式（由 backend-api 按 eq.user.roles 判定）；alse 时用 agent → 明确报错 */
+  allowAgentMode?: boolean;
+  /**
+   * 服务端认定的调用者身份（检索隔离 / RBAC 用）。
+   * ⚠️ 必须由服务端（会话/令牌）填充，**不要**从客户端帧里读。
+   */
+  user?: { id: string | null; roles?: string[] };
+  /**
+   * ★ **服务端权威的角色策略**（由 backend-api 按 `req.user.roles` 判定后传入）。
+   *
+   * ⚠️ Lead 裁定：**它不再决定"给不给工具"** —— 任何角色（含 admin）默认都是 `[]`。
+   * 现在它只用于**诊断/审计**（说明是哪个角色、以及为什么没工具）。
+   * 要工具请走 `tools` 白名单；要**危险**工具请走独立开关 `dangerousTools`。
+   */
+  allowTools?: boolean;
+  /**
+   * ★ **危险 opt-in**（独立开关，**不来自角色**）：允许 pi 的默认工具全集
+   * （`read`/`bash`/`edit`/`write`）。
+   *
+   * 默认 **false**。开启意味着"浏览器用户可以让 agent 执行主机命令/读主机文件"——
+   * 仅限本机可信运维场景，且**必须**同时给 `AgentSessionManager` 配 `allowPiDefaultTools: true`
+   * 才真的会生效（两道显式开关）。`ready.tools_source` 会标成刺眼的 `dangerous-opt-in`。
+   */
+  dangerousTools?: boolean;
+  /**
+   * 允许的工具白名单（管理员按策略给；危险内置工具仍会被管理器过滤）。
+   */
+  tools?: string[];
+  /**
+   * ★ 按角色的**工具白名单**（可选，优先级高于 `allowTools`；不传则用 `allowTools` 策略）。
+   * 例如：`toolsFor: (u) => (u.roles?.includes('admin') ? ['kb_read'] : [])`
+   */
+  toolsFor?: (user: { id: string | null; roles?: string[] }) => string[];
+  /**
+   * ★ 每轮结束（`settled`）后的**引用校验**回调（RETRIEVAL.md §4）。
+   *
+   * 三档：`cited`（引用有效）/ `forged`（引用了不在检索结果里的 id，疑似编造）/
+   * `missing`（检索给了东西却一次都没引用）。**只上报不自作主张改回答**。
+   */
+  onAnswerAudit?: (audit: AnswerAudit) => void;
+}
+
+/** 引用校验 + 检索状态（给 backend-api 记指标/审计用） */
+export interface AnswerAudit {
+  round: number;
+  mode: CitationMode;
+  citations: string[];
+  unknown: string[];
+  contextProvided: boolean;
+  retrievalMode: RetrievalMode;
+  retrievalStatus: RetrievalStatus;
+  /** 检索耗时（`none` 时 null） */
+  retrievalElapsedMs?: number | null;
+  /** 命中条数 */
+  retrievalHits?: number;
+  /** 检索不可用/失败时的可读原因 */
+  retrievalReason: string;
+  describe: string;
+}
+
+export type RetrievalStatus = 'none' | 'ok' | 'empty' | 'unavailable' | 'error';
+
+/** 服务端检索钩子（实现方：`src/retrieval/**`，由 backend-api/kg-rag 提供） */
+export interface RetrievalHook {
+  retrieve(args: {
+    mode: RetrievalMode;
+    query: string;
+    /** ★ 服务端身份（不是客户端给的） */
+    userId: string | null;
+    sessionId: string;
+    limit?: number;
+  }): Promise<{
+    mode?: RetrievalMode;
+    available: boolean;
+    reason?: string;
+    items: RetrievedHitLike[];
+    elapsedMs?: number;
+  }>;
+  /** 可选：实现方自己格式化（不提供则用 `guards.formatRetrievalContext`） */
+  formatContext?: (items: RetrievedHitLike[], mode: RetrievalMode) => string;
 }
 
 /** 客户端消息的必填字段（契约 §7.2） */
@@ -571,13 +870,77 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
     }
   }
 
+  /**
+   * ★ 模式 → 会话（**每个模式一个独立会话**）。
+   *
+   * 工具白名单只能在**建会话时**确定（pi 的 `createAgentSession({tools})`），
+   * 所以 `chat` 与 `agent` 必须是两个会话：`chat` 不给工具，`agent` 只给 `kb_search`/`kb_get`。
+   * 切换模式 = 切会话（各自独立上下文），并会**重发一帧 `ready`** 让前端知道"现在这个会话是什么状态"。
+   */
+  const sessionsByMode = new Map<AgentMode, ChatSessionLike>();
+  const policyByMode = new Map<AgentMode, ToolsSource>();
+  let currentMode: AgentMode = opts.mode ?? 'chat';
+
+  /** 按模式取/建会话，并算出该模式的工具策略（**服务端权威**，客户端帧里的信息一律不读） */
+  const ensureSessionForMode = async (mode: AgentMode): Promise<{ session: ChatSessionLike; policy: ToolsSource }> => {
+    const cached = sessionsByMode.get(mode);
+    if (cached) return { session: cached, policy: policyByMode.get(mode) ?? 'disabled-by-role' };
+
+    // 工具集：只有 `agent` 模式给**只读知识库工具**；`chat` 一律空
+    // ★ 危险内置工具（bash/read/edit/write）**任何模式都不给**（manager 的 sanitizeToolList 还会再拦一层）
+    let tools: string[] | undefined;
+    let policy: ToolsSource;
+    if (mode === 'agent') {
+      if (opts.allowAgentMode === false) {
+        throw Object.assign(new Error('当前角色不允许 agent 模式（只读知识库工具）'), { name: 'AgentModeDenied' });
+      }
+      tools = [...KB_TOOL_NAMES];
+      policy = 'kb-readonly';
+    } else {
+      tools = [];
+      policy = 'disabled-by-role';
+    }
+    // ★ 危险 opt-in 是**独立开关**（与角色/模式无关）：只有它能让"自定义白名单"生效。
+    //   即：**没有任何通用白名单能在不显式开启危险开关的情况下拿到工具**（student/teacher/admin 一视同仁）。
+    //   需要"读知识库"请用 `mode:'agent'`（给只读 kb 工具），别用 `tools` 白名单。
+    if (opts.dangerousTools === true) {
+      const custom = opts.tools?.length ? opts.tools : opts.toolsFor?.(opts.user ?? { id: null });
+      tools = custom && custom.length > 0 ? custom : undefined; // undefined = 交给管理器（需它有 allowPiDefaultTools）
+      policy = 'dangerous-opt-in';
+    }
+
+    // 模式进会话 key：同一浏览器会话的 chat / agent 各有一个独立上下文。
+    // ⚠️ key 也必须满足 session id 白名单（`[A-Za-z0-9._-]{1,64}`）——**不能用 `#`**：
+    //    原写法 `sessionId#agent` 会被自己的校验拒掉（"非法 session id"），
+    //    真机表现为"切到 agent 模式直接报错"（我第一版就是这么踩的）。
+    const key = mode === 'agent' ? `${sessionId}.agent` : sessionId;
+    const session = await manager.getOrCreate(key, {
+      ...(tools !== undefined ? { tools } : {}),
+      ...(opts.user?.id ? { kbUserId: opts.user.id } : {}),
+    });
+    sessionsByMode.set(mode, session);
+    policyByMode.set(mode, policy);
+    return { session, policy };
+  };
+
   let session: ChatSessionLike;
+  let toolsPolicy: ToolsSource;
   try {
-    session = await manager.getOrCreate(sessionId);
+    const first = await ensureSessionForMode(currentMode);
+    session = first.session;
+    toolsPolicy = first.policy;
   } catch (err) {
     const classified = classifyFailure(err, { where: '创建会话' });
-    const frame =
-      classified.kind === 'unknown' && String(err).includes('pi SDK')
+    // ★ 凭据文件**形状**错（就是让 pi 静默挂死的那种）：给可读原因 + 修法，
+    //   而且**不要**说成"pi 不可用"（SDK 好好的，是部署配置的形状问题）。
+    const isAuthShape = (err as Error)?.name === 'PiAuthShapeInvalid';
+    const isSdkMissing = classified.kind === 'unknown' && String(err).includes('pi SDK');
+    const frame = isAuthShape
+      ? agentError(AGENT_ERROR_CODES.E_PI_CMD, String((err as Error).message), {
+          hint: '这是**部署配置**问题（不是模型、也不是学生的操作）：按消息里的形状修正 pi 凭据文件后重试',
+          detail: 'PiAuthShapeInvalid（形状错的凭据会让 pi 静默挂死 → 所以在建会话前就拦下）',
+        })
+      : isSdkMissing
         ? sdkUnavailableError(String((err as Error)?.message ?? err))
         : agentError(classified.code, classified.msg, { hint: classified.hint, detail: classified.detail });
     await safeSend(send, frame);
@@ -593,6 +956,18 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
   let flushing = false;
   let readySent = false;
   let closed = false;
+  // ★ 引用校验（RETRIEVAL.md §4）的每轮状态
+  let currentRound = 0;
+  let currentRoundText = '';
+  let currentContextValidIds: string[] = [];
+  let auditContextProvided = false;
+  let auditRetrievalMode: RetrievalMode = 'none';
+  let auditRetrievalStatus: RetrievalStatus = 'none';
+  let auditRetrievalReason = '';
+  let auditRetrievalElapsedMs: number | null = null;
+  let auditRetrievalHits = 0;
+  /** 本轮的服务端解析结果（页面上下文标题）→ 拼在用户消息前面 */
+  let contextPrefix = '';
 
   const flush = async (): Promise<void> => {
     if (flushing || !readySent) return;
@@ -610,12 +985,62 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
     }
   };
 
-  const unsubscribe = session.subscribe((frame) => {
+  let unsubscribe: (() => void) | null = null;
+  const onSessionFrame = (frame: AgentFrame): void => {
+    // ★ 本轮引用校验：攒文本 → `settled` 时按本次检索结果做三档判定并回调。
+    //   **只上报，不改回答**（回答是模型的话，改了就说不清"谁说的"）。
+    if (frame.type === 'text_delta') currentRoundText += frame.delta;
+    if (frame.type === 'message_end') {
+      const msg = frame.message as { role?: unknown } | null;
+      if (msg && msg.role === 'assistant') {
+        const content = (msg as { content?: unknown }).content;
+        if (Array.isArray(content)) {
+          const text = content
+            .map((b) => (b && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : ''))
+            .join('');
+          if (text !== '') currentRoundText = text; // message_end 是权威
+        }
+      }
+    }
+    if (frame.type === 'settled' && currentRound > 0 && opts.onAnswerAudit) {
+      const verdict = validateAnswerCitations(currentRoundText, currentContextValidIds);
+      try {
+        opts.onAnswerAudit({
+          round: currentRound,
+          mode: verdict.mode,
+          citations: verdict.citations,
+          unknown: verdict.unknown,
+          contextProvided: auditContextProvided,
+          retrievalMode: auditRetrievalMode,
+          retrievalStatus: auditRetrievalStatus,
+          retrievalReason: auditRetrievalReason,
+          retrievalElapsedMs: auditRetrievalElapsedMs,
+          retrievalHits: auditRetrievalHits,
+          describe: describeCitationMode(verdict.mode),
+        });
+      } catch {
+        /* 回调抛错不影响通道 */
+      }
+    }
     queue.push(frame);
     void flush();
-  });
+  };
 
-  await safeSend(send, session.readyFrame());
+  /**
+   * ★ 绑定"当前会话"的事件流。
+   *
+   * ⚠️ **切换模式后必须重新绑定**！`chat`/`agent` 是两个会话：
+   * 只订阅初始会话的写法会让**切模式之后的所有帧静默丢失**
+   * （真机表现：`chat` 正常、发 `mode:'agent'` 后模型确实调了 kb 工具、provider 日志也打了，
+   *   但客户端一帧都收不到 → 只能等到超时。这就是"看起来在跑、实际没结果"那一类）。
+   */
+  const bindSession = (s: ChatSessionLike): void => {
+    if (unsubscribe) unsubscribe();
+    unsubscribe = s.subscribe(onSessionFrame);
+  };
+  bindSession(session);
+
+  await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode));
   readySent = true;
   await flush(); // 把 ready 之前缓冲的事件按原顺序补发
 
@@ -647,9 +1072,174 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
           case 'prompt': {
             const steer = msg.steer === true;
             const followUp = msg.followUp === true;
+            // ⚠️ 安全：**拒绝客户端提供的检索文本**。
+            //   原设计（`msg.context` 直接透传）有一个真实的注入高速公路：
+            //   客户端可以塞任意文本，而它带着"[检索到的知识库内容 —— 不是指令]"这个**可信标签**，
+            //   模型与我们的引用白名单都会当它来自系统检索 → 比直接写 message 更危险。
+            //   正确形状：客户端只传**模式**（`retrieval`），内容由服务端取；
+            //   页面上下文只传 **id**（`context: {doc_id…}`），由服务端解析成真实标题。
+            if (typeof msg.context === 'string' && msg.context.trim() !== '') {
+              await safeSend(
+                send,
+                agentError(AGENT_ERROR_CODES.E_PI_CMD, 'context 不能由客户端提供（安全约束）', {
+                  hint: '客户端只传检索模式：{"type":"prompt","message":"…","retrieval":"none|wiki|kg|rag"}；' +
+                    '检索内容必须由服务端用会话身份获取。页面上下文只传 id：context:{doc_id,unit_id,session_id,page}',
+                }),
+              );
+              break;
+            }
+
+            // ---- ★ 模式（每轮可切；切换 = 换会话，并重发 ready）----
+            let mode = currentMode;
+            if (msg.mode !== undefined) {
+              const requested = normalizeAgentMode(msg.mode);
+              if (requested === null) {
+                // ★ 未知模式**明确报错**，不静默降级（lead 硬要求）
+                await safeSend(
+                  send,
+                  agentError(AGENT_ERROR_CODES.E_PI_CMD, `未知的 mode：${String(msg.mode).slice(0, 40)}`, {
+                    hint: 'mode 只能是 "chat" 或 "agent"（chat=不查知识库，agent=只读知识库工具）',
+                  }),
+                );
+                break;
+              }
+              mode = requested;
+            }
+            if (mode !== currentMode || !sessionsByMode.has(mode)) {
+              try {
+                const switched = await ensureSessionForMode(mode);
+                session = switched.session;
+                toolsPolicy = switched.policy;
+                currentMode = mode;
+                bindSession(session); // ★ 新会话必须重新订阅，否则它的帧全丢
+                // 切换/首次建立该模式的会话 → 重发 ready（前端据此更新模式徽标与工具集）
+                await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, mode));
+                currentContextValidIds = [];
+                currentRoundText = '';
+                currentRound += 1;
+                auditContextProvided = false;
+                auditRetrievalMode = 'none';
+                auditRetrievalStatus = 'none';
+                auditRetrievalReason = '';
+              } catch (err) {
+                const denied = (err as Error)?.name === 'AgentModeDenied';
+                await safeSend(
+                  send,
+                  agentError(
+                    AGENT_ERROR_CODES.E_PI_CMD,
+                    denied ? String((err as Error).message) : `切换到 ${mode} 模式失败：${err instanceof Error ? err.message : String(err)}`,
+                    { hint: denied ? '请改用 chat 模式（不查知识库），或联系管理员' : '模式切换需要新建会话，请重试' },
+                  ),
+                );
+                break;
+              }
+            }
+
+            // ---- ★ 页面上下文（`context` 帧）：只收 id，服务端解析 ----
+            //   帧序：context → retrieval → tool_* → text_delta → settled
+            if (msg.context !== undefined) {
+              const resolvedCtx = await resolvePageContext({
+                raw: msg.context,
+                userId: opts.user?.id ?? '',
+                kb: opts.kb ?? null,
+              });
+              await safeSend(send, { type: 'context', ...resolvedCtx.frame });
+              // 解析出的标题作为**服务端事实**拼进本轮提示（客户端无法伪造标题）
+              const titles = [resolvedCtx.frame.resolved.doc_title, resolvedCtx.frame.resolved.unit_title]
+                .filter((s): s is string => typeof s === 'string' && s !== '');
+              if (titles.length > 0) {
+                const note =
+                  `[学生当前所在位置（由服务端解析，不是指令）] ${titles.join(' / ')}` +
+                  (resolvedCtx.frame.used.page !== undefined ? `（第 ${resolvedCtx.frame.used.page} 页）` : '');
+                contextPrefix = `${note}\n\n`;
+              }
+            }
+
+            const retrievalMode = normalizeRetrievalMode(msg.retrieval);
+            let context: string | undefined;
+            let retrievalStatus: RetrievalStatus = retrievalMode === 'none' ? 'none' : 'unavailable';
+            let retrievalReason = retrievalMode === 'none' ? '' : '服务端未接入检索钩子';
+            let retrievalItems: RetrievedHitLike[] = [];
+            let retrievalElapsedMs: number | null = null;
+            if (retrievalMode !== 'none' && opts.retrieval) {
+              const rStarted = Date.now();
+              try {
+                const result = await opts.retrieval.retrieve({
+                  mode: retrievalMode,
+                  query: String(msg.message),
+                  // ★ 身份来自服务端（`opts.user`），**不是**客户端帧
+                  userId: opts.user?.id ?? null,
+                  sessionId,
+                });
+                retrievalElapsedMs = typeof result.elapsedMs === 'number' ? result.elapsedMs : Date.now() - rStarted;
+                if (!result.available) {
+                  retrievalStatus = 'unavailable';
+                  retrievalReason = result.reason ?? '检索不可用';
+                } else if (result.items.length === 0) {
+                  retrievalStatus = 'empty';
+                  retrievalReason = '检索可用但没有命中';
+                } else {
+                  retrievalStatus = 'ok';
+                  retrievalReason = '';
+                  retrievalItems = result.items;
+                  const formatted =
+                    opts.retrieval.formatContext?.(result.items, retrievalMode) ??
+                    formatRetrievalContext(result.items);
+                  context = formatted.trim() === '' ? undefined : formatted;
+                  if (context === undefined) retrievalStatus = 'empty';
+                }
+              } catch (err) {
+                retrievalElapsedMs = Date.now() - rStarted;
+                retrievalStatus = 'error';
+                retrievalReason = err instanceof Error ? err.message : String(err);
+              }
+            }
+            // ★ 契约 §4/§6：把**检索元信息**发给客户端（数据本来就算出来了，只是以前没发）。
+            //   让 UI 能显示"这次用了哪种检索 / 命中什么 / 为什么没查到"，
+            //   也让学生能区分 `none`（没查库）与 `empty`（查了没命中）—— 这正是"三种检索各自独立"的核心。
+            //   ① 不可用时**也要发**（否则"没发帧"与"没检索"分不清）；
+            //   ② 每轮**恰好一帧**，在 `ready` 之后、`text_delta` 之前。
+            await safeSend(
+              send,
+              makeRetrievalFrame({
+                mode: retrievalMode,
+                status: retrievalStatus,
+                hits: retrievalItems.length,
+                elapsedMs: retrievalElapsedMs,
+                reason: retrievalReason,
+                items: retrievalItems,
+              }),
+            );
+            auditRetrievalElapsedMs = retrievalElapsedMs;
+            auditRetrievalHits = retrievalItems.length;
+            // 检索没成功时：把"这一轮没有知识库依据"如实写进提示词，让模型告诉学生
+            // （不新增帧类型；学生看到的是"这次回答没有引用知识库"，而不是一份假装有出处的答案）
+            const contextForPrompt =
+              context ??
+              (retrievalMode === 'none'
+                ? undefined
+                : `[本次检索未能提供知识库内容：${retrievalReason}]（请在回答里如实说明这次没有知识库依据，不要编造引用）`);
+            // ★ 页面上下文（服务端解析出的真实标题）拼在本轮消息**前面**。
+            //   ⚠️ 原错误写法：只算出了 `contextPrefix` 却没拼进 prompt ——
+            //   `context` 帧照样回报 `used/resolved`（"用了"），而模型根本没收到。
+            //   真机表现：问"我在看哪一章"，模型答"我读不到你的浏览状态"（帧与事实相反）。
+            const outgoing = contextPrefix === '' ? String(msg.message) : `${contextPrefix}${String(msg.message)}`;
+            contextPrefix = '';
+
+            currentContextValidIds = context ? extractCitations(context) : [];
+            currentRoundText = '';
+            currentRound += 1;
+            auditContextProvided = context !== undefined;
+            auditRetrievalMode = retrievalMode;
+            auditRetrievalStatus = retrievalStatus;
+            auditRetrievalReason = retrievalReason;
             // 本轮结束的信号由 session 内部（agent_settled）保证；这里 await 只是为了
             // 在失败时拿到异常并变成 error 帧（SDK: prompt() 在运行结束时 resolve）。
-            await session.prompt(String(msg.message), { steer, followUp });
+            await session.prompt(outgoing, {
+              steer,
+              followUp,
+              ...(contextForPrompt ? { context: contextForPrompt } : {}),
+            });
             break;
           }
           case 'steer': {
@@ -674,16 +1264,16 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                 hint: '模型必须已在 pi 的 models.json/目录里且凭据可用',
               }));
             }
-            await safeSend(send, session.readyFrame());
+            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode));
             break;
           }
           case 'new_session': {
             const ready = await session.reset();
-            await safeSend(send, ready);
+            await safeSend(send, withToolsPolicy(ready, toolsPolicy, currentMode));
             break;
           }
           case 'get_state': {
-            await safeSend(send, session.readyFrame());
+            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode));
             break;
           }
           default: {
@@ -698,8 +1288,12 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
     },
     async close(): Promise<void> {
       closed = true;
-      unsubscribe();
-      manager.release(sessionId);
+      unsubscribe?.();
+      // 释放**所有**模式的会话（chat/agent 各一份）
+      for (const m of sessionsByMode.keys()) {
+        manager.release(m === 'agent' ? `${sessionId}.agent` : sessionId);
+      }
+      if (sessionsByMode.size === 0) manager.release(sessionId);
     },
   };
 

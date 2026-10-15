@@ -722,16 +722,56 @@ data: {"task_id":"tsk_1","error":"ASR model load failed","code":"E_ASR_LOAD"}
 **服务端 → 客户端**（**复用 pi 事件名**，见 §7.3 映射）：
 
 ```json
-{ "type":"ready",        "session_id":"pi_abc", "model":"…", "tools":["read","bash"] }
+{ "type":"ready",        "session_id":"pi_abc", "model":"…", "tools":["read","bash"],
+                         "agent_mode":"chat", "tools_source":"disabled-by-role" }
+{ "type":"context",      "used":{"doc_id":"doc_x","unit_id":"unt_y","page":3},
+                         "resolved":{"doc_title":"…","unit_title":"3.1 聚簇索引"},
+                         "dropped":[{"field":"unit_id","value":"unt_zzz","reason":"未找到或无权访问"}] }
+{ "type":"retrieval",    "mode":"wiki", "status":"ok", "available":true, "hits":2,
+                         "elapsedMs":1240, "why":["bigram 命中「聚簇索引」"],
+                         "reason":"", "sources":[{"kind":"unit","ref_id":"unt_0001","title":"3.1 聚簇索引"}] }
 { "type":"text_delta",   "delta":"聚簇" }
 { "type":"thinking_delta","delta":"先确认…" }
-{ "type":"tool_start",   "id":"call_1", "tool":"read", "args":{...} }
+{ "type":"tool_start",   "id":"call_1", "tool":"kb_get", "args":{"ref_id":"crd_0042"} }
 { "type":"tool_update",  "id":"call_1", "partial":"…" }
 { "type":"tool_end",     "id":"call_1", "ok":true, "duration_ms":120 }
 { "type":"message_end",  "message":{...} }
 { "type":"settled",      "aborted":false }
 { "type":"error",        "code":"E_PI_EXIT", "msg":"pi process exited" }
 ```
+
+> **共 11 种帧**。每轮帧序：**`context → retrieval → tool_* → text_delta → settled`**
+> （`ready` 只在**会话建立 / 模式切换**时发）。
+>
+> **`agent_mode` vs `mode` —— 两个都叫"模式"但语义完全不同，不要混用**：
+> - `ready.agent_mode` = `'chat' | 'agent'` —— **能不能调用知识库只读工具**
+> - `ready.mode` = 执行模式（恒 `'sdk'`）—— 与 pi 的集成方式
+>
+> **`context` 帧（页面上下文）的三条硬约束**：
+> 1. **请求侧只接受 id，不收自由文本** —— 客户端不可信；服务端必须用知识库把 id
+>    解析成**真实标题/snippet** 再注入（与"客户端不许传检索 context 文本"同一原则）
+> 2. **`dropped` 非空必须如实回** —— 前端要显示"未找到你当前章节，已忽略"，**不许静默丢**
+> 3. **`session_id` 要按 `userId` 校验归属** —— 否则是一条跨用户读取路径
+>
+> **`context` 与 `retrieval` 正交**：`retrieval:'none'` 时 `context` 仍然存在 ——
+> 所以单开一帧，不塞进 `retrieval`（塞一起会让"我在看哪一页"与"查不查库"两个维度纠缠）。
+>
+> **`agent` 模式只给 `kb_search` / `kb_get`（只读知识库）**，
+> **绝不含 `bash`/`read`/`edit`/`write`** —— 危险工具仍由两道显式开关把关（见 §7.2 安全说明）。
+
+> **共 10 种帧**（原清单漏了 `retrieval` —— 由独立验收发现：契约 `RETRIEVAL.md` §4 要求它，
+> 而实现的服务端**已算出 `retrievalStatus`/`retrievalReason` 并写进 audit，却没发给客户端**，
+> 导致学生无法知道这次回答有没有用知识库、用的哪种检索）。
+>
+> **`retrieval` 帧的两条硬约束**：
+> 1. **每轮恰好一帧**，且必须在**检索处理完、发 prompt 给 SDK 之前**发出（顺序：`ready → retrieval → …`）
+> 2. ★ **`status` 必须显式区分五种情况**：`none`（没查库）/ `ok`（命中）/ **`empty`（查了但 0 命中）** /
+>    `unavailable`（能力不可用）/ `error`。
+>    **`available` 单字段表达不了这个区分** —— `none` 与 `empty` 都是 `available:true`，
+>    但"没查库"与"查了没命中"对学生是完全不同的信息（这正是"四种检索各自独立"的可见性基础）。
+> 3. **不可用/出错也要发帧**（`available:false` + 可读 `reason`）——
+>    否则"没发帧"与"没检索"分不清。
+> 4. **帧里不带正文片段**（`sources` ≤5 条，只有 id/title/kind/score）。
 
 ### 7.3 事件映射（pi → 我们的桥）
 
@@ -920,6 +960,28 @@ verify_rpc() 真起进程 → 发 get_state → 等带 id 的响应，超时判�
 | `E_PI_EXIT` | 502 | pi 子进程退出 | 自动重启一次，再失败则禁用对话 |
 | `E_PI_TIMEOUT` | 504 | pi 超时 | 可中断重试 |
 | `E_BUSY` | 429 | 任务队列满 | 排队或稍后 |
+| `E_UNAUTHENTICATED` | 401 | **未登录 / 会话失效** | 跳登录页（**不是显示空数据**） |
+| `E_FORBIDDEN` | 403 | 已登录但无权访问该资源 | 提示无权限 + 说明需要什么角色 |
+| `E_ACCOUNT_DISABLED` | 403 | 账号被禁用 | 提示联系管理员（**旧 cookie 立即失效**） |
+| `E_BADREQUEST` | 400 | 请求字段不合法（如缺 `username`） | 指明哪个字段 |
+| `E_CONFLICT` | 409 | 唯一性冲突（如用户名已存在） | 提示换一个 |
+| `E_QUOTA` | 429 | **该用户**的并发/配额超限 | 提示稍后 + 显示配额；**教师任务优先，不会被学生饿死** |
+| `E_MODEL_BUSY` | 409 | 有批量推理在跑，**拒绝直接热切换模型** | 提示「终止并切换」或等 `drain` |
+| `E_MODEL_PROBE` | 502 | 新模型探测失败 → **已回滚到旧模型** | 显示回滚 + 失败原因 |
+| `E_SANDBOX_FORBIDDEN` | 403 | SQL 被安全闸拒绝（`ATTACH`/`load_extension`/多语句…） | 显示原因 + 说明为何禁止 |
+| `E_SANDBOX_MULTI` | 400 | 一次只能执行**单条**语句 | 提示拆开执行 |
+| `E_SANDBOX_PATH` | 400 | 沙箱路径越界 | 拒绝（不提示内部路径） |
+| `E_SANDBOX_TIMEOUT` | 408 | 查询超时被中断 | **明确说明"不是语法错"** + 常见原因；区分 `killedBy=progress`（语句层中断）/ `process`（进程级硬杀） |
+| `E_LOG_ISOLATION` | 403 | 请求的日志不属于该会话 | 拒绝（**跨用户读日志**） |
+
+> ⚠️ **`E_FORMAT` 是 415（文件格式不支持），不是 400（字段不合法）** ——
+> 用 `E_FORMAT` 表示"少传了 username"会给前端误导性状态码，所以另立 `E_BADREQUEST`。
+>
+> ⚠️ **`E_QUOTA` 与 `E_BUSY` 语义不同**：`E_BUSY` 是**全局**队列满（大家都等），
+> `E_QUOTA` 是**该用户**超了自己的配额（别人还能跑）。前端文案要区分。
+>
+> ⚠️ **未登录必须是 401，不是 200 + 空列表** ——
+> "返回空数据冒充成功"是本项目明令禁止的失败模式（见 `AGENTS.md` 坑清单判据）。
 
 **错误响应体**：
 

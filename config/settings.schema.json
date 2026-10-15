@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://course-kb.local/config/settings.schema.json",
+  "title": "course-kb 运行期设置（config/settings.json）",
+  "description": "运行期可改的 AI 配置（模型选择/策略/配额/开关）。部署期 provider 清单在 providers.yaml；凭据只在 .env。见 docs/SETTINGS_AND_SANDBOX.md §1。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "llm"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "type": "integer", "minimum": 1 },
+    "llm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active"],
+      "properties": {
+        "active": { "type": "string", "minLength": 1, "description": "当前生效模型（热切换改这个）" },
+        "fallbacks": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "maxTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "★ 必须包含推理 token 预算（实测 8 字回复用 54 个 reasoning token）"
+        },
+        "structured": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "jsonSchemaStrict": { "type": "boolean" } }
+        },
+        "concurrency": {
+          "const": 1,
+          "description": "★ 用户硬要求：并发=1，代码层面忽略调高（写 >1 会被强制回 1 并记 warning）"
+        }
+      }
+    },
+    "asr": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "active": { "type": ["string", "null"] },
+        "model": { "type": "string" },
+        "fallbacks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "tts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "active": { "type": ["string", "null"] } }
+    },
+    "translate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "active": { "type": ["string", "null"] },
+        "glossaryMode": { "enum": ["inject", "none"] },
+        "keepIdentifiers": { "type": "boolean" }
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "engine": { "enum": ["sqlite", "postgres", "mysql", "opengauss"] },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxRows": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 60000 },
+            "maxDbBytes": { "type": "integer", "minimum": 1024 }
+          }
+        },
+        "allowWrites": { "type": "boolean" },
+        "resetPolicy": { "enum": ["per_session", "never", "always"] }
+      }
+    },
+    "quota": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "student": { "$ref": "#/$defs/quotaEntry" },
+        "teacher": { "$ref": "#/$defs/quotaEntry" }
+      }
+    },
+    "hotReload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "watch": { "type": "boolean", "description": "改文件后不重启即生效" },
+        "debounceMs": { "type": "integer", "minimum": 50, "maximum": 5000 }
+      }
+    }
+  },
+  "$defs": {
+    "quotaEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "concurrentLlmTasks": { "type": "integer", "minimum": 1 },
+        "dailyLlmCalls": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

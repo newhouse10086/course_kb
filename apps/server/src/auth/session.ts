@@ -153,11 +153,16 @@ export class LoginRateLimiter {
   }
 }
 
-/** 日志脱敏：**cookie / 口令 / token 绝不落日志**。 */
+/**
+ * 日志脱敏：**cookie / 口令 / token 绝不落日志**。
+ *
+ * ⚠️ 同时覆盖 `"password":"x"`（JSON）与 `password=x` / `password="x"`（日志行/表单）两种形态 ——
+ * 只防 JSON 形态会漏掉最常见的手写日志行。
+ */
 export function redactAuthText(text: string): string {
   return text
     .replace(/(ckb_session=)[A-Za-z0-9_\-%]+/gi, '$1<redacted>')
-    .replace(/("password"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2')
-    .replace(/("token"\s*:\s*")[^"]*(")/gi, '$1<redacted>$2')
+    .replace(/(["']?(?:password|passwd|pwd)["']?\s*[=:]\s*)["']?[^"',;&\s}]+/gi, '$1<redacted>')
+    .replace(/(["']?(?:token|api_key|apikey|secret)["']?\s*[=:]\s*)["']?[^"',;&\s}]+/gi, '$1<redacted>')
     .replace(/(Bearer\s+)[A-Za-z0-9._\-]+/gi, '$1<redacted>');
 }

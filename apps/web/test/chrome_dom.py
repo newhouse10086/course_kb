@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """headless Chrome DOM 断言（Vue3 前端的 e2e）
 
@@ -473,6 +473,209 @@ def main() -> int:
                'data-testid="chat-gate"' in deg_chat and ("pi SDK" in deg_chat or "AMR_KEY" in deg_chat))
             ok("导航入口标记不可用", 'data-nav="/chat"' in deg_chat and "不可用" in deg_chat)
 
+        # ============ 9b. 检索模式徽标（契约 §4）：none / wiki / kg(0命中) / rag(不可用) ============
+        def chat_retrieval(mode: str, kg_hit: bool = False):
+            api(f"/api/v1/_fixture/config?retrieval={mode}" + ("&kg_hit=1" if kg_hit else ""))
+            dom = dump_dom(driver, url(normal, "chat?selftest=1"), READY_VIEW)
+            # 发一句 → 等检索帧与一轮结束
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"retrieval-badge\"]')", timeout=60, interval=0.2)
+            return dom
+
+        def check_retrieval_wiki() -> None:
+            dom = chat_retrieval("wiki")
+            ok("wiki：徽标出现", 'data-testid="retrieval-badge"' in dom)
+            ok("wiki：标注模式与命中数（status=ok）",
+               'data-mode="wiki"' in dom and 'data-hits="2"' in dom and 'data-status="ok"' in dom,
+               "缺 data-mode/hits/status")
+            ok("wiki：显示耗时（教学对比用）", "耗时" in dom and "s" in dom)
+            ok("wiki：可展开依据（why）", 'data-testid="retrieval-why-toggle"' in dom)
+            # 展开 → 看到 why 与路径
+            driver.ch.evaluate("document.querySelector('[data-testid=\"retrieval-why-toggle\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"retrieval-why\"]')", timeout=20, interval=0.2)
+            why_dom = driver.ch.outer_html()
+            ok("wiki：why 里是可读的命中原因（bigram 命中「索引」）", "bigram 命中" in why_dom, "why 未显示可读原因")
+            ok("wiki：命中项带 title/score", "聚簇索引" in why_dom and "score" in why_dom)
+
+        # ============ 9b-2. 全局 chat 小助手：**每个页面**都能打开（用户明确需求） ============
+        def check_dock_everywhere() -> None:
+            # 六个页面（含我新做的 Settings / Lab）逐个断言：浮动入口存在 + 抽屉能开
+            pages = [
+                ("wiki", f"wiki?doc={DOC_PDF}&unit={UNIT}", 'data-ctx-keys="doc_id,unit_id"'),
+                ("graph", f"graph?doc={DOC_PDF}", 'data-ctx-keys="doc_id"'),
+                ("video", f"video?doc={DOC_VIDEO}", 'data-ctx-keys="doc_id"'),
+                ("docs", "docs", ""),
+                ("settings", "settings", ""),
+                ("lab", "lab?load=1", 'data-ctx-keys="session_id"'),
+            ]
+            for name, route, want_ctx in pages:
+                # ⚠️ 这里**不能**用 READY_VIEW（它只认 selftest-report/docs-report）——
+                #    无自检的页面（settings/lab/graph）会一直等到超时。小助手是全局的，用它当就绪信号。
+                dump_dom(driver, url(normal, route),
+                         "!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=120)
+                if want_ctx == 'data-ctx-keys="session_id"':
+                    # Lab 的 session_id 要等沙箱会话建立后才写入
+                    driver.ch.wait_for("(document.querySelector('[data-testid=\"assistant-dock\"]')?.dataset.ctxKeys || '').includes('session_id')",
+                                       timeout=120, interval=0.3)
+                dom = driver.ch.outer_html()
+                ok(f"{name}：小助手浮动入口存在", 'data-testid="assistant-fab"' in dom, f"{name} 无入口")
+                ok(f"{name}：入口标出所在页", f'data-page="/{name}"' in dom)
+                driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+                driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"]')", timeout=30, interval=0.2)
+                drawer = driver.ch.outer_html()
+                ok(f"{name}：抽屉能打开且内含对话组件", 'data-testid="assistant-drawer"' in drawer and 'data-testid="chat-input"' in drawer)
+                if want_ctx:
+                    ok(f"{name}：带对页面上下文（{want_ctx}）", want_ctx in drawer,
+                       f"{name} 上下文缺失：{want_ctx}")
+                # 关掉，避免影响后续用例
+                driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-close\"]').click()")
+
+        run_view("全局小助手 / 六个页面都能打开", check_dock_everywhere)
+
+        def check_dock_chat() -> None:
+            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"),
+                     "!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=120)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"chat-input\"]')", timeout=30, interval=0.2)
+            # 在抽屉里真发一条 → 真流式回答（走同一个 WS）
+            driver.ch.evaluate("(() => { const d=document.querySelector('[data-testid=\"assistant-drawer\"]');"
+                               " const t=d.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='这一节讲什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => d.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-text\"]')",
+                               timeout=60, interval=0.3)
+            dom = driver.ch.outer_html()
+            ok("小助手：能发消息并流式回答", 'data-testid="assistant-text"' in dom)
+            ok("小助手：显示正在参考（服务端解析出的真实标题）",
+               'data-testid="context-used"' in dom and "MySQL 26.7 Reference Manual" in dom, "未显示 context 帧的 resolved 标题")
+
+        run_view("全局小助手 / 真发消息 + 上下文回显", check_dock_chat)
+
+        # ============ 9b-3. tools 自述字段与实际值**同源**（AGENTS.md 坑 21） ============
+        def check_tools_consistency() -> None:
+            # chat 模式：source=disabled-by-role ⇒ tools 必须为空
+            dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='一致性检查'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.source === 'disabled-by-role'",
+                               timeout=60, interval=0.2)
+            tools = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.tools || ''")
+            ok("chat：tools_source=disabled-by-role ⇒ tools 必须为空（同源断言）",
+               str(tools).strip() == "", f"tools={tools}")
+            # agent 模式：source=kb-readonly ⇒ tools 必须含 KB 工具（反向断言：说开了就真开）
+            driver.ch.evaluate("document.querySelector('[data-testid=\"mode-agent\"]').click()")
+            driver.ch.wait_for("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.source === 'kb-readonly'",
+                               timeout=60, interval=0.2)
+            tools2 = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.tools || ''")
+            ok("agent：tools_source=kb-readonly ⇒ tools 必须含 kb_search/kb_get（同源断言）",
+               "kb_search" in str(tools2) and "kb_get" in str(tools2), f"tools={tools2}")
+            ok("agent：自述只读时绝不含危险工具（反向断言）",
+               not any(x in str(tools2) for x in ("bash", "read", "edit", "write")), f"tools={tools2}")
+
+        run_view("工具自述 vs 实际（同源断言，坑 21）", check_tools_consistency)
+
+        # ============ 9c. 模式选择器（chat / agent）—— 用户需求，两个正交控件 ============
+        def check_mode_switch() -> None:
+            dom = dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)
+            ok("模式分段控件存在（chat / agent）",
+               'data-testid="mode-select"' in dom and 'data-testid="mode-chat"' in dom and 'data-testid="mode-agent"' in dom)
+            ok("说清两者差异（快/能翻原文）", 'data-testid="mode-explain"' in dom and "kb_search" in dom)
+            ok("检索与模式是**两个独立控件**",
+               'data-testid="retrieval-select"' in dom and 'data-testid="mode-select"' in dom)
+            # 发一轮（chat 默认）→ 后端回显 agent_mode=chat 且 tools 为空
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='聚簇索引是什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("document.querySelector('[data-testid=\"backend-mode\"]')?.dataset.backendMode === 'chat'",
+                               timeout=60, interval=0.2)
+            chat_dom = driver.ch.outer_html()
+            ok("chat：后端回显 agent_mode=chat（不是自己选的）", 'data-backend-mode="chat"' in chat_dom)
+            ok("chat：**没有** kb 工具帧（chat 不读原文）", 'data-testid="retrieval-tool"' not in chat_dom)
+            # 切到 agent → 再发一轮 → 应有 kb_search/kb_get 工具帧 + tools 真值
+            driver.ch.evaluate("document.querySelector('[data-testid=\"mode-agent\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"mode-note\"]')", timeout=20, interval=0.2)
+            note = driver.ch.evaluate("document.querySelector('[data-testid=\"mode-note\"]').textContent")
+            ok("切模式如实提示上下文会重新开始", "上下文会重新开始" in str(note), str(note)[:120])
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='再讲一次聚簇索引'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"retrieval-tool\"]').length >= 2",
+                               timeout=60, interval=0.2)
+            agent_dom = driver.ch.outer_html()
+            ok("agent：后端回显 agent_mode=agent", 'data-backend-mode="agent"' in agent_dom)
+            ok("agent：真调用 kb_search", 'data-tool="kb_search"' in agent_dom)
+            ok("agent：真调用 kb_get（读原文）", 'data-tool="kb_get"' in agent_dom)
+            tools = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.tools || ''")
+            src = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.source || ''")
+            ok("agent：ready.tools 真值含 kb_search/kb_get",
+               "kb_search" in str(tools) and "kb_get" in str(tools), f"tools={tools}")
+            ok("agent：tools_source=kb-readonly", str(src) == "kb-readonly", f"source={src}")
+            ok("agent：不含 bash/read（不是全能 agent）",
+               "bash" not in str(tools) and "read" not in str(tools), f"tools={tools}")
+            ok("agent：工具卡显示读了哪张卡片（result_text）", "unt_0001" in agent_dom or "3.1 聚簇索引" in agent_dom)
+
+        run_view("模式选择器 / chat ⇄ agent（工具真值）", check_mode_switch)
+
+        # ============ 9d. context 帧：服务端解析出的真实标题 + dropped 如实显示 ============
+        def check_context_frame() -> None:
+            # 带一个**不存在**的 unit_id → 后端应丢进 dropped 并如实显示
+            dump_dom(driver, url(normal, "chat?selftest=0&doc=" + DOC_PDF + "&unit=unt_not_exist_zzz"), READY_VIEW)
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='这一节讲什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"context-used\"]')", timeout=60, interval=0.2)
+            dom = driver.ch.outer_html()
+            ok("context 帧：显示服务端解析出的**真实标题**（不是客户端 id）",
+               'data-testid="context-used"' in dom and "MySQL 26.7 Reference Manual" in dom, "未显示 doc_title")
+            ok("context 帧：解析不到的 unit_id 如实进 dropped（不静默）",
+               'data-testid="context-dropped"' in dom and "未找到或无权访问" in dom, "dropped 未显示")
+
+        run_view("context 帧 / 真实标题 + dropped 如实显示", check_context_frame)
+
+        run_view("检索徽标 / wiki（命中 3 条）", check_retrieval_wiki)
+
+        def check_retrieval_none() -> None:
+            dom = chat_retrieval("none")
+            ok("none：徽标标注没查库（不是 0 命中）",
+               'data-mode="none"' in dom and 'data-status="none"' in dom and 'data-searched="0"' in dom,
+               "none 与 empty 没区分开")
+            ok("none：文案明确没查库", "没查库" in dom or "不检索" in dom)
+            ok("none：与查了没命中视觉不同（灰虚线 vs 橙）",
+               'data-status="none"' in dom and 'data-status="empty"' not in dom)
+
+        run_view("检索徽标 / none（没查库）", check_retrieval_none)
+
+        def check_retrieval_kg_empty() -> None:
+            dom = chat_retrieval("kg")
+            ok("kg：查了但 0 命中 → status=empty（与 none 不同）",
+               'data-mode="kg"' in dom and 'data-status="empty"' in dom and 'data-hits="0"' in dom,
+               "kg 空命中未标注")
+            ok("kg：明确写查了但 0 命中", "0 命中" in dom)
+
+        run_view("检索徽标 / kg（查了但 0 命中）", check_retrieval_kg_empty)
+
+        def check_retrieval_kg_hit() -> None:
+            dom = chat_retrieval("kg", kg_hit=True)
+            ok("kg 命中：status=ok + why 可见（DEPENDS_ON）",
+               'data-status="ok"' in dom and 'data-hits="1"' in dom)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"retrieval-why-toggle\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"retrieval-why\"]')", timeout=20, interval=0.2)
+            why_dom = driver.ch.outer_html()
+            ok("kg：why 显示跳数（DEPENDS_ON 1 跳）", "DEPENDS_ON" in why_dom, "kg 的可解释性未显示")
+
+        run_view("检索徽标 / kg（命中 1 条 + 路径）", check_retrieval_kg_hit)
+
+        def check_retrieval_rag_unavailable() -> None:
+            dom = chat_retrieval("rag")
+            ok("rag：不可用 → status=unavailable + 未使用知识库",
+               'data-mode="rag"' in dom and 'data-status="unavailable"' in dom and 'data-available="0"' in dom)
+            ok("rag：显示可读原因（未配置 embedding provider）",
+               'data-testid="retrieval-reason"' in dom and "embedding" in dom,
+               "不可用原因未显示")
+
+        run_view("检索徽标 / rag（不可用 + 原因）", check_retrieval_rag_unavailable)
+        api("/api/v1/_fixture/config?retrieval=wiki&kg_hit=0")
+
         run_view("降级 / 对话入口禁用 + 原因", check_deg_chat)
 
         # ============ 10. 降级：知识库 TTS 禁用（各能力独立） ============
@@ -492,6 +695,224 @@ def main() -> int:
 
         run_view("降级 / 知识库（TTS 禁用，其它能力不受影响）", check_deg_wiki)
 
+        # ============ 11. 模型设置页（teacher）：热切换状态机 ============
+        settings_dom = dump_dom(driver, url(normal, "settings?selftest=1"), READY_VIEW)
+
+        def check_settings() -> None:
+            rep = report(settings_dom, "settings-report") or {}
+            ok("settings-report 存在", bool(rep))
+            eq("角色为 teacher", rep.get("role"), "teacher")
+            ok("识别为教师（可进设置页）", rep.get("is_staff") is True)
+            eq("模型数（端点实测 8 个）", rep.get("models"), 8)
+            eq("可用模型数", rep.get("available_models"), 7)
+            ok("配置来源如实标注", rep.get("settings_source") in ("file", "default"), str(rep.get("settings_source")))
+            ok("concurrency 锁为 1", rep.get("concurrency") == 1 and rep.get("concurrency_locked") is True)
+            run = rep.get("running") or {}
+            ok("显示运行中任务（不再是 0/368）", int(run.get("done") or 0) > 0 and int(run.get("total") or 0) == 368,
+               json.dumps(run, ensure_ascii=False))
+            # 进度/按钮文案在**自检 checks** 里（那是交互后的实测值；report 只是运行前快照）
+            st = report(settings_dom, "selftest-report") or {}
+            c = st.get("checks", {})
+            ok("运行中进度条百分比 > 0", int(c.get("progress_pct") or 0) > 0, str(c.get("progress_pct")))
+            ok("按钮文案为「终止并切换」", c.get("switch_button_label") == "终止并切换", str(c.get("switch_button_label")))
+            ok("模型表格每行带 available", count(settings_dom, r'data-available="1"') >= 7)
+            ok("concurrency 输入框禁用且标注固定=1",
+               has(settings_dom, r'data-testid="concurrency"[^>]*disabled') and "固定=1" in settings_dom)
+            ok("设置页自检全绿", st.get("ok") is True, f"failed={st.get('failed')}")
+            ok("切换必须二次确认", c.get("confirm_required") is True)
+            ok("运行中默认走 abort（终止并切换）", c.get("confirm_default_mode") == "abort")
+            br = c.get("busy_rejected") or {}
+            ok("运行中直接热切被拒（409 E_MODEL_BUSY）",
+               "拒绝直接热切" in str(br.get("note")) and "rollup 137/368" in str(br.get("note")), json.dumps(br, ensure_ascii=False))
+            sw = c.get("switched") or {}
+            ok("abort 切换成功且 from→to 正确", sw.get("mode") == "abort" and sw.get("from") and sw.get("to"), json.dumps(sw, ensure_ascii=False)[:200])
+            ok("切换后断点续推（从 137 继续，不重复计费）",
+               int(((sw.get("resume") or {}).get("from_checkpoint")) or 0) == 137 and (sw.get("resume") or {}).get("state") == "resuming",
+               json.dumps(sw.get("resume"), ensure_ascii=False))
+            ok("切换后 activeModel 变为目标", c.get("active_after_switch") == sw.get("to"), str(c.get("active_after_switch")))
+            ok("记录 switchedFrom / switchedAt", c.get("switched_from") == sw.get("from") and c.get("switched_at_text") not in ("", "—", None),
+               f"{c.get('switched_from')} @ {c.get('switched_at_text')}")
+            rb = c.get("rollback") or {}
+            ok("切到坏模型 → 回滚且 activeModel 不变",
+               "已回滚" in str(rb.get("note")) and rb.get("activeModel") == sw.get("to"), json.dumps(rb, ensure_ascii=False))
+            ok("表里显示不可用模型的 reason", "HTTP 503" in settings_dom and 'data-testid="model-down-note"' in settings_dom)
+
+        run_view("模型设置 / 热切换状态机（teacher）", check_settings)
+
+        # ============ 12. 模型设置页：学生角色 → 入口不给（权限在服务端） ============
+        api("/api/v1/_fixture/config?role=student")
+        settings_student = dump_dom(driver, url(normal, "settings?selftest=1"), "!!document.getElementById('settings-report')")
+        api("/api/v1/_fixture/config?role=teacher")
+
+        def check_settings_student() -> None:
+            rep = report(settings_student, "settings-report") or {}
+            eq("角色为 student", rep.get("role"), "student")
+            ok("不识别为教师", rep.get("is_staff") is False)
+            ok("显示角色门控说明（不是空白页）",
+               'data-testid="role-gate"' in settings_student and "需要教师或管理员角色" in settings_student)
+            ok("导航里的设置入口标记不可用",
+               'data-nav="/settings"' in settings_student and ("不可用" in settings_student or "需要教师" in settings_student))
+            ok("模型表格不渲染（无权限）", 'data-testid="model-table"' not in settings_student)
+
+        run_view("模型设置 / 学生角色门控", check_settings_student)
+
+        # ============ 13. SQL 练习台：引擎门控 + 完整 CRUD + 答疑引用 ============
+        lab_dom = dump_dom(driver, url(normal, "lab?selftest=1"), READY_VIEW)
+
+        def check_lab() -> None:
+            rep = report(lab_dom, "lab-report") or {}
+            ok("lab-report 存在", bool(rep))
+            eq("选中引擎", rep.get("engine"), "sqlite")
+            ok("引擎可用", rep.get("engine_available") is True)
+            engines = rep.get("engines") or []
+            ok("引擎列表来自 /capabilities.sandbox.engines（含不可用项及原因）",
+               len(engines) >= 2 and any(not e.get("available") and e.get("reason") for e in engines),
+               json.dumps(engines, ensure_ascii=False)[:200])
+            eq("数据集数量（真后端默认 sc + 我保留的 3 套）", len(rep.get("datasets") or []), 4)
+            ok("方言显著标注", "SQLite" in str(rep.get("dialect")))
+            ok("maxRows 声明在页面上", has(lab_dom, r'data-testid="limits"') and "maxRows=" in lab_dom)
+            ok("方言差异表（诚实标注 SQLite ≠ MySQL）",
+               'data-testid="dialect-note"' in lab_dom and "AUTO_INCREMENT" in lab_dom and "存储过程" in lab_dom)
+            st = report(lab_dom, "selftest-report") or {}
+            ok("练习台自检全绿", st.get("ok") is True, f"failed={st.get('failed')}")
+            c = st.get("checks", {})
+            ok("引擎下拉项数 = 上报数", c.get("engines_rendered") == len(engines), str(c.get("engines_rendered")))
+            ok("不可用引擎带原因（指向 Docker 部署文档）",
+               any("未安装 Docker" in str(x) for x in (c.get("engines_disabled") or [])), json.dumps(c.get("engines_disabled"), ensure_ascii=False))
+            # ★ 完整 CRUD（真点击「运行」按钮）
+            ok("① 建表 CREATE TABLE", (c.get("crud_ddl") or {}).get("error") is None, json.dumps(c.get("crud_ddl"), ensure_ascii=False))
+            ok("② 插数 → ③ 查询读到 1 行", (c.get("crud_select") or {}).get("rows") == [[1, "我的笔记"]],
+               json.dumps(c.get("crud_select"), ensure_ascii=False))
+            ok("④ 更新后查询可见新值", c.get("crud_update_visible") is True)
+            ok("⑤ 删除后查询为 0 行", c.get("crud_delete_visible") is True)
+            ok("⑦ 事务 BEGIN 可执行", c.get("tx_begin") is not False)
+            j = c.get("join") or {}
+            ok("三表 JOIN（真实教学 schema）", len(j.get("rows") or []) == 3 and j.get("cols") == ["sname", "cname", "grade"],
+               json.dumps(j, ensure_ascii=False))
+            a = c.get("agg") or {}
+            ok("GROUP BY 聚合", len(a.get("rows") or []) == 3, json.dumps(a, ensure_ascii=False))
+            ok("reset 回到初始 schema（默认数据集 sc：students/courses/enrollments 行数 >0）",
+               sum(1 for t in (c.get("reset_tables") or []) if "(" in str(t) and str(t).split("(")[1].rstrip(")").isdigit()
+                   and int(str(t).split("(")[1].rstrip(")")) > 0) >= 2,
+               json.dumps(c.get("reset_tables"), ensure_ascii=False))
+            # 安全红线
+            ok("ATTACH 被拒（E_SQL_FORBIDDEN）", (c.get("attach_blocked") or {}).get("code") == "E_SQL_FORBIDDEN")
+            ok("多语句拼接被拒（E_SQL_MULTI）", (c.get("multi_blocked") or {}).get("code") == "E_SQL_MULTI")
+            ok("报错文本是 SQL 原生错误（no such table + E_SQL_NO_OBJECT）",
+               "no such table" in str((c.get("bad_table_error") or {}).get("msg"))
+               and (c.get("bad_table_error") or {}).get("code") == "E_SQL_NO_OBJECT",
+               json.dumps(c.get("bad_table_error"), ensure_ascii=False)[:160])
+            # ★ 答疑
+            ask = c.get("ask") or {}
+            ok("答疑流式返回（>40 字）", int(ask.get("len") or 0) > 40, json.dumps(ask, ensure_ascii=False)[:160])
+            # 真后端没有 progress 帧 → 上下文在"回显的用户消息"里（ask_user_echo）；两条路都算证据
+            seen = str((ask.get("context") or {}).get("error") or "") + " " + str(c.get("ask_user_echo") or "")
+            ok("答疑看到学生的真实报错（SQL/报错进了提示词）", "no such table" in seen, seen[:160])
+            ok("答疑是「先问后引」而不是直接给答案", "先别急着" in str(ask.get("head")))
+            ok("答疑引用知识库卡片（≥1）", int(ask.get("citations") or 0) > 0)
+            # ★ 错误归因三档（Lead 硬要求：三种不能长得一样）
+            w1, w2, w3 = c.get("who_student") or {}, c.get("who_rules") or {}, c.get("who_system") or {}
+            ok("学生的错：who=student + E_SQL_SYNTAX", w1.get("kind") == "student" and w1.get("code") == "E_SQL_SYNTAX",
+               json.dumps(w1, ensure_ascii=False)[:180])
+            ok("规则限制：who=rules + E_SQL_FORBIDDEN", w2.get("kind") == "rules" and w2.get("code") == "E_SQL_FORBIDDEN",
+               json.dumps(w2, ensure_ascii=False)[:180])
+            ok("系统/超时：E_SQL_TIMEOUT + killedBy 归因", w3.get("kind") == "system" and w3.get("code") == "E_SQL_TIMEOUT",
+               json.dumps(w3, ensure_ascii=False)[:180])
+            ok("三档视觉色调互不相同", len({w1.get("tone"), w2.get("tone"), w3.get("tone")}) == 3,
+               f"{w1.get('tone')}/{w2.get('tone')}/{w3.get('tone')}")
+            ok("三档文案互不相同（规则/系统话术各就其位）",
+               len({w1.get("text"), w2.get("text"), w3.get("text")}) == 3
+               and "规则限制" in str(w2.get("text")) and ("系统" in str(w3.get("text")) or "中断" in str(w3.get("text"))),
+               json.dumps([w1.get("text"), w2.get("text"), w3.get("text")], ensure_ascii=False)[:300])
+            ok("超时显示 killedBy/hardKilled 归因", "killedBy=" in str(c.get("kill_attribution")), str(c.get("kill_attribution"))[:120])
+            ok("引用链接可跳原文（#/wiki?...&card=）",
+               str(c.get("citation_anchor", "")).startswith("#/wiki?") and "card=" in str(c.get("citation_anchor")),
+               str(c.get("citation_anchor")))
+
+        run_view("SQL 练习台 / CRUD + 安全红线 + 答疑", check_lab)
+
+        # ============ 14. 练习台：maxRows 截断必须明示 ============
+        api("/api/v1/_fixture/config?maxrows=2")
+        dump_dom(driver, url(normal, "lab?selftest=0&load=1"), "!!document.getElementById('lab-report')")
+
+        def check_truncate() -> None:
+            # 走页面里的真实执行链路：填 SQL → 点「运行」→ 断言"仅显示前 N 行"提示
+            driver.ch.evaluate(
+                "(() => { const t=document.querySelector('[data-testid=\"sql-input\"]');"
+                " t.value='SELECT * FROM enrollments'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                " setTimeout(() => document.querySelector('[data-testid=\"btn-run\"]').click(), 80); return 1 })()"
+            )
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"truncate-note\"]')", timeout=60, interval=0.2)
+            dom = driver.ch.outer_html()
+            ok("超过 maxRows 时给出截断提示", 'data-testid="truncate-note"' in dom, "无提示即视为骗人")
+            ok("提示写明「仅显示前 N 行」", "仅显示前" in dom and "共" in dom)
+            ok("结果表仍渲染（不是空）", 'data-testid="result-table"' in dom and count(dom, r"<tr") > 2,
+               f"rows={count(dom, r'<tr')}")
+
+        run_view("SQL 练习台 / maxRows 截断明示", check_truncate)
+        api("/api/v1/_fixture/config?maxrows=200")
+
+        # ============ 15. 降级：沙箱引擎不可用（禁用 + 原因 + 文档指向） ============
+        deg_lab = dump_dom(driver, url(degraded, "lab?selftest=1"), "!!document.getElementById('lab-report')")
+
+        def check_deg_lab() -> None:
+            rep = report(deg_lab, "lab-report") or {}
+            ok("降级下引擎不可用", rep.get("engine_available") is False)
+            ok("显示禁用说明（不是空白）", 'data-testid="engine-gate"' in deg_lab and "不可用" in deg_lab)
+            ok("原因指向部署文档章节", "LAB_DB_DEPLOY" in deg_lab, "只说「不可用」不合格")
+            ok("运行按钮禁用", has(deg_lab, r'data-testid="btn-run"[^>]*disabled'))
+            ok("重置按钮禁用", has(deg_lab, r'data-testid="btn-reset"[^>]*disabled'))
+            ok("练习题不假装能执行：没有结果表", 'data-testid="result"' not in deg_lab)
+
+        run_view("降级 / SQL 练习台（引擎不可用）", check_deg_lab)
+
+        # ============ 16. 文档页：真 multipart 上传（CDP 选文件） ============
+        upload_probe = WEB / "test" / "_upload_probe.txt"
+
+        def check_upload() -> None:
+            upload_probe.write_text("课程知识平台上传测试：这是一个纯文本资料。" * 40, encoding="utf-8")
+            try:
+                driver.ch.navigate("about:blank", timeout=30)
+                driver.ch.navigate(url(normal, "docs"), timeout=60)
+                driver.ch.wait_for("!!document.getElementById('docs-report')", timeout=60, interval=0.2)
+                before = len(api("/api/v1/_fixture/meta")["config"]["uploads"])
+                # 真选文件（`input.value = path` 在浏览器里是只读的，必须走 DOM.setFileInputFiles）
+                driver.ch.call("DOM.enable")
+                doc_node = driver.ch.call("DOM.getDocument", {"depth": -1})
+                node = driver.ch.call("DOM.querySelector", {"nodeId": doc_node["root"]["nodeId"], "selector": 'input[type="file"]'})
+                ok("页面上有 file input", bool(node.get("nodeId")))
+                driver.ch.call("DOM.setFileInputFiles", {"files": [str(upload_probe)], "nodeId": node["nodeId"]})
+                # 等**上传真正结束**：note 一出现是"正在上传…"，那不是结果
+                driver.ch.wait_for(
+                    "(() => { const n=document.querySelector('[data-testid=\"upload-note\"]');"
+                    " return !!n && /已上传|失败/.test(n.textContent) })()",
+                    timeout=90, interval=0.2)
+                note = str(driver.ch.evaluate("document.querySelector('[data-testid=\"upload-note\"]').textContent") or "")
+                meta = api("/api/v1/_fixture/meta")["config"]
+                after = len(meta["uploads"])
+                ok("上传真的发出去了（mock 收到 multipart）", after == before + 1, f"{before} → {after}")
+                ok("界面显示上传结果（含 document_id）", "document_id=" in note, note[:100])
+                ok("上传后触发解析任务（task_id）", "task_id=" in note or "tsk_" in note, note[:120])
+                # 任务进度（SSE 主 + 轮询兜底都在 TaskStream 里）——必须等**真帧到达**再断言
+                driver.ch.wait_for(
+                    "(() => { const e=document.querySelector('[data-testid=\"task-info\"]');"
+                    " return !!e && e.dataset.progress !== '' && e.dataset.done === 'true' })()",
+                    timeout=60, interval=0.2)
+                task_attrs = driver.ch.evaluate(
+                    "(() => { const e=document.querySelector('[data-testid=\"task-info\"]');"
+                    " return JSON.stringify({ id:e.dataset.taskId, done:e.dataset.done, progress:e.dataset.progress }) })()"
+                )
+                t = json.loads(task_attrs)
+                ok("任务进度可见（id + done 帧）", bool(t.get("id")) and t.get("done") == "true", task_attrs)
+                ok("进度百分比来自 SSE progress 帧（42%）", str(t.get("progress")) == "42", task_attrs)
+            finally:
+                try:
+                    upload_probe.unlink()
+                except OSError:
+                    pass
+
+        run_view("文档页 / 真 multipart 上传 + 任务进度", check_upload)
+
     finally:
         mock.terminate()
         try:
@@ -507,6 +928,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 
 

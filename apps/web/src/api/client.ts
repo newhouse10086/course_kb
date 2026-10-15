@@ -8,7 +8,9 @@
  * · 错误统一成 ApiError（携带契约 §8 的 code/hint），UI 直接渲染而不是抛 "Failed to fetch"。
  */
 import type {
-  Card, CardDetail, DocumentInfo, GraphData, Outline, Paged, SearchResult, Span,
+  BusyInfo, Card, CardDetail, DocumentInfo, GraphData, LoginResponse, MeResponse, ModelsResponse, Outline, Paged, SandboxDataset,
+  SandboxEngine, SandboxHistoryEntry, SandboxResult, SandboxSchema, SandboxSession, SandboxTable, SearchResult,
+  SettingsPayload, Span, SwitchResult,
   TaskInfo, Unit, UploadAccepted, VideoArtifact, VideoSlide, TranscriptChapter, Xref,
 } from './types'
 
@@ -23,18 +25,25 @@ export const API_BASE: string = (() => {
   return (q || '/api/v1').replace(/\/$/, '')
 })()
 
+/** 未认证回调：由 App 注入（把 401 变成"跳登录页"，而不是把错误糊在页面上） */
+let onUnauthenticated: ((detail: string) => void) | null = null
+export function setUnauthenticatedHandler(fn: ((detail: string) => void) | null) { onUnauthenticated = fn }
+
 export class ApiError extends Error {
   code: string
   status: number
   detail: string
   hint: string
-  constructor(code: string, msg: string, status = 0, detail = '', hint = '') {
+  /** 机器可读的附加信息（如 409 里的运行中任务进度、502 回滚后的 activeModel） */
+  data: any
+  constructor(code: string, msg: string, status = 0, detail = '', hint = '', data: any = null) {
     super(msg || code || '请求失败')
     this.name = 'ApiError'
     this.code = code || 'E_UNKNOWN'
     this.status = status
     this.detail = detail
     this.hint = hint
+    this.data = data
   }
 }
 
@@ -68,8 +77,13 @@ export async function req<T>(path: string, params?: Params, init?: RequestInit):
   }
   if (!res.ok) {
     const err = body?.error || {}
+    // 401/未认证：交给上层跳登录（真后端 auth.required=true，实测未登录返回 E_UNAUTHENTICATED）
+    if (res.status === 401 || err.code === 'E_UNAUTHENTICATED') {
+      onUnauthenticated?.(String(err.hint || err.msg || ''))
+    }
     throw new ApiError(err.code || `E_HTTP${res.status}`, err.msg || `HTTP ${res.status}`,
-      res.status, err.detail || '', err.hint || '')
+      res.status, typeof err.detail === 'string' ? err.detail : '', typeof err.hint === 'string' ? err.hint : '',
+      err.data ?? null)
   }
   return body as T
 }
@@ -90,7 +104,9 @@ export const api = {
   health: () => req<{ ok: boolean; version?: string }>('/health'),
 
   /** §5.1 能力接口（诚实接口）：UI 必须按 available 渲染 */
-  capabilities: () => req<Record<string, unknown>>('/capabilities'),
+  /** §5.1 能力接口（诚实接口）：UI 必须按 available 渲染。
+   *  `refresh=true` → 加 `?refresh=1` 强制重探（真后端默认 15s TTL 缓存，实测 17s → 7ms） */
+  capabilities: (refresh = false) => req<Record<string, unknown>>(`/capabilities${refresh ? '?refresh=1' : ''}`),
 
   // ---- §5.2 文档 ----
   documents: (p?: Params) => req<Paged<DocumentInfo>>('/documents', p),
@@ -154,24 +170,103 @@ export const api = {
   cancelTask: (id: string) =>
     req<{ ok?: boolean }>(`/tasks/${encodeURIComponent(id)}/cancel`, undefined, { method: 'POST' }),
 
+  // ---- 身份（RBAC §3：前端只用来决定入口可见性，权限判定永远在服务端） ----
+  /**
+   * 真实响应（实测）：
+   *   POST /auth/login {username,password} → {user:{id,username,display_name,roles,status}, courses:{teacher,student}, expires_in_s}
+   *                                         + **httpOnly cookie `ckb_session`**（浏览器自动带）
+   *   GET  /auth/me  → {user:{...}, courses, can:"admin：可见全部"}
+   * ⚠️ 注意：**roles 在 user 里**（不是顶层），也没有 permissions[] —— 只有一句 `can` 文案。
+   *    我第一版按 `{roles, permissions}` 读 → 对着真后端设置入口永远不显示（实测差异）。
+   */
+  me: () => req<MeResponse>('/auth/me'),
+  login: (username: string, password: string) =>
+    req<LoginResponse>('/auth/login', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => req<{ ok?: boolean }>('/auth/logout', undefined, { method: 'POST' }),
+
+  // ---- 任务列表（真后端有；设置页用它判断"有没有在跑的 LLM 任务"） ----
+  tasks: () => req<{ tasks?: TaskInfo[]; items?: TaskInfo[] }>('/tasks'),
+
+  // ---- 模型列表与设置（docs/SETTINGS_AND_SANDBOX.md §1/§2） ----
+  /** `GET /models?deep=1`：真探测（**不加 deep 时真后端也可能带 latencyMs**，见 README §3A） */
+  models: (deep = false) => req<ModelsResponse>(`/models${deep ? '?deep=1' : ''}`),
+  /**
+   * `GET /settings` 真响应是 `{settings:{...}, meta:{source,path,revision,mtimeMs}}`；
+   * 我 mock 用的是**扁平** `{source, llm:{...}}`。这里统一成"扁平 + meta 保留"，
+   * 让页面只写一种读法（并在 README §3A 记下差异）。
+   */
+  settings: async () => {
+    const r = await req<{ settings?: SettingsPayload; meta?: { source?: string; path?: string; revision?: number; mtimeMs?: number } } & SettingsPayload>('/settings')
+    const flat: SettingsPayload = { ...(r.settings || r) }
+    if (r.meta?.source) flat.source = r.meta.source
+    ;(flat as any).meta = r.meta ?? null
+    return flat
+  },
+  putSettings: (body: unknown) =>
+    req<{ ok?: boolean; settings?: SettingsPayload; ignored?: Array<{ field: string; requested: unknown; applied: unknown; reason: string }> }>(
+      '/settings', undefined, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  /** 切换相关的只读视图（真后端有 `switchedFrom/switchedAt/busy`；`/models` 里没有） */
+  settingsLlm: () => req<{ activeModel: string; fallbacks?: string[]; concurrency?: number; switchedFrom?: string | null; switchedAt?: number | null; busy?: BusyInfo }>('/settings/llm'),
+  /** 模型热切换：mode=now 仅空闲可用；drain 等当前单元；abort 存断点后终止并续推 */
+  switchModel: (model: string, mode: 'now' | 'drain' | 'abort') =>
+    req<SwitchResult>('/settings/llm/switch', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, mode }),
+    }),
+
+  // ---- 学生虚拟数据库沙箱（SETTINGS §3） ----
+  /** 真响应：`{default:'sc', datasets:[{id,label,description,tables,teachingPoints,dialectNotes}]}` */
+  sandboxDatasets: () => req<{ default?: string; datasets: SandboxDataset[] }>('/sandbox/datasets'),
+  sandboxSession: (dataset: string, sessionId?: string) =>
+    req<SandboxSession>('/sandbox/session', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sessionId ? { dataset, sessionId } : { dataset }),
+    }),
+  /** 执行 SQL：**失败也返回 200 + ok:false + error**（SQL 报错要显示给学生看，不是网络错误） */
+  sandboxExecute: (sessionId: string, sql: string, opts?: { maxRows?: number; timeoutMs?: number; multi?: boolean }) =>
+    req<SandboxResult>('/sandbox/execute', undefined, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, sql, ...(opts || {}) }),
+    }),
+  /** 真响应：`{sessionId, reset:true, engine, schema}`（**没有 tables 顶层字段**） */
+  sandboxReset: (dataset: string, sessionId?: string) =>
+    req<{ sessionId?: string; reset?: boolean; engine?: string; schema?: SandboxSchema; ok?: boolean; dataset?: string }>(
+      '/sandbox/reset', undefined, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sessionId ? { dataset, sessionId } : { dataset }),
+      }),
+  sandboxSchema: (sessionId: string) => req<SandboxSchema & { sessionId?: string }>(`/sandbox/schema${qs({ sessionId })}`),
+  sandboxHistory: (sessionId: string) => req<{ sessionId?: string; entries: SandboxHistoryEntry[] }>(`/sandbox/history${qs({ sessionId })}`),
+  sandboxEngines: () => req<{ engines?: SandboxEngine[]; defaultEngine?: string }>('/sandbox/engines'),
+
   // ---- URL 构造（§5.7 / §5.5） ----
   fileUrl: (docId: string, page?: number) =>
     `${API_BASE}/documents/${encodeURIComponent(docId)}/file${page ? `#page=${page}` : ''}`,
   streamUrl: (docId: string) => `${API_BASE}/documents/${encodeURIComponent(docId)}/stream`,
   subtitleUrl: (docId: string, fmt: 'srt' | 'vtt' = 'vtt') =>
     `${API_BASE}/documents/${encodeURIComponent(docId)}/video/subtitle?fmt=${fmt}`,
+  /** §3 沙箱答疑（POST + SSE：先问后引 + 引用知识库卡片） */
+  sandboxAskUrl: () => `${API_BASE}/sandbox/ask`,
   /** §6 SSE 进度流地址 */
   taskEventsUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/events`,
   /** §7.2 对话 WebSocket（同源派生，测试可用 ?ws= 覆盖；参数在 hash query 里也能读到） */
-  chatWsUrl: (sessionId: string) => {
-    if (typeof location === 'undefined') return `ws://127.0.0.1:8787/api/v1/chat/${sessionId}`
+    /**
+   * §7.2 对话 WS。★ **模式是连接级参数**（backend-api 实测）：
+   * `?mode=chat|agent` —— pi 把 mode 编进会话 key，**工具集在建会话时确定**；
+   * 帧里带 `mode` 只做一致性校验。所以**切模式必须重连**（会丢上下文，这是有意取舍）。
+   */
+  chatWsUrl: (sessionId: string, mode?: 'chat' | 'agent') => {
+    const q = mode ? `?mode=${mode}` : ''
+    if (typeof location === 'undefined') return `ws://127.0.0.1:8787/api/v1/chat/${sessionId}${q}`
     const h = location.hash || ''
     const i = h.indexOf('?')
     const hashParams = i >= 0 ? new URLSearchParams(h.slice(i + 1)) : null
     const override = new URLSearchParams(location.search).get('ws') || hashParams?.get('ws')
-    if (override) return `${override.replace(/\/$/, '')}/${sessionId}`
+    if (override) return `${override.replace(/\/$/, '')}/${sessionId}${q}`
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    return `${proto}//${location.host}/api/v1/chat/${sessionId}`
+    return `${proto}//${location.host}/api/v1/chat/${sessionId}${q}`
   },
 }
 
@@ -210,3 +305,12 @@ export function cardSpan(c: Card | null | undefined): Span | null {
   }
   return null
 }
+
+
+
+
+
+
+
+
+

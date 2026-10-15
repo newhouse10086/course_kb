@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 #: 错误码（契约 §8）
 E_LLM = "E_LLM"
 E_LLM_SCHEMA = "E_LLM_SCHEMA"
+#: 空内容（含"推理吃光预算"）—— 契约 §0 明确要求：**不许当成功**
+#: （推理模型的 reasoning token 计入输出预算：实测 8 字回复用掉 54 推理 token）
+E_LLM_EMPTY_CONTENT = "E_LLM_EMPTY_CONTENT"
+#: 内容不是 JSON（可能被截断）—— 与"JSON 但字段不合规"分开，处置不同
+E_LLM_BAD_JSON = "E_LLM_BAD_JSON"
+#: 上游 5xx / 网络故障（**可重试**）—— 与"输出不合规"分开
+E_LLM_UPSTREAM = "E_LLM_UPSTREAM"
 
 
 class LLMError(Exception):
@@ -187,6 +194,10 @@ class LLMConfig:
     temperature: float = 0.0
     max_retries: int = 2
     timeout_s: float = 120.0
+    #: ★ 输出预算。**推理模型的 reasoning token 计入 `max_tokens`**（实测：8 个 token 会被
+    #: 推理全部吃掉 → `content` 为空、`finish_reason=length`）。不显式给预算 = 把"能不能
+    #: 出内容"交给 provider 默认值（可能很小）→ 结构化抽取默认 8192（够推理 + JSON）。
+    max_tokens: int = 8192
     #: ★ 用户硬要求：并发 = 1（不是"可调参数"）
     concurrency: int = 1
     #: 额外透传（如 provider id / 组织 id），worker 不解释
@@ -224,7 +235,7 @@ class LLMConfig:
     def from_dict(cls, d: dict[str, Any] | None, *, default_model: str = DEFAULT_MODEL) -> "LLMConfig":
         d = dict(d or {})
         known = {"base_url", "api_key", "model", "temperature", "max_retries",
-                 "timeout_s", "concurrency", "extra"}
+                 "timeout_s", "concurrency", "extra", "max_tokens", "maxTokens"}
         extra = dict(d.get("extra") or {})
         extra.update({k: v for k, v in d.items() if k not in known})
         return cls(
@@ -234,6 +245,9 @@ class LLMConfig:
             temperature=float(d.get("temperature") or 0.0),
             max_retries=int(d.get("max_retries") or 2),
             timeout_s=float(d.get("timeout_s") or 120.0),
+            # 输出预算：Node 传 maxTokens/max_tokens 就用它（settings.json 里是 16384），
+            # 没传则用默认 8192 —— **绝不省略**，因为推理 token 计入预算
+            max_tokens=int(d.get("max_tokens") or d.get("maxTokens") or 8192),
             # 并发固定 1：即便调用方传了别的值也不采纳（用户硬要求）
             concurrency=1,
             extra=extra,
@@ -302,6 +316,9 @@ class LLMClient:
         #: None=还没调过；True=成功过；False=上次失败（402/401/…）
         self._chat_ok: bool | None = None
         self._chat_error: str = ""
+        #: 最近一次响应的诊断元信息（finish_reason / tokens / reasoning 长度）——
+        #: 用来区分"推理吃光预算 / 上游过载 / 输出不合规"（三者处置不同）
+        self._last_meta: dict[str, Any] = {}
         self.status_ = LLMStatus(
             configured=self.cfg.configured,
             model=self.cfg.model,
@@ -484,6 +501,21 @@ class LLMClient:
             )
             if attempt < attempts:
                 self._sleep(0.5 * attempt)
+        # ★ 末次输出**根本不是 JSON** → 独立错误码 + 响应诊断：
+        #   "被截断 / 空内容" 与 "JSON 但不合 schema" 的处置完全不同
+        #   （polysemy-prober 实测：上游 503 与"返回非 JSON"被表达成同一个 E_LLM，运维无法分辨）
+        if isinstance(last_err, LLMSchemaError) and "无法解析出 JSON" in (last_err.detail or ""):
+            meta = self._last_meta or {}
+            raise LLMError(
+                E_LLM_BAD_JSON,
+                "模型输出不是合法 JSON（可能被截断）",
+                detail=(f"finish_reason={meta.get('finish_reason')} "
+                        f"content_chars={meta.get('content_chars')} "
+                        f"completion_tokens={meta.get('completion_tokens')} "
+                        f"reasoning_chars={meta.get('reasoning_chars')}；尝试 {attempts} 次"),
+                hint="若 finish_reason=length 说明输出被截断 → 提高 max_tokens；"
+                     "否则检查提示词是否明确要求纯 JSON 输出",
+            )
         raise last_err or LLMSchemaError("结构化输出失败")
 
     def complete_text(
@@ -524,8 +556,10 @@ class LLMClient:
             "temperature": self.cfg.temperature if temperature is None else temperature,
             "stream": False,
         }
-        if max_tokens:
-            payload["max_tokens"] = int(max_tokens)
+        # ★ 永远显式给预算：调用方 > 配置默认（推理 token 计入预算，不能靠 provider 默认值）
+        budget = int(max_tokens or self.cfg.max_tokens or 0)
+        if budget > 0:
+            payload["max_tokens"] = budget
         if schema is not None:
             # ★ 唯一可靠的结构化输出方式（契约 C2）
             payload["response_format"] = {
@@ -535,7 +569,7 @@ class LLMClient:
         return payload
 
     def _call(self, payload: dict[str, Any]) -> str:
-        """真正发请求（**持锁串行**）。"""
+        """真正发请求（**持锁串行** = 并发 1），并统一做"空内容不算成功"检查。"""
         if not self.configured:
             raise LLMError(
                 E_LLM,
@@ -548,11 +582,42 @@ class LLMClient:
             self._max_inflight = max(self._max_inflight, self._inflight)
             try:
                 self.calls += 1
-                if self._transport is not None:
-                    return self._transport(payload)
-                return self._http_call(payload)
+                raw = (self._transport(payload) if self._transport is not None
+                       else self._http_call(payload))
+                return self._ensure_content(raw, payload)
             finally:
                 self._inflight -= 1
+
+    def _ensure_content(self, raw: Any, payload: dict[str, Any]) -> str:
+        """★ 空内容**不算成功**（契约 §0：content 空而 reasoning 非空必须显式报错）。
+
+        两个关键点：
+        1. 检查放在 :meth:`_call` 里 → **HTTP 与注入 transport 两条路径都覆盖**。
+           第一版只在 ``_http_call`` 里查 → 注入替身的调用会绕过（我自己的测试抓到的隐患）。
+        2. 报错要能区分"预算被推理吃光"与"模型就是返回了空"——
+           推理模型（如 deepseek-v4.1-flash）的 reasoning token **计入输出预算**，
+           实测 8 个 token 会被推理全部吃掉、``finish_reason=length``、``content`` 为空。
+           （polysemy-prober 在 Node 侧实测到同一现象；只判 HTTP 200 会**假绿**。）
+        """
+        text = str(raw or "")
+        if text.strip():
+            return text
+        meta = self._last_meta or {}
+        # ⚠️ 措辞用"很可能"：`finish_reason=length` 与 reasoning 长度只是**线索**，
+        #    不保证总出现（Lead 实测：8 token 时出现了 length，但不能依赖它）
+        #    → **判据只看 content 是否为空**，原因描述保持概率化，别断言因果。
+        why = ("很可能推理 token 吃光了输出预算" if meta.get("reasoning_chars")
+               else "模型返回了空内容")
+        raise LLMError(
+            E_LLM_EMPTY_CONTENT,
+            f"模型没有输出内容（{why}）",
+            detail=(f"finish_reason={meta.get('finish_reason')} "
+                    f"completion_tokens={meta.get('completion_tokens')} "
+                    f"reasoning_chars={meta.get('reasoning_chars')} "
+                    f"max_tokens={payload.get('max_tokens')}"),
+            hint=("提高 max_tokens（推理 token 计入输出预算：实测 8 会被推理全部吃掉；"
+                  "结构化抽取建议 ≥2000，探测至少 ≥500）"),
+        )
 
     def _http_call(self, payload: dict[str, Any]) -> str:
         url = self.cfg.base_url.rstrip("/") + "/chat/completions"
@@ -564,11 +629,16 @@ class LLMClient:
                 if resp.status_code == 200:
                     body = resp.json()
                     try:
-                        content = body["choices"][0]["message"]["content"] or ""
+                        message = body["choices"][0]["message"]
+                        choice = body["choices"][0]
+                        content = message.get("content") or ""
                     except (KeyError, IndexError, TypeError) as exc:
                         raise LLMError(
                             E_LLM, "响应结构异常", detail=json.dumps(body)[:400]
                         ) from exc
+                    # ★ 记录本次响应的诊断信息：S4/运维要靠它区分
+                    #   "推理吃光预算" vs "上游过载" vs "输出不合规"（三者的处置完全不同）
+                    self._last_meta = self._response_meta(choice, message, body)
                     self._chat_ok = True
                     self._chat_error = ""
                     self.status_.available = True
@@ -590,12 +660,38 @@ class LLMClient:
                         detail=reason,
                         hint="402/额度不足需等额度重置；401 检查 key；404 检查 base_url 是否带 /v1",
                     )
-                last_exc = LLMError(E_LLM, f"LLM 返回 HTTP {resp.status_code}", detail=reason)
+                # ★ 5xx：**上游故障**（如 503 Service Overload）—— 与"输出不合规"是两回事，
+                #   用独立错误码 + retryable，运维一眼能分辨（polysemy-prober 实测踩到）
+                last_exc = LLMError(
+                    E_LLM_UPSTREAM,
+                    f"上游返回 HTTP {resp.status_code}",
+                    detail=reason,
+                    hint="上游瞬时故障，重试即可；持续失败请查 provider 状态页",
+                )
+                setattr(last_exc, "retryable", True)
             except httpx.HTTPError as exc:
-                last_exc = LLMError(E_LLM, f"网络错误：{exc}", detail=type(exc).__name__)
+                last_exc = LLMError(E_LLM_UPSTREAM, f"网络错误：{exc}",
+                                    detail=type(exc).__name__)
+                setattr(last_exc, "retryable", True)
             if attempt < 2:
                 self._sleep(1.0 * attempt)
         raise last_exc or LLMError(E_LLM, "LLM 调用失败")
+
+    @staticmethod
+    def _response_meta(choice: dict[str, Any], message: dict[str, Any],
+                       body: dict[str, Any]) -> dict[str, Any]:
+        """把响应里**对诊断有用**的字段摘出来（不含正文，避免把模型输出写进日志）。"""
+        usage = body.get("usage") or {}
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+        return {
+            "finish_reason": choice.get("finish_reason"),
+            "content_chars": len(message.get("content") or ""),
+            "reasoning_chars": len(reasoning) if isinstance(reasoning, str) else 0,
+            "completion_tokens": usage.get("completion_tokens"),
+            "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get(
+                "reasoning_tokens"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+        }
 
     # ── 指标 ────────────────────────────────────────────────────────
     def metrics(self) -> dict[str, Any]:

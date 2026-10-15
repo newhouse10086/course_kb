@@ -447,6 +447,78 @@ def test_print_payload_schema_has_all_jobs() -> None:
     assert "llm" in example, "LLM 配置由 Node 下发，示例里必须体现"
 
 
+# ── ★ 回归：`*_ready` 必须只用"可调用协议"（生产用的是 cli.py 的 Emitter）──────
+#
+# 实测事故（本轮真机端到端抓到的）：
+#   `_emit_ready` 写的是 `emit.ready(...)`，而**生产路径** `worker/cli.py::Emitter`
+#   **没有 `ready` 方法**（只有 `__call__/progress/info/warn/unit/result/error`）。
+#   后果很坑：**整条管线跑完、产物全部落盘**（音频 / 5 段 ASR / 字幕 / 文稿 / 思维导图 / 帧），
+#   却在最后"上报"这一步抛 `AttributeError` → 退出码 1 + `E_INTERNAL` + **没有**
+#   `result`/`*_ready` 帧 ⟹ 对外表现是"失败"，而实际活儿已经干完了。
+#
+# 为什么既有测试没抓到：下面那条真机 E2E（`test_real_chain_end_to_end_through_job`）
+# 名义上走"和 Node 完全一样的 job 入口"，但它用的是**本模块自己的 `Emitter`**（恰好有 `.ready()`）
+#   ⟹ **测试与生产用的不是同一个发射器**；而且它默认被 `COURSE_KB_ASR_E2E=1` 跳过。
+# 本测试因此用两种"生产形态"的发射器各跑一遍，且**不需要真 ASR**（注入 FakeAsr）→ 默认可跑。
+
+
+class _CallableOnlyEmitter:
+    """**只有 `__call__`** 的发射器 —— 比 `cli.py::Emitter` 还严格。"""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def __call__(self, event: dict) -> None:
+        self.events.append(event)
+
+
+@pytest.mark.parametrize("shape", ["callable-only", "cli.Emitter"])
+def test_ready_frames_do_not_require_emitter_helpers(video: str, tmp_path, shape: str) -> None:
+    """★ 回归：4 类 ``*_ready`` + ``result`` 必须能在**生产发射器**上发出。
+
+    * ``callable-only``：只有 ``__call__`` 的对象（最严格的可调用协议）
+    * ``cli.Emitter``：**真生产用的那个**（``python -m worker.cli`` 走它）
+    """
+    payload = {
+        "job": "video.parse",
+        "docId": "doc_ready_protocol",
+        "videoPath": video,
+        "title": "就绪帧协议",
+        "workDir": str(tmp_path / f"w_{shape.replace('.', '_')}"),
+        "options": {
+            "enableAsr": True,
+            "enableSlides": True,
+            "enableOcr": False,   # 本测试只验协议，不跑 OCR（省几秒）
+            "enableLlm": False,   # worker 不读 .env；无 LLM → 走降级路径
+            "chunkMs": 6_000,     # 12s 视频 → 2 段，顺带覆盖分段
+            "resume": False,
+            "maxSlides": 5,
+        },
+    }
+
+    if shape == "callable-only":
+        emit = _CallableOnlyEmitter()
+        rc = run_job(payload, emit, providers={"local-fw": FakeAsr(segments=3)})
+        events = emit.events
+    else:
+        from worker.cli import Emitter as CliEmitter
+
+        buf = io.BytesIO()
+        rc = run_job(payload, CliEmitter(buf), providers={"local-fw": FakeAsr(segments=3)})
+        events = [json.loads(line) for line in buf.getvalue().decode("utf-8").split("\n") if line.strip()]
+
+    kinds = [e.get("type") for e in events]
+    assert rc == 0, f"{shape}: rc={rc}，帧={kinds}"
+    assert "error" not in kinds, f"{shape}: 不该有 error 帧：{[e for e in events if e.get('type') == 'error']}"
+    for need in ("subtitle_ready", "transcript_ready", "mindmap_ready", "slides_ready", "result"):
+        assert need in kinds, f"{shape}: 缺 {need} 帧；实际 {kinds}"
+
+    # 顺带钉住关键字段（不是"非空"）
+    sub = _of(events, "subtitle_ready")[0]["data"]
+    assert sub["firstMs"] == 0 and sub["cues"] >= 1
+    assert _of(events, "slides_ready")[0]["data"]["count"] >= 1
+
+
 # ── 真机 E2E（默认跳过；``COURSE_KB_ASR_E2E=1`` 时跑）──────────────────
 E2E = os.environ.get("COURSE_KB_ASR_E2E") == "1"
 

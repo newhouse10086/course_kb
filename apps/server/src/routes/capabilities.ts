@@ -121,12 +121,155 @@ function llmBlock(deps: AppDeps, caps: Record<string, unknown> | undefined): Rec
   };
 }
 
+/**
+ * `/capabilities` 的**短 TTL 缓存**。
+ *
+ * 为什么需要（web-ui 实测）：该端点无缓存时 **7–14s**（`pi.loadMs≈2.9s` + 模型真探测 ≈2.5s +
+ * 4 个引擎真探测 + FTS 计数）。首屏能力横幅等 7–14s，用户会以为页面卡住了。
+ *
+ * 诚实性要求（不能因为"要快"就假装是实时值）：
+ * - 命中缓存时响应里带 `cached:true` + `cached_age_ms` + `cache_ttl_ms`，UI/脚本能看出来
+ * - `?refresh=1`（或 `?deep=1`）**强制绕过缓存**重新探测
+ * - 只缓存**成功**的响应；出错不缓存（避免把一次故障钉在 TTL 里）
+ */
+const CAPS_TTL_MS = 15_000;
+
+/**
+ * ★★ **只有这些字段允许"陈旧"**（走缓存）；**其余一律实时重算** —— fail-safe 方向。
+ *
+ * ## 为什么是"可缓存白名单"而不是"实时白名单"（Lead 裁定的方向反转）
+ * 我原先写的是 `REALTIME_ON_CACHE_HIT`（默认缓存、靠记得把新字段加进实时白名单）——
+ * 这个坑**一轮内踩了 3 次**（`auth.bootstrap` / `settings.activeModel` / `retrieval.dataReady`），
+ * 说明"靠记得加"不可靠。反转之后：
+ * - **忘了分类 → 新字段按"实时"处理**（安全，最多慢一点）
+ * - 而不是 → 新字段被悄悄缓存成**陈旧值**（不安全，且**测试不会红**）
+ *
+ * ## 判据（写在这里，防止再犯）
+ * **一个"忘了就出错"的设计不可靠；一个"忘了就退化成保守"的设计才可靠。**
+ * 与本项目其它原则一致：默认拒绝鉴权、默认不假装可用、`available` 与 `dataReady` 正交。
+ *
+ * ## 漏分类的兜底（靠机制，不靠记得）
+ * 缓存命中前先检查：缓存体里是否有**既不在本白名单、也不在实时集**的顶层 key（= 有人新增字段却没分类）
+ * → 那就**不冒险用缓存**，直接走完整重算，并把清单放进响应的 `unclassified_fields`；
+ * 测试断言它为空 ⟹ **新字段忘分类时会红**。
+ *
+ * ## 历史（这些字段为什么"承诺实时"）
+ * 1. `auth.bootstrap` —— "实时反映库里有没有用户"（启动后 `create-admin` 建号要立刻变 `initialized`）
+ * 2. `settings.activeModel` —— 模型热切换后要立刻可见
+ * 3. `retrieval.*.dataReady` —— "**当前**有没有数据"（抽完资料要立刻变 `true`）
+ * 4. `search` —— FTS 行数（抽完资料要立刻可见）
+ * 共同点：**都是"当前状态"**，且都**极便宜**（一次 COUNT / 读内存 store / 0.05ms / 0.007ms），
+ * 与"昂贵探测"（pi 加载 ≈2.9s / 模型探测 ≈2.5s / 4 引擎探测）差好几个数量级。
+ */
+const CACHEABLE_FIELDS = [
+  // 昂贵**真探测**（秒级）：pi 加载 ≈2.9s / 模型探测 ≈2.5s / 4 引擎探测 / worker import
+  'pi',
+  'llm',
+  'asr',
+  'sandbox',
+  'providers',
+  'worker',
+  'ffmpeg',
+  'adapters',
+  'policy',
+  'providers_error',
+  // 启动期就定下来的**静态**值（运行期不变）
+  'version',
+  'schema',
+  'pipeline',
+  'paths',
+  // `chat_modes`：模式/工具/允许角色都是启动期静态策略（`kb.available` 也是装配期定）
+  'chat_modes',
+] as const;
+
+/** 缓存命中时**必须实时重算**的字段（都很便宜）。 */
+const LIVE_FIELDS = ['auth', 'settings', 'retrieval', 'search'] as const;
+
 export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): void {
+  let capsCache: { at: number; key: string; body: Record<string, unknown> } | null = null;
+
+  /** 构造**实时**字段（缓存命中路径与主路径共用 → 两处语义不会漂）。 */
+  async function liveFields(): Promise<Record<string, unknown>> {
+    const out: Record<string, unknown> = {
+      auth: {
+        required: deps.auth.required,
+        bootstrap: deps.repo.rbac.countUsers() > 0 ? 'initialized' : 'not_initialized',
+      },
+      // 检索/FTS 统计：抽完资料后必须立刻可见（否则 UI 会显示"知识库为空"）
+      search: { ...searchStats(deps.db), selftest: selftestBigram() },
+    };
+    if (deps.settingsCapabilities) {
+      try {
+        out.settings = await deps.settingsCapabilities();
+      } catch (err) {
+        // 如实报"探测失败"（而不是省略字段 —— 省略会让前端分不清"没接入"和"探测失败"）
+        out.settings = {
+          available: false,
+          reason: `设置层探测失败：${redact(err instanceof Error ? err.message : String(err))}`,
+        };
+      }
+    } else {
+      out.settings = {
+        available: false,
+        reason: '设置层未接入（src/settings/** 或 routes/settings.ts 不可用）→ 模型选择走 providers.yaml/.env',
+        activeModel: null,
+      };
+    }
+    if (deps.retrieval?.capabilities) {
+      try {
+        out.retrieval = await deps.retrieval.capabilities();
+      } catch (err) {
+        out.retrieval = { registered: true, error: redact(err instanceof Error ? err.message : String(err)) };
+      }
+    } else {
+      out.retrieval = {
+        registered: false,
+        reason: '检索层未接入（src/retrieval/** 动态导入失败或未交付）→ chat 按 retrieval:none 走',
+        modes: {
+          none: { available: true, reason: '不检索' },
+          wiki: { available: false, reason: '检索层未接入' },
+          kg: { available: false, reason: '检索层未接入' },
+          rag: { available: false, reason: '检索层未接入' },
+        },
+      };
+    }
+    return out;
+  }
+
   app.get('/api/v1/capabilities', async (req, reply) => {
     try {
       const q = (req.query ?? {}) as Record<string, unknown>;
       // 默认深探测（诚实值）；`?deep=0` 走缓存求快
       const deep = q.deep !== '0' && q.deep !== 'false';
+      const cacheKey = deep ? 'deep' : 'shallow';
+      const forceRefresh = q.refresh === '1' || q.force === '1';
+
+      // ★ 短 TTL 缓存：命中就**如实标注** `cached:true` + 年龄（不假装是实时值）
+      // ⚠️ 只把 `CACHEABLE_FIELDS`（昂贵探测 + 静态值）走缓存，**其余一律实时重算**；
+      //    若发现**未分类**的顶层字段 → **不冒险用缓存**（走完整重算）—— 见 `CACHEABLE_FIELDS` 注释。
+      if (!forceRefresh && capsCache && capsCache.key === cacheKey) {
+        const age = Date.now() - capsCache.at;
+        const cachedBody = capsCache.body;
+        const cacheable = new Set<string>(CACHEABLE_FIELDS);
+        const live = new Set<string>(LIVE_FIELDS);
+        // 漏分类检测：既不可缓存、也不在实时集 → 新字段默认按"实时/重算"处理（安全方向）
+        const unclassified = Object.keys(cachedBody).filter((k) => !cacheable.has(k) && !live.has(k));
+        if (age < CAPS_TTL_MS && unclassified.length === 0) {
+          const cachedPart: Record<string, unknown> = {};
+          for (const k of CACHEABLE_FIELDS) if (k in cachedBody) cachedPart[k] = cachedBody[k];
+          return reply.send({
+            ...cachedPart, // 只有**允许陈旧**的字段来自缓存
+            ...(await liveFields()), // ★ 其余实时重算：auth / settings / retrieval / search
+            cached: true,
+            cached_age_ms: age,
+            cache_ttl_ms: CAPS_TTL_MS,
+            cacheable_fields: [...CACHEABLE_FIELDS],
+            live_fields: [...LIVE_FIELDS],
+            unclassified_fields: [],
+          });
+        }
+        // age 到期 或 有未分类字段 → 落到下面**完整重算**（并在响应里如实报出未分类清单）
+      }
 
       // worker：真 import 探测（缓存 300s）。走注入的探针，保证测试可控、生产为真执行
       deps.workerCapability = await deps.workerProbe(deep && q.force === '1');
@@ -165,8 +308,60 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
 
       const schema = schemaSummary(deps.enums);
 
-      return reply.send({
-        version: SERVER_VERSION,
+      // ④ 检索能力 / ⑤ 系统设置段：**由 `liveFields()` 统一构造**（见 `CACHEABLE_FIELDS`）——
+      //    这里不再各自算一遍，否则缓存命中路径与主路径就有**两处真相**，迟早漂。
+
+      // ④ 学生 SQL 沙箱：逐引擎**真探测**（不可用必给 reason + 指向部署文档）
+      let sandbox: Record<string, unknown>;
+      if (deps.sandboxCapabilities) {
+        try {
+          sandbox = await deps.sandboxCapabilities();
+        } catch (err) {
+          sandbox = { available: false, reason: `沙箱探测失败：${redact(err instanceof Error ? err.message : String(err))}` };
+        }
+      } else {
+        sandbox = {
+          available: false,
+          reason: '沙箱未接入（worker 不可用或未注册 sandbox 路由）',
+          defaultEngine: null,
+          engines: [],
+        };
+      }
+
+      // ⑤ 系统设置段：**由 `liveFields()` 统一构造**（同 ④，避免两处真相）
+
+      const body = {
+        version: SERVER_VERSION,        // ⓪ RBAC 自述（docs/RBAC.md §8）：UI 据此决定要不要显示登录页
+        //   `auth` / `settings` / `retrieval` / `search` 与**缓存命中路径共用** `liveFields()`
+        //   （见 `CACHEABLE_FIELDS` / `LIVE_FIELDS`）→ 两条路径的语义不会漂。
+        //   历史：`bootstrap` 曾在组装期算一次 → 建号后仍报 `not_initialized`（已修，并加了结构级守卫）。
+        ...(await liveFields()),
+        /**
+         * ★ 对话模式自述（Lead 裁定）：前端据此渲染模式选择器，**不必自己按 roles 推断**
+         * （上次 `user.roles` 推断的教训：前端猜权限迟早与后端不一致）。
+         *
+         * - `chat`：无工具（默认）；`agent`：**只读**知识库工具 `kb_search`/`kb_get`
+         * - 危险工具 `read`/`bash`/`edit`/`write` **永远剔除**（agent 模式 ≠ 放开主机工具）
+         * - `allowed_roles`：`agent` 允许的角色（**服务端权威**）
+         *   ★ Lead 裁定（2026-10-15）：**加 `student`** —— 答疑的主体是学生，不给学生开等于
+         *   这个功能对主要场景无效；且风险画像与 `bash` 完全不同（只读 + 按 userId 过滤 +
+         *   无主机工具 + 无 SQL 执行）。它还是**安全的正向收益**：给模型一个受控出口去读原文，
+         *   比"想读却没工具 → 把 tool 调用退化成正文乱码"更好。
+         * - `kb`：只读查询是否接入（未接入 → agent 模式**如实降级**，不假装有结果）
+         */
+        chat_modes: {
+          modes: ['chat', 'agent'],
+          default: 'chat',
+          tools: { chat: [], agent: ['kb_search', 'kb_get'] },
+          allowed_roles: { agent: ['admin', 'teacher', 'student'] },
+          kb: deps.kb
+            ? { available: true, readonly: true, scoped_by: 'userId' }
+            : { available: false, reason: '只读知识库查询未接入（store/kb-query.ts）→ agent 模式如实降级' },
+          note: '模式是**会话级**的（工具集在建会话时确定）：请用 `?mode=agent` 连接；未知 mode → 明确报错',
+        },
+        // ④ 学生 SQL 沙箱：**真探测**（逐引擎 + 不可用必给 reason）——
+        //    `sqlite` 永远可用；MySQL/PostgreSQL/openGauss 未部署 → 如实 false + 指向部署文档
+        sandbox: sandbox,
         // ① 解析能力：**来自 worker 的真探测**（worker 不可用 → 空数组 + worker.reason 说明）
         adapters: adaptersFromWorker(worker.available),
         // ② 契约 §5.1 的四个能力块（缺一个就是"假装可用"）
@@ -190,8 +385,7 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
         providers,
         policy: (providerCaps?.policy as Record<string, string>) ?? deps.cfg.providers.policy,
         ...(providersError ? { providers_error: providersError } : {}),
-        // ④ 检索自述（坑 15 的诚实标注）
-        search: { ...searchStats(deps.db), selftest: selftestBigram() },
+        // ④ 检索自述（坑 15 的诚实标注）+ `search` —— 由 `liveFields()` 统一构造（与缓存命中路径共用）
         // ⑤ 封闭枚举规模（来自 schema/*.json；不许发明）
         schema,
         // ⑥ 已验证的管线常量（AGENTS.md §5：不要重新发明）
@@ -208,6 +402,17 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
           uploads: deps.cfg.uploadsDir,
           artifacts: deps.cfg.artifactsDir,
         },
+      };
+      // 只缓存**成功**的响应（出错不缓存，避免把一次故障钉在 TTL 里）
+      capsCache = { at: Date.now(), key: cacheKey, body };
+      return reply.send({
+        ...body,
+        cached: false,
+        cache_ttl_ms: CAPS_TTL_MS,
+        // 如实报出分类：前端/验收脚本能看出"哪些字段允许陈旧、哪些每次实时"
+        cacheable_fields: [...CACHEABLE_FIELDS],
+        live_fields: [...LIVE_FIELDS],
+        unclassified_fields: [],
       });
     } catch (err) {
       return sendError(reply, err);

@@ -15,6 +15,59 @@
 import { api } from './client'
 import type { TaskInfo, TaskProgressEvent } from './types'
 
+/* ==========================================================================
+   POST + SSE（EventSource 只能 GET → 用 fetch 流自己解析 `event:` / `data:` 帧）
+   用于沙箱答疑：POST 里带 SQL / 报错 / 问题，服务端流式回 hint 与引用。
+   ========================================================================== */
+export interface PostSseHandlers {
+  onEvent: (event: string, data: any) => void
+  onError?: (msg: string) => void
+  onClose?: () => void
+}
+
+export async function postSse(url: string, body: unknown, h: PostSseHandlers, signal?: AbortSignal): Promise<void> {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify(body || {}),
+      signal,
+    })
+    if (!res.ok || !res.body) {
+      throw new Error(`HTTP ${res.status}${res.ok ? '（无流）' : ''}`)
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buf = ''
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      // 帧以空行分隔（契约 §6：data 是单行 JSON）
+      let idx: number
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx)
+        buf = buf.slice(idx + 2)
+        let event = 'message'
+        const dataLines: string[] = []
+        for (const line of chunk.split('\n')) {
+          if (line.startsWith('event:')) event = line.slice(6).trim()
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+          // `:` 开头是 keepalive 注释，忽略
+        }
+        if (!dataLines.length) continue
+        let parsed: any = dataLines.join('\n')
+        try { parsed = JSON.parse(parsed) } catch { /* 非 JSON 就原样给出去 */ }
+        h.onEvent(event, parsed)
+      }
+    }
+    h.onClose?.()
+  } catch (e) {
+    if ((e as Error).name === 'AbortError') return
+    h.onError?.((e as Error).message)
+  }
+}
+
 export type TaskTransport = 'sse' | 'poll'
 
 export interface TaskStreamHandlers {

@@ -363,7 +363,11 @@ test('ready 帧：两层字段齐、session_id 与 pi_session_id 分开、不含
   assert.equal(ready.persistence, 'ephemeral');
   assert.match(ready.persistence_reason, /未启用持久化|inMemory/);
   assert.equal(ready.session_file, null);
-  assert.equal(ready.tools_source, 'none');
+  // ⚠️ 原断言是 `'none'` —— 那个值读起来像"没工具"，而当时实际是 pi 的默认全集
+  //    （`read`/`bash`/`edit`/`write`），正是 shell 漏洞里"自相矛盾的信号"。
+  //    现在：安全默认下我们**显式**传空数组，来源如实标 `explicit`。
+  assert.equal(ready.tools_source, 'explicit');
+  assert.deepEqual(ready.tools, []);
   assert.equal(ready.version, '1.2.0-fake');
   assert.ok(!JSON.stringify(ready).includes('expert coding assistant'));
 });

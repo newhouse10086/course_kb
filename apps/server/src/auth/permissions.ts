@@ -69,6 +69,14 @@ export function can(user: AuthUser | null, action: Action, resource: Resource): 
     return ALLOW;
   }
 
+  if (resource.kind === 'note') {
+    // 笔记/会话是**私有资源**：只有本人（admin 已在第 3 步放过 —— 但路由层不会把别人的 note 交给 admin 视图）
+    if (resource.ownerId !== user.id) {
+      return deny('E_FORBIDDEN', 403, '只能访问自己的笔记');
+    }
+    return ALLOW;
+  }
+
   if (resource.kind === 'course') {
     const isOwner = Boolean(resource.ownerId && resource.ownerId === user.id);
     const memberRole = memberRoleOf(user, resource.courseId);
@@ -85,6 +93,14 @@ export function can(user: AuthUser | null, action: Action, resource: Resource): 
 
   // ── 4. owner（"发布"除外）────────────────────────────────────────
   if (isOwner && action !== 'publish') return ALLOW;
+  // 发布：§4 说 owner "除发布外全权" → owner 身份本身**不够**，还要有教师角色。
+  // 这是"教师上传自己的资料 → 审核 → 发布"的常规路径（该文档通常还没挂课程，
+  // 所以不能只靠 course_members 判定）。
+  if (isOwner && action === 'publish') {
+    return teacherish
+      ? ALLOW
+      : deny('E_FORBIDDEN', 403, '发布需要教师权限（仅"本人上传"不足以发布给学生）');
+  }
 
   // ── 5. 课程成员 ─────────────────────────────────────────────────
   if (memberRole === 'teacher') {

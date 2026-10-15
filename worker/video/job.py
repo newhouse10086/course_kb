@@ -230,6 +230,26 @@ def _run_parse(payload: dict, emit: EmitFn, *, providers: dict | None = None) ->
     return 0
 
 
+def _ready(emit: EmitFn, kind: str, data: dict) -> None:
+    """发一个 ``{kind}_ready`` 帧。
+
+    ⚠️ **只用可调用协议 ``emit({...})``**，不要用 ``emit.ready(...)``。
+    工程里有**两个** Emitter：
+    * ``worker/video/job.py::Emitter``（本模块的，有 ``.ready()``）
+    * ``worker/cli.py::Emitter``（**生产路径**用的那个，只有
+      ``__call__ / progress / info / warn / unit / result / error``，**没有 ``ready``**）
+
+    原实现这里写的是 ``emit.ready("subtitle", …)`` —— 单测用的是本模块的 Emitter（有该方法）
+    所以一直是绿的；但走 ``python -m worker.cli --job video.parse`` 时会在**最后一步上报**炸掉：
+    ``AttributeError: 'Emitter' object has no attribute 'ready'``。
+    实测后果很坑：**整条管线跑完、产物全部落盘**（音频/5 段 ASR/字幕/文稿/思维导图/幻灯片帧），
+    却在"上报"这一步崩 → 退出码 1 + ``E_INTERNAL`` + 没有 ``*_ready``/``result`` 帧
+    ⟹ Node 侧看到的是"失败"，而实际活儿已经干完了（反向的"看起来失败"）。
+    两者唯一的公共接口就是 ``__call__``，所以统一用它。
+    """
+    emit({"type": f"{kind}_ready", "data": data})
+
+
 def _emit_ready(emit: EmitFn, outcome: runner_mod.PipelineOutcome) -> None:
     """发 4 类"产物就绪"事件（Lead 要求的 ``*_ready``）。"""
     art = outcome.artifact
@@ -237,7 +257,8 @@ def _emit_ready(emit: EmitFn, outcome: runner_mod.PipelineOutcome) -> None:
         cues = subtitle_mod.parse_srt(art.subtitle_srt)
         validate_timeline(cues, duration_ms=art.duration_ms)
         st = outcome.stages.get("subtitle") or {}
-        emit.ready(
+        _ready(
+            emit,
             "subtitle",
             {
                 "cues": len(cues),
@@ -251,7 +272,8 @@ def _emit_ready(emit: EmitFn, outcome: runner_mod.PipelineOutcome) -> None:
             },
         )
     if art.transcript:
-        emit.ready(
+        _ready(
+            emit,
             "transcript",
             {
                 "chapters": len(art.transcript),
@@ -264,7 +286,8 @@ def _emit_ready(emit: EmitFn, outcome: runner_mod.PipelineOutcome) -> None:
         )
     if art.mindmap_content:
         tree = mindmap_mod.to_tree(art.mindmap_content)
-        emit.ready(
+        _ready(
+            emit,
             "mindmap",
             {
                 "format": art.mindmap_format,
@@ -276,7 +299,8 @@ def _emit_ready(emit: EmitFn, outcome: runner_mod.PipelineOutcome) -> None:
             },
         )
     if art.slides:
-        emit.ready(
+        _ready(
+            emit,
             "slides",
             {
                 "count": len(art.slides),

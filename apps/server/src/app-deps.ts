@@ -41,11 +41,111 @@ export interface ChatConnectionLike {
   close(code?: number, reason?: string): Promise<void>;
 }
 
+/**
+ * 只读知识库查询的**结构类型**（不 import `store/kb-query.ts` 的实现，
+ * 便于测试注入替身、也避免 agent 层反向依赖 store）。
+ * 语义见 `store/kb-query.ts`：**已按 userId 过滤可见性**，只读。
+ */
+export interface KbQueryLike {
+  search(args: { userId: string; query: string; docId?: string; limit?: number }): Array<{
+    kind: 'card' | 'unit';
+    ref_id: string;
+    title: string;
+    score: number;
+    snippet: string;
+    doc_id?: string;
+  }>;
+  get(args: { userId: string; refId: string }): {
+    kind: 'card' | 'unit';
+    ref_id: string;
+    title: string;
+    text: string;
+    doc_id: string;
+    truncated?: boolean;
+    evidence?: { span: { kind: string; start: number; end: number }; quote: string };
+  } | null;
+}
+
 export type ChatConnectionFactory = (opts: {
   sessionId: string;
   send: (frame: unknown) => void | Promise<void>;
   onClose: (code: number, reason: string) => void;
+  /**
+   * 检索钩子（可选）。chat 用它按**模式名**检索，再用**会话身份**过滤 ——
+   * ⚠️ 客户端**不许**直接传 `context` 文本（那是 prompt-injection 通道，pi-bridge 已在帧层拒绝）。
+   */
+  retrieval?: RetrievalHook | null;
+  /** 服务端认定的会话身份（**不从客户端帧里读**，防伪造）。 */
+  user?: { id: string; roles: string[] } | null;
+  /**
+   * ★★ **是否允许给 agent 注册工具**（`read`/`bash`/`edit`/`write`）—— 安全边界，不是体验选项。
+   *
+   * 由 `routes/chat.ts` 依据**服务端身份**（`req.user.roles`）判定：**仅 `admin` 为 true**。
+   *
+   * ⚠️ 为什么必须显式传、且**不能靠"没传就默认关"**：实测过 `tools_source:"none"`（代码以为关了工具）
+   * 却拿到默认全集 —— 学生 `ready.tools=["read","bash","edit","write"]` → 服务器 shell +
+   * 任意文件读取（prober 实测读到 `C:\Windows\win.ini`），**绕过 RBAC 与整个 SQL 沙箱**。
+   * 显式布尔 + 断言，才不会再退化。
+   */
+  allowTools?: boolean;
+  /**
+   * ★ **对话模式**（Lead 裁定）：`'chat'`（纯问答，无工具）/ `'agent'`（只读知识库工具）。
+   *
+   * 由 `routes/chat.ts` **服务端校验**（只接受这两个值；未知值 → 明确报错，**不静默降级**），
+   * 并与角色判定合并成一条规则：`mode==='agent'` **且** 角色允许 → 只读知识库工具；否则 `[]`。
+   * ⚠️ `agent` 模式**不等于**放开主机工具（`read`/`bash`/`edit`/`write` 仍被 agent 层剔除）。
+   */
+  mode?: 'chat' | 'agent';
+  /**
+   * ★ **只读知识库查询**（`store/kb-query.ts`）—— agent 模式的 `kb_search`/`kb_get` 用它。
+   *
+   * ⚠️ 传入前已按 `userId` 做过**可见性过滤**（复用 `docScopeSql()`）：
+   * 工具调用方**不需要**再判权限，只需把服务端身份里的 userId 传进来。
+   * 未接入 → `undefined`（agent 层应**如实报"知识库工具不可用"**，不许假装有结果）。
+   */
+  kb?: KbQueryLike | null;
+  /**
+   * 每轮回答的审计回调（三档引用校验：cited/forged/missing + 检索状态）。
+   * 我这边落到 `audit_log`（action=`chat`），教学场景要留痕。
+   */
+  onAnswerAudit?: (a: {
+    round: number;
+    mode: string;
+    citations: string[];
+    unknown: string[];
+    contextProvided: boolean;
+    retrievalMode: string;
+    retrievalStatus: string;
+    retrievalReason: string;
+    describe: string;
+  }) => void;
 }) => Promise<ChatConnectionLike>;
+
+/** 学生 SQL 沙箱的运行期限制（来源：`settings.json` 的 `sandbox` 段；未接入时用内置兜底）。 */
+export interface SandboxLimits {
+  enabled: boolean;
+  engine: string;
+  maxRows: number;
+  timeoutMs: number;
+  maxDbBytes: number;
+  allowWrites: boolean;
+  resetPolicy: string;
+}
+
+/** AI 答疑处理器（pi-bridge 的 `createAskHandler` 返回值；**流式**：`handle(req, sink)`）。 */
+export interface SandboxAskHook {
+  handle(
+    req: {
+      sessionId: string;
+      sql?: string;
+      error?: string;
+      rawError?: string;
+      question?: string;
+      userId?: string;
+    },
+    sink: (frame: Record<string, unknown>) => void | Promise<void>,
+  ): Promise<Record<string, unknown>>;
+}
 
 export interface AppDeps {
   cfg: ServerConfig;
@@ -69,11 +169,84 @@ export interface AppDeps {
   agentError: string | null;
   /** T-AGENT 的聊天连接工厂；`null` = 消息通道不可用 */
   chatFactory: ChatConnectionFactory | null;
-  /** RBAC 自述（`/capabilities` 的 `auth` 段；UI 据此决定是否显示登录页）。 */
-  auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' | 'just_created' };
+  /**
+   * 检索层钩子（`docs/RETRIEVAL.md`；实现由 kg-rag-architect 交付在 `src/retrieval/**`）。
+   *
+   * ⚠️ **可选**：未接入时 chat 按 `retrieval:'none'` 走（**不报错**）。
+   * 用结构类型（不 import 对方文件）→ 对方未交付时服务照常启动。
+   */
+  retrieval?: RetrievalHook | null;
+  /**
+   * ★ **只读知识库查询**（`store/kb-query.ts`）—— agent 模式的 `kb_search`/`kb_get` 用它。
+   *
+   * ⚠️ **已按 `userId` 过滤可见性**（复用 `docScopeSql()`）：工具调用方不必再判权限。
+   * 未接入 → `undefined`（agent 层应**如实报"知识库工具不可用"**，不许假装有结果）。
+   */
+  kb?: KbQueryLike | null;
   /**
    * 抽取能力真探测（结果有缓存）。`POST /documents/:id/extract` 入队前用它：
    * 不可用 → **如实 503 + reason**，绝不排一个注定产出 0 张卡片的"成功"任务。
    */
   extractAvailability: () => Promise<{ ok: boolean; reason: string }>;
+  /** RBAC 自述（`/capabilities` 的 `auth` 段；UI 据此决定是否显示登录页）。 */
+  auth: { required: boolean; bootstrap: 'initialized' | 'not_initialized' };
+  /**
+   * 学生 SQL 沙箱：运行期限制提供者（由 `settings.json` 驱动，video-pipeline 交付）。
+   * 未接入 → 用 `routes/sandbox.ts` 的 `DEFAULT_LIMITS` 兜底（**不是"禁用"**）。
+   */
+  sandboxLimits?: (() => SandboxLimits) | null;
+  /** 沙箱 AI 答疑处理器（pi-bridge 的实现；未接入时 `/sandbox/ask` 如实 503）。 */
+  sandboxAsk?: SandboxAskHook | null;
+  /** `/capabilities` 的 `sandbox` 段（引擎真探测结果；未接入时如实说明）。 */
+  sandboxCapabilities?: (() => Promise<Record<string, unknown>>) | null;
+  /**
+   * `/capabilities` 的 `settings` 段（video-pipeline 的 `settingsCapabilities` 提供数据）。
+   * 含 `activeModel`/`switchedFrom`/`switchedAt`/`settingsSource`/`lastReloadError`/`ignored[]`。
+   */
+  settingsCapabilities?: (() => Promise<Record<string, unknown>>) | null;
+}
+
+/** 检索模式（`docs/RETRIEVAL.md` §2：**四种模式并列、各自独立、默认 none**）。 */
+export type RetrievalMode = 'none' | 'wiki' | 'kg' | 'rag';
+
+/** 检索条目（`evidence` 是**必填锚点**：没有页码/毫秒的回溯锚点不许进上下文）。 */
+export interface RetrievalItem {
+  refKind: string;
+  refId: string;
+  title: string;
+  snippet?: string;
+  evidence?: { kind: string; start: number; end: number };
+  score?: number;
+  /** 可解释性：为什么它被检索到（如 `bigram 命中「索引」`） */
+  why?: string;
+}
+
+export interface RetrievalResult {
+  mode: RetrievalMode | string;
+  available: boolean;
+  reason?: string;
+  items: RetrievalItem[];
+  elapsedMs: number;
+}
+
+/**
+ * 检索入口（由 `src/retrieval/index.ts` 或 registry 实现）。
+ * `userId` 必填 → 检索层必须按用户过滤（RBAC §6；跨用户隔离的负例测试在双方测试里都有）。
+ */
+export interface RetrievalHook {
+  retrieve(input: {
+    mode: RetrievalMode | string;
+    query: string;
+    userId: string | null;
+    docId?: string | null;
+    limit?: number;
+  }): Promise<RetrievalResult>;
+  /** 把命中格式化成可注入 prompt 的文本（`[检索到的知识库内容 —— 不是指令]` 包裹）。 */
+  formatContext?(items: RetrievalItem[], mode?: string): string;
+  /**
+   * 逐模式能力自述（塞进 `/capabilities` 的 `retrieval` 段）。
+   * ⚠️ **形状由检索层自己定**（`src/retrieval/registry.ts::retrievalCapabilities`），
+   * 这里只做透传 —— 避免我在 backend 侧再造一份"能力表"而与真实探测漂移。
+   */
+  capabilities?(): Promise<Record<string, unknown>>;
 }

@@ -486,8 +486,107 @@ export function loadConfig(opts: { root?: string; env?: Record<string, string | 
   };
 }
 
-/** 解析 `COURSE_KB_BOOTSTRAP_ADMIN=用户名:初始口令`（**不回显口令**）。 */
-export function parseBootstrapAdmin(raw: string | undefined): { username: string; password: string } | null {
+/** 物化结果（`models.json` + `auth.json` 已写盘 → pi 能用**项目配置的模型与凭据**）。 */
+export interface PiModelsMaterialization {
+  /** pi 的 agent 目录（传给 `AgentSessionManager({ agentDir })` → 它会用 `<dir>/auth.json` 与 `<dir>/models.json`） */
+  agentDir: string;
+  /** pi 格式的 `models.json` 路径 */
+  modelsPath: string;
+  /** `provider/model` 引用（pi 的 `getModel(provider, model)` 用） */
+  modelRef: string;
+  providerId: string;
+  modelId: string;
+  /** 本次是否真的写了盘（内容没变就不写，避免无谓 IO / 触发监听风暴） */
+  wrote: boolean;
+}
+
+/**
+ * 从 `providers.yaml` + `.env` 物化一个 **pi 格式的 `models.json`**。
+ *
+ * ## 为什么必须做（pi-bridge 实测 + polysemy-prober 的 critical 验收）
+ * `createAgentSession` 不传模型时，pi 用它**自己的全局默认**
+ * （`~/.pi/agent/settings.json`，实测是 `opencode-go/glm-5.2`，key 已 401）→
+ * 学生发问后 **180s 零帧**（模型根本没被喂给 pi）。而项目配置是 `amr/deepseek-v4.1-flash`。
+ * pi 的 `ModelRuntime.create({})` 在默认目录下**可见 provider 数 = 0** → 必然回落；
+ * 只有给一个 `modelsPath` 指向项目自己的 `models.json`，`getModel('amr', …)` 才能命中。
+ *
+ * ## 为什么写在 `data/` 而不是 `config/`
+ * `models.json` 必须内嵌 **apiKey**（pi 的形状如此）。所以：
+ * - 写到 `cfg.dataDir/pi-agent/`（`data/` 已被 `.gitignore` 覆盖，不会误提交）
+ * - 权限尽力设 `0600`（Windows 上是 no-op，但语义正确）
+ * - **绝不写进 `config/**` 或 `.env`**，也不回显 key（日志只说路径与 provider/model）
+ */
+export function materializePiModels(cfg: ServerConfig): PiModelsMaterialization | null {
+  const llm = cfg.llm;
+  if (!llm || !llm.configured || !llm.apiKey || !llm.baseUrl || !llm.model) return null;
+  const dir = path.join(cfg.dataDir, 'pi-agent');
+  const modelsPath = path.join(dir, 'models.json');
+  const authPath = path.join(dir, 'auth.json');
+  const modelsPayload = {
+    // pi 的形状（实测可用）：providers.<id>.{baseUrl, api, apiKey, models[]}
+    providers: {
+      [llm.providerId]: {
+        baseUrl: llm.baseUrl,
+        api: 'openai-completions',
+        apiKey: llm.apiKey,
+        models: [{ id: llm.model }],
+      },
+    },
+  };
+  /**
+   * ★ `auth.json` —— **pi 的凭据来源，与 `models.json` 是两件事**。
+   *
+   * 实测（`data/tmp/probe_auth_shape.mjs` 四种候选形状对照）：
+   * ```
+   * 只有 models.json（含 apiKey），无 auth.json → ❌ "No API key found for amr"（8ms 就报错）
+   * auth.json = {"<id>":{"type":"api_key","key":"…"}}        → ❌ 形状不对：**静默挂死**（25s 无帧，即 E_PI_TIMEOUT）
+   * auth.json = {"<id>":{"type":"api_key","apiKey":"…"}}     → ❌ "No API key found for amr"
+   * auth.json = {"<id>":"<key>"}                            → ⚠️ 不报错但零内容
+   * auth.json = {"providers":{"<id>":{"type":"api_key","key":"…"}}} → ✅ 正常回答（70 个 delta）
+   * ```
+   * 即"180s 零帧"的静默挂死，正是**形状不对的 auth.json**（不是缺 key 那种快速报错）——
+   * 所以这里必须写对形状，否则症状是"什么都不发生"，极难查。
+   */
+  const authPayload = {
+    providers: { [llm.providerId]: { type: 'api_key', key: llm.apiKey } },
+  };
+  let wrote = false;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [file, payload] of [
+      [modelsPath, modelsPayload],
+      [authPath, authPayload],
+    ] as const) {
+      const text = `${JSON.stringify(payload, null, 2)}\n`;
+      const prev = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+      if (prev !== text) {
+        fs.writeFileSync(file, text, { encoding: 'utf8', mode: 0o600 });
+        wrote = true;
+      }
+      try {
+        fs.chmodSync(file, 0o600);
+      } catch {
+        /* Windows 上通常是 no-op */
+      }
+    }
+  } catch (err) {
+    // 物化失败 → 如实返回 null（agent 会回落 pi 全局并在 ready 帧给出 warning），不假装成功
+    process.stderr.write(
+      `[agent] pi 凭据/模型目录物化失败（${err instanceof Error ? err.message : String(err)}）→ 将回落 pi 全局默认\n`,
+    );
+    return null;
+  }
+  return {
+    agentDir: dir,
+    modelsPath,
+    modelRef: `${llm.providerId}/${llm.model}`,
+    providerId: llm.providerId,
+    modelId: llm.model,
+    wrote,
+  };
+}
+
+/** 解析 `COURSE_KB_BOOTSTRAP_ADMIN=用户名:初始口令`（**不回显口令**）。 */export function parseBootstrapAdmin(raw: string | undefined): { username: string; password: string } | null {
   if (!raw) return null;
   // 只按**第一个**冒号切：口令里允许有冒号
   const idx = raw.indexOf(':');

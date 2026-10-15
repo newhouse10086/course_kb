@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 能力 composable：全局只拉一次 `/capabilities`（契约 §5.1 / PROVIDERS §7）
  * 失败不阻塞页面，但会把错误暴露给 UI 显示（而不是假装能力都在）。
  */
@@ -17,7 +17,8 @@ async function load(force = false): Promise<CapsModel | null> {
   error.value = ''
   promise = (async () => {
     try {
-      const raw = await api.capabilities()
+      // `refresh=1` = 强制重探（真后端 15s TTL 缓存；点"重新探测"时必须绕过缓存）
+      const raw = await api.capabilities(force)
       caps.value = normalizeCapabilities(raw)
       return caps.value
     } catch (e) {
@@ -33,5 +34,6 @@ async function load(force = false): Promise<CapsModel | null> {
 
 export function useCaps() {
   if (!caps.value && !promise) void load()
-  return { caps, error, loading, reload: () => load(true) }
+  return { caps, error, loading, reload: (force = true) => load(force) }
 }
+

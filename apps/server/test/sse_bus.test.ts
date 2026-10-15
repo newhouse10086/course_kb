@@ -151,11 +151,51 @@ test('queue：成功路径 —— 任务 done、progress=1、detail=返回值、
     assert.equal(task?.finished_at !== null, true, '完成必须写 finished_at');
     assert.equal(closed, true, '任务结束必须关流（契约 §6）');
     assert.deepEqual(frames.map((f) => f.event), ['progress', 'progress', 'log', 'progress', 'done']);
-    assert.deepEqual(frames[0]?.data, { task_id: taskId, progress: 0, stage: '排队中', kind: 'ok' });
+    // 首帧带 `priority`（RBAC §5：调度优先级对前端可见，便于解释"为什么我的排在后面"）
+    assert.deepEqual(frames[0]?.data, { task_id: taskId, progress: 0, stage: '排队中', kind: 'ok', priority: 0 });
     assert.deepEqual(frames[1]?.data, { task_id: taskId, progress: 0.5, stage: '半程', done: 1, total: 2 });
     assert.deepEqual(frames[2]?.data, { task_id: taskId, level: 'info', msg: '一条日志' });
     assert.equal(frames[4]?.data.status, 'done');
     assert.equal(typeof frames[4]?.data.elapsed_ms, 'number');
+  } finally {
+    s.db.close();
+  }
+});
+
+test('queue：drain 准入控制 —— pause 后不领新任务、resume 立刻调度；**暂停时刻可读且幂等**', async () => {
+  const s = setup({
+    quick: async () => ({ ok: 1 }),
+  });
+  try {
+    // ① 暂停后入队的任务**不许开跑**（drain 语义：在跑的跑完，pending 停住）
+    s.queue.pauseAdmissions();
+    assert.equal(s.queue.isAdmissionsPaused(), true);
+    assert.equal(s.queue.admissionsPaused, true);
+    const t1 = s.queue.enqueue({ kind: 'quick' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(s.repo.getTask(t1)?.status, 'queued', '暂停期间不许领取新任务');
+    assert.equal(s.queue.running().length, 0);
+
+    // ② ★ 暂停时刻可读（供"drain 超时自动恢复"判断暂停了多久）
+    const at = s.queue.admissionsPausedAt();
+    assert.equal(typeof at, 'number');
+    const forMs = s.queue.admissionsPausedForMs();
+    assert.equal(typeof forMs, 'number');
+    assert.ok((forMs as number) >= 0);
+    // 幂等：重复 pause **不刷新**时刻（否则超时兜底永远等不到）
+    const before = s.queue.admissionsPausedAt();
+    await new Promise((r) => setTimeout(r, 20));
+    s.queue.pauseAdmissions();
+    assert.equal(s.queue.admissionsPausedAt(), before, '重复 pause 不许刷新暂停时刻');
+    assert.ok((s.queue.admissionsPausedForMs() as number) >= 20, '暂停时长应继续累计');
+
+    // ③ resume 后立刻调度
+    s.queue.resumeAdmissions();
+    assert.equal(s.queue.admissionsPaused, false);
+    assert.equal(s.queue.admissionsPausedAt(), null, 'resume 后暂停时刻清零');
+    assert.equal(s.queue.admissionsPausedForMs(), null);
+    await s.queue.drained(5000);
+    assert.equal(s.repo.getTask(t1)?.status, 'done');
   } finally {
     s.db.close();
   }

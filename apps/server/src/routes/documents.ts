@@ -232,7 +232,7 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
       const body = (req.body ?? {}) as Record<string, unknown>;
       const target = typeof body.status === 'string' ? body.status : '';
       if (target !== 'draft' && target !== 'reviewed' && target !== 'published') {
-        throw new ApiError('E_FORMAT', `非法状态：${target || '(空)'}`, {
+        throw new ApiError('E_BADREQUEST', `非法状态：${target || '(空)'}`, {
           detail: 'status ∈ draft | reviewed | published',
         });
       }
@@ -240,18 +240,60 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
       // 拿**未过滤**的行：不存在 → 404；存在但不可见 → 404；可见但无权 → 403
       const row = authorizeDoc(req, deps, id, target === 'published' ? 'publish' : 'review');
       const user = requireUser(req);
-      const previous = row.review_status;
-      if (previous === target) {
-        return reply.send({ document_id: id, review_status: target, changed: false, previous });
+
+      // ★ 发布必须真的"能给学生看到"，否则是个静默空操作（比报错更糟 —— 看起来成功了）
+      let visibilityPatch: 'course' | 'public' | null = null;
+      if (target === 'published') {
+        const want = typeof body.visibility === 'string' ? body.visibility : '';
+        if (want && want !== 'private' && want !== 'course' && want !== 'public') {
+          throw new ApiError('E_BADREQUEST', `非法 visibility：${want}`, { detail: 'private | course | public' });
+        }
+        if (want === 'course' || want === 'public') {
+          if (want === 'course' && !row.course_id) {
+            throw new ApiError('E_BADREQUEST', 'visibility=course 需要先把文档挂到课程上', {
+              detail: 'documents.course_id 为空',
+              hint: '上传时带 ?course_id=… 或先 POST /courses 建课',
+            });
+          }
+          visibilityPatch = want;
+        } else if (row.visibility === 'private') {
+          // 未显式指定 → 按文档归属推断；推断不出来就**如实拒绝**，不假装发布成功
+          if (row.course_id) {
+            visibilityPatch = 'course';
+          } else {
+            throw new ApiError('E_PARSE', '该资料的可见范围是 private，发布后学生仍然看不到', {
+              detail: `document_id=${id} course_id=(空) visibility=private`,
+              hint: '在同一个请求里带 visibility:"public"（全站已登录用户可见）或先把文档挂到课程（visibility:"course"）',
+            });
+          }
+        }
       }
+
+      const previous = row.review_status;
+      const visibilityChanged = visibilityPatch !== null && visibilityPatch !== row.visibility;
+      if (previous === target && !visibilityChanged) {
+        return reply.send({ document_id: id, review_status: target, visibility: row.visibility, changed: false, previous });
+      }
+      if (visibilityPatch) repo.setDocumentScope(id, { visibility: visibilityPatch });
       repo.setReviewStatus(id, target, user.id);
       repo.rbac.audit({
         userId: user.id,
         action: target === 'published' ? 'publish' : 'review',
         target: id,
-        detail: { from: previous, to: target, note: typeof body.note === 'string' ? body.note.slice(0, 500) : '' },
+        detail: {
+          from: previous,
+          to: target,
+          visibility: visibilityPatch ?? row.visibility,
+          note: typeof body.note === 'string' ? body.note.slice(0, 500) : '',
+        },
       });
-      return reply.send({ document_id: id, review_status: target, changed: true, previous });
+      return reply.send({
+        document_id: id,
+        review_status: target,
+        visibility: visibilityPatch ?? row.visibility,
+        changed: true,
+        previous,
+      });
     } catch (err) {
       return sendError(reply, err);
     }
@@ -300,14 +342,19 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
       }
 
       const body = (req.body ?? {}) as Record<string, unknown>;
+      const caller = requireUser(req);
       const taskId = queue.enqueue({
         docId: id,
         kind: 'extract',
+        // RBAC §5：教师=0 优先；学生（若有权限）也不会挤掉教师任务
+        priority: taskPriority(caller),
+        userId: caller.id,
         params: {
           ...(Array.isArray(body.units) ? { units: body.units } : {}),
           ...(typeof body.limit === 'number' ? { limit: body.limit } : {}),
         },
       });
+      repo.rbac.audit({ userId: caller.id, action: 'extract', target: id, detail: { task_id: taskId } });
       return reply.code(202).send({
         document_id: id,
         task_id: taskId,
@@ -598,9 +645,12 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
         });
       }
       const body = (req.body ?? {}) as Record<string, unknown>;
+      const caller = requireUser(req);
       const taskId = queue.enqueue({
         docId: id,
         kind: 'asr',
+        priority: taskPriority(caller),
+        userId: caller.id,
         params: {
           op: 'transcribe',
           ...(strParam(body.asr_model) ? { model: strParam(body.asr_model) as string } : {}),

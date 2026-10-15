@@ -221,6 +221,10 @@ test('注入 modelProbe（可复用 T-PROVIDERS 的 healthCheck）', async () =>
         missingEnv: [],
         httpStatus: 200,
         resetAt: null,
+        bodyShape: 'choices',
+        finishReason: 'stop',
+        contentEmpty: false,
+        warning: null,
       };
     },
     force: true,
@@ -260,7 +264,12 @@ test('probeLlmEndpoint：200 → available，且请求体是 max_tokens=1 的最
       fetchImpl: async (_url, init) => {
         captured.body = JSON.parse(String(init?.body)) as Record<string, unknown>;
         captured.headers = (init?.headers ?? {}) as Record<string, string>;
-        return jsonResponse(200, { choices: [] });
+        // ⚠️ 原 fixture 是 `{ choices: [] }` —— 那是**空 choices**，真实 chat completion 不会这样。
+        // 独立验收指出"HTTP 200 ≠ 模型可用"后，实现改成必须看到合法的 choices；
+        // 所以这里换成**真实形状**（否则测的是"假绿"本身）。
+        return jsonResponse(200, {
+          choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'pong' } }],
+        });
       },
     },
   );
@@ -271,6 +280,11 @@ test('probeLlmEndpoint：200 → available，且请求体是 max_tokens=1 的最
   assert.equal(captured.body?.stream, false);
   assert.equal(captured.headers.authorization, 'Bearer key-1234567890');
   assert.equal(cap.reason, '');
+  // 响应形状被如实记录（新字段）
+  assert.equal(cap.bodyShape, 'choices');
+  assert.equal(cap.finishReason, 'stop');
+  assert.equal(cap.contentEmpty, false);
+  assert.equal(cap.warning, null);
 });
 
 test('probeLlmEndpoint：baseUrl 末尾斜杠不会拼出双斜杠', async () => {

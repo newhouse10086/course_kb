@@ -13,6 +13,7 @@
  *      真实媒体路径下必须断言 `video.currentTime ≈ 目标时间`。
  *   ② 重跑入口不是摆设 → 真提交 + TaskStream（SSE 主 + 轮询兜底），transport 如实上报。
  */
+import { setAssistantContext } from '../composables/useAssistantContext'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { api, listOf } from '../api/client'
@@ -288,6 +289,11 @@ async function boot() {
 }
 
 onBeforeUnmount(() => tasks.forEach((t) => t.stop()))
+// ★ 小助手上下文：doc（当前播放位置不是后端认识的 id，作为 page 传"秒"也不合适 → 只传 doc）
+watch(() => route.query.doc, (d) => {
+  setAssistantContext(d ? { doc_id: String(d) } : {}, d ? '当前视频' : '')
+}, { immediate: true })
+
 onMounted(boot)
 // 换文档不重挂载（见 App.vue 的 RouterView key 说明）→ 自己监听 query.doc 重新加载
 watch(() => route.query.doc, (v, old) => { if (v && v !== old) void boot() })

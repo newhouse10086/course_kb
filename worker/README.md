@@ -1,4 +1,4 @@
-﻿# Python Worker —— CLI + 严格 JSONL 协议
+# Python Worker —— CLI + 严格 JSONL 协议
 
 > **架构 v2 定位**（`docs/ARCHITECTURE_V2.md` §3）：后端主体是 **TS/Node**，
 > Python 只做「成熟库不可替代」的事：**PDF/PPTX/DOCX 解析**、**本地 ASR**、抽帧。
@@ -48,6 +48,57 @@ stderr: 日志（**不是协议**）
 
 ---
 
+### 2.1 ★ 输入编码：三条路径都**显式 UTF-8**（不看语言环境）
+
+| 路径 | 实现 | 说明 |
+|---|---|---|
+| `--in '<内联 JSON>'`（argv） | Python 在 Windows 用宽字符 API 取 argv | 中文安全 |
+| `--in <文件>` | `worker/stdio.py::read_text_file` | **按 BOM 判编码**，无 BOM 则 UTF-8 **strict** |
+| stdin（大 payload 的推荐通道，坑 18） | `worker/stdio.py::read_stdin_text`（读 `sys.stdin.buffer`） | **绝不**用 `sys.stdin.read()` |
+
+**为什么必须显式**：`sys.stdin.read()` 按**语言环境编码**解码 —— Windows 中文机是 **GBK**。
+于是"我们推荐的 stdin 大 payload 通道"在中文内容下**必然乱码**，而且**看起来成功**：
+坏字节被解成 `任?` / `?务`，JSON 照样能解析 → 一路写进库。
+实测对照（同一份 UTF-8 字节喂 stdin）：
+
+```
+默认（GBK 解码）          terms = ['任?', '?务']      ← 静默错
+PYTHONIOENCODING=utf-8   terms = ['任务']            ← 对
+```
+
+**`errors=` 策略：`strict`（不是 `replace`）** —— 这是有意的取舍：
+
+* `replace` 把坏字节变成 `?`/U+FFFD **而不报错**。若坏字节落在 JSON 字符串值里，
+  `json.loads` **照样成功** → 内容被悄悄改坏、零信号（正是上面那个 bug 的表现）。
+* 若坏字节落在 JSON 结构里，报的是"JSON 语法错"，把**编码问题**误诊成**格式问题**，排查方向全错。
+* 编码错误几乎总是上游真的错了（非 UTF-8 写入 / 流被截断 / 二次编码）→
+  **明确失败 + 指出第几字节**才可修。
+
+所以坏字节 → `E_PAYLOAD`（退出码 2）+ 精确信息：
+
+```jsonc
+{"type":"error","code":"E_PAYLOAD",
+ "msg":"stdin 不是合法 UTF-8：第 21 字节起解码失败（invalid continuation byte）—— 常见原因：上游用系统默认编码写的（Windows 中文机是 GBK），或字节流被截断",
+ "detail":"坏字节：b'\\xc8\\xce'（hex c8ce）；总长度 26 字节。修法：以 UTF-8 写入（Node 用 Buffer.from(json,'utf8')…）"}
+```
+
+**BOM**：按 BOM 判编码（`utf-8-sig` / `utf-16-le` / `utf-16-be` / `utf-32-*`）——
+Windows 编辑器与 `Set-Content -Encoding Unicode` 常写 BOM。
+**无 BOM 的 UTF-16 不做猜测**（猜编码会引入更隐蔽的错误）→ 明确失败并提示。
+（实现细节：用显式 codec 解 UTF-16 时 BOM 会留在文本里变成 U+FEFF、`json.loads` 会报
+"Unexpected UTF-8 BOM" → `stdio.decode_payload_bytes` 统一剥一次。）
+
+**stderr**：`main()` 调 `stdio.configure_stdio_utf8()` 把日志流设为 UTF-8
+（`errors="backslashreplace"`：日志宁可出现转义也不能因编码崩）。**stdout 不动** ——
+协议输出是 `sys.stdout.buffer` 的纯 ASCII 字节（见 §3）。
+
+> ⚠️ **测试必须造敌意环境**：历史上这个 bug 之所以长期没被发现，是因为开发机的 shell
+> 设了 `PYTHONIOENCODING=utf-8` → 测试进程继承它 → 在"恰好正确"的环境里全绿。
+> `worker/tests/test_cli.py::_hostile_env()` 现在**清掉** `PYTHONIOENCODING`/`PYTHONUTF8`
+> 并设 `PYTHONUTF8=0`，全量套件在该环境下也必须全绿（实测 499 passed）。
+> 同一类 bug 还有**第二处**：`worker/sandbox/runner.py` 也从 stdin 读 payload ——
+> 已一并修为显式 UTF-8（`test_runner_stdin_is_explicit_utf8` 在敌意环境下直连 runner 验证）。
+
 ## 3. stdout 协议（**硬约束**）
 
 一行一个 JSON，**行尾 `\n`**，5 种事件：
@@ -93,6 +144,8 @@ stderr: 日志（**不是协议**）
 | `index` | bigram 检索行（坑 15） | T-WORKER |
 | `search` | 查询词 → bigram 词项 + FTS5 `MATCH` 表达式 | T-WORKER |
 | `asr` | 本地 ASR：`op=probe` 真探测 / `op=transcribe` 转写 | T-WORKER（实现 T2） |
+| `rollup.plan` / `rollup.convert` | S2 汇总（与 extract 同构：提示词 / 校验转换） | T-WORKER |
+| `sandbox.*` | 学生 SQL 沙箱（8 个 job，见 §10） | T-WORKER |
 | `video.*` | 视频管线整包转 `worker/video/job.py::run_job` | T2 video-pipeline |
 | `ping` | 自检：返回版本 + job 列表 | T-WORKER |
 
@@ -212,6 +265,66 @@ stderr: 日志（**不是协议**）
 | 有 payload 但**一个都没匹配上** | — | >0 | **1**（`E_PICK_KEY`） |
 
 调用方**不要只看 `cards`**：`cards=0` + `ok=true` 才是"这篇确实没有知识点"。
+
+#### ★ `status` / `warnings`：把"成功但零产出"与"失败"分开
+
+`extract` / `extract.convert` 的 `result.data` 里除了 `ok`/`error_count` 还有：
+
+| `status` | 含义 | `ok` | 退出码 |
+|---|---|---|---|
+| `done` | 有卡片产出 | true | 0 |
+| **`done_empty`** | **全部成功但一张卡都没有** —— 内容不足（模型合理地只返回 `section`） | true | 0 |
+| `partial` | 有失败也有成功 | false | 0 |
+| `failed` | 全失败（含"一个 payload 都没匹配上"） | false | 1 |
+
+`done_empty` **不是错误**（模型拒绝抽取可以是对的：原文只有一句定义式陈述），
+但它**必须**与"抽取失败""管线丢卡"在返回值上区分 —— 否则前端只能把空知识库
+当正常完成展示，用户分不清"内容太少"和"系统坏了"（polysemy-prober 独立验收抓到）。
+
+配套的 `warnings[]`（`done_empty` 时必有）：
+
+```jsonc
+{"code":"W_NO_CARDS", "unit_id":"unt_…", "title":"索引简介", "span":{...},
+ "cards_key":"missing",     // missing=模型主动省略该键（内容不足）；empty=给了空数组
+ "model_note":"本节只有一句定义式陈述……不足以支撑任何操作层面的结论。",
+ "msg":"模型返回的 section 合法，但**没有产出任何卡片**（`cards` 键缺失 …）；模型说明：…"}
+```
+`model_note` 直接取自模型的 `section_summary` —— 它往往正好解释了
+"为什么抽不出知识点"，前端可直接显示给用户。
+
+> ⚠️ **两条路径的差异**（别混淆）：
+> * **B：worker 内调 LLM**（`extract`）—— strict schema **要求** `cards` 键，
+>   模型省略它 → 重试 3 次 → **失败**（`status:"failed"`）。本来就响。
+> * **A：Node 调模型**（`extract.plan` → `extract.convert`）—— 模型输出未经 strict
+>   校验就回传 → 第一版**静默**；现在 `status:"done_empty"` + `warnings`。
+> * `stats.units_no_cards` 计数这类单元，便于看"是整篇内容少还是个别的少"。
+
+#### ★ LLM 错误码：把"推理吃光预算 / 上游过载 / 输出不合规"分开
+
+契约 §0 明确要求「`content` 为空但 `reasoning_content` 非空 → **显式报错**，不许当成功」。
+推理模型的 reasoning token **计入输出预算**（实测：8 字回复用掉 54 个推理 token），
+所以预算太小时 `content` 为空、`finish_reason=length` —— **只判 HTTP 200 就会假绿**。
+
+| 错误码 | 触发 | 处置 |
+|---|---|---|
+| `E_LLM` | 未配置凭据 / 4xx（401/402/403/404/429） | 配置或等额度；`402` 会触发抽取**中断**（`E_LLM_ABORT`） |
+| **`E_LLM_EMPTY_CONTENT`** | `content` 为空（空白也算）——**不算成功** | `detail` 带 `finish_reason`/tokens/`reasoning_chars`；**提高 `max_tokens`**（结构化抽取 ≥2000，探测 ≥500） |
+| **`E_LLM_BAD_JSON`** | 输出不是 JSON（可能被截断） | 看 `finish_reason=length` → 提高预算；否则查提示词 |
+| **`E_LLM_UPSTREAM`** | 上游 5xx / 网络故障（`retryable=true`） | **重试即可**；`detail` 保留 `HTTP 503` + body 片段（如 `Service Overload`） |
+| `E_LLM_SCHEMA` | JSON 合法但字段/枚举不合规（重试后仍错） | 改 schema/提示词；`detail` 列出违规项 |
+
+> 这些检查在 `_call` 里做 → **真 HTTP 与注入 transport 两条路径都覆盖**
+> （第一版只在 `_http_call` 里查，注入替身会绕过）。
+> 顺带一个教训：我第一次重构 `_call` 时**多留了一份定义**，把"并发=1 的锁"覆盖掉了 ——
+> 是既有的 `test_llm_serialises_calls_under_threads`（断言 `max_inflight == 1`）当场抓住的。
+
+**输出预算必须显式给**（`LLMConfig.max_tokens` 默认 8192；Node 传 `maxTokens` 即采纳，
+`settings.json` 里是 16384）：推理 token **计入** `max_tokens`，省略它就是让 provider 的默认值
+决定"能不能出内容"。判据是 **`content` 是否为空**，**不是** `finish_reason`
+（实测 `length` 会出现但不保证总出现 → 只能当线索，所以原因描述写"很可能"而不下断言）。
+
+> 真端点回归（`.env` 现指向推理端点 `llm-api.x-aio.com`）：`extract` 1 个单元 → **8 张卡片**、
+> `status:"done"`、24.3s、`llm_calls:1` —— 显式预算下推理模型的结构化抽取正常。
 
 好处：**提示词/封闭枚举/转换规则只有 worker 一份实现**（不会在 TS 里抄漂移），
 而且 provider 凭据**不必下发子进程**。
@@ -359,7 +472,166 @@ worker 外壳统一保证协议格式与退出码。
 
 ## 9. 不做什么（边界）
 
-- **不碰存储**：worker 不连 SQLite、不写数据库（TS 负责）
+- **不碰存储**：worker 不连课程知识库的 SQLite、不写数据库（TS 负责）
 - **不读凭据**：LLM/云 ASR 凭据一律从 job 参数来（Node 下发）
 - **不编排**：任务队列/SSE/重试策略在 Node；worker 只做一次"输入 → 输出"
 - **不假装成功**：能力不足一律 `{ok:false, reason}` 或 `error` 帧（铁律 R3）
+
+---
+
+## 10. 学生 SQL 沙箱（`sandbox.*`）
+
+契约：`docs/SETTINGS_AND_SANDBOX.md` §3 + **`docs/LAB_DB_DEPLOY.md`**（引擎抽象 / CRUD / 日志）。
+
+**为什么执行放 worker**：`better-sqlite3` 是**同步**的 —— 学生在浏览器里跑
+`WITH RECURSIVE` 死循环会**卡死 Node 事件循环**（`/health` 不再响应）。
+所以每次执行都在**独立子进程**里，父进程用 `subprocess(timeout=)` + `kill()`
+做**进程级硬超时**（三层：SQLite `progress_handler` → 子进程 deadline → **父进程 kill**）。
+
+### 10.1 job 一览
+
+| job | 入参 | 出参要点 |
+|---|---|---|
+| `sandbox.engines` | `{root?}` | 逐引擎**真探测**上报 + 日志源能力；不可用必给 `reason` + 文档章节 |
+| `sandbox.datasets` | `{with_sql?}` | `sc` / `employees` / `orders`（含教学点与方言说明） |
+| `sandbox.init` | `{user_id, session_id, dataset?, root?}` | 建/取会话；`created` 区分"新建/复用"；带 `schema` + `capabilities` |
+| `sandbox.reset` | 同上 | **真 reset**：先 DROP 掉库里**所有**用户表，再重建数据集 |
+| `sandbox.exec` | `{user_id, session_id, sql, multi?, max_rows?, timeout_ms?}` | `{columns, rows, rowCount, truncated, elapsedMs, affected?, ok, error?}`；`multi:true` 时 `statements[]` 逐条回报；事务见 §10.1.1 |
+| `sandbox.schema` | `{user_id, session_id, with_text?}` | `{dialect, tables:[{name, columns:[{name,type,pk,notnull,fk}], rows}]}` |
+| `sandbox.history` | `{user_id, session_id, limit?, request_user_id?}` | `[{at, sql, ok, error?, rowCount?, elapsedMs?}]`（**只读 + 隔离**） |
+| `sandbox.logs` | `{…, limit?, since?, with_text?, request_user_id?}` | `{source, entries:[LogEntry], count, boundary?, text?}`（L1） |
+
+### 10.1.1 ★ 事务：**同一次执行内可用，跨调用不支持**（如实说明，别当成 bug 去"修"）
+
+```jsonc
+// ✅ 正确用法：整批语句放**同一次**请求（multi:true）—— 同进程同连接，语义完全正确
+{"job":"sandbox.exec","sql":"BEGIN; INSERT INTO students(sid,sname) VALUES(555,'x'); ROLLBACK;",
+ "multi":true, ...}
+//   ROLLBACK 版：行数**不变**；COMMIT 版：行数 **+1**（两条都有测试）
+
+// ❌ 跨调用（单发）会**被明确拒绝**，而不是假成功
+{"job":"sandbox.exec","sql":"BEGIN"}       // → ok:false, error.code="E_SQL_UNSUPPORTED"
+{"job":"sandbox.exec","sql":"ROLLBACK"}    // → 同上（不会出现"no transaction is active"这种底层错）
+```
+
+**为什么不做跨调用事务**（架构取舍，不是没做）：
+每次执行都是**独立进程 + 独立连接**，这是**两条安全属性的前提** ——
+① **硬超时能真杀**（`WITH RECURSIVE` 死循环不拖死服务）；② **学生之间天然隔离**（无共享连接状态）。
+为了一个语法糖引入会话级长连接，等于**拿两条安全属性换一个便利**。→ 不换。
+
+**原 bug（backend-api 独立复现）**：单发 `BEGIN` 报 `ok:true`、`INSERT` 报 `ok:true`、
+随后 `ROLLBACK` 报 `cannot rollback - no transaction is active`，**而数据已被提交**
+（期望 1 行、实际 2 行）—— "看起来成功"的最坏形态。现在单发即拒：
+
+```jsonc
+{"ok":false, "txUnsupported":true,
+ "error":{"code":"E_SQL_UNSUPPORTED",
+   "message":"沙箱每次执行都是独立进程，事务状态无法跨调用保留 → 单发的 BEGIN 不会生效（后续语句会被立即提交）",
+   "localReading":"沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）",
+   "hint":"做事务实验请把整批语句放进**同一次**请求：{\"sql\":\"BEGIN; INSERT …; ROLLBACK;\",\"multi\":true}（已实测可用）；或用 sandbox.reset 恢复初始数据",
+   "who":"rules"}}
+```
+`who:"rules"` = **规则限制，不是学生的错**（与 S4 的责任方枚举一致）。
+`/capabilities` 也如实上报（**不再是裸 bool**）：
+
+```jsonc
+"capabilities": {"crud":true, "ddl":true, "procedures":false, "maxRowsDefault":200,
+  "transactions": {"same_call":true, "cross_call":false, "batch_param":"multi",
+    "note":"事务需在**同一次执行内**完成（每次 execute 独立进程 —— 这是硬超时强杀与学生隔离的前提）"}}
+```
+
+### 10.2 安全（**每条都有负例测试**）
+
+| 手段 | 实现 |
+|---|---|
+| **路径隔离** | 库只能是 `data/sandbox/<user>/<session>.sqlite3`；`resolve()` 后判前缀；id 仅允许字母数字下划线连字符汉字（挡 `..`、`/`、Windows 保留名） |
+| **不信任客户端 `db_path`** | 引擎只用 `user_id`+`session_id` 推导路径；不一致 → `E_SANDBOX_PATH`（exit 2）；自省/日志同样过路径闸 |
+| **单条语句** | 字符串/注释外的第二个 `;` → `E_SQL_MULTI` |
+| **批次（事务实验）** | `multi:true` 时**逐条**过同一个闸（`BEGIN; UPDATE…; ROLLBACK;`） |
+| **禁 `ATTACH`/`DETACH`** | 词法闸 + SQLite `set_authorizer`（两道） |
+| **禁 `load_extension`** | 词法闸 + `enable_load_extension(False)` + authorizer |
+| **PRAGMA 白名单** | 只放只读自省类；`writable_schema`/`temp_store_directory`/`journal_mode` 直接拒 |
+| **其他引擎越权面** | `LOAD DATA`/`INTO OUTFILE`/`pg_read_file`/`COPY…PROGRAM`/`lo_import` 全拒（服务器类引擎接入后同样适用） |
+| **外键固定开启** | 装 authorizer 之前 `PRAGMA foreign_keys=ON`（与 MySQL 对齐；学生不能关） |
+| **行数/大小上限** | `max_rows`（默认 200，上限 5000）+ 库文件上限（超出 `ROLLBACK` + `E_SANDBOX_SIZE`） |
+| **审计** | 每次执行（含**被闸拒绝**的）O_APPEND 到 `<session>.audit.jsonl`（进程被杀也不丢） |
+| **日志隔离 + 脱敏** | `request_user_id` 必须等于会话所有者；所有文本过 `redact()` |
+
+### 10.3 错误语义（Node 侧请注意）
+
+* **学生 SQL 写错** → `sandbox.exec` 仍 **exit 0**，错误在 `data.error`（`ok:false`）。
+  这是"这条 SQL 失败"，不是"job 失败" —— UI 要展示给学生。
+* `data.error = {code, message, raw, hint, localReading, localMatched, killedBy?, hardKilled?}`
+  * **`message` 是引擎原文一字不改**（`near "FROM": syntax error`、`no such table: student`）；
+  * `localReading`/`hint` 是**本地确定性解读**（模型不可用时也能诚实降级）。
+* **超时**：`E_SQL_TIMEOUT`；`killedBy: "progress"`（SQLite 层先中断）或 `"process"`
+  （**父进程硬杀**，`hardKilled:true`）；两种情况都不阻塞后续执行。
+  * 这条信息**也落进审计**：`sandbox.history` 的记录带 `killedBy`/`hardKilled`/`timeoutMs`，
+    `sandbox.logs` 的 `entry.context` 同样带 —— S4 才能准确说"你的递归 CTE 是被超时
+    停掉的，不是语法错"。**`hardKilled` 与 `killedBy` 恒自洽**（`progress` ⇒ `false`，
+    `process` ⇒ `true`，有断言）。
+  * 超时条目的 `hint` 是**确定性**文案（递归要有终止条件 + 先加 LIMIT 试小范围），
+    不靠正则去匹配人话文本。
+* **入参/路径类** → exit **2**（`E_SANDBOX_PATH` / `E_PAYLOAD`）；
+  **引擎不可用** → exit **1** + `E_ENGINE_UNAVAILABLE`（reason 指向部署文档）。
+
+### 10.4 引擎可插拔 + 日志源
+
+* `DatabaseEngine`（`engine.py`）与 `LogSource`（`logs.py`）是**两个并列契约**，
+  注册方式一致；**加引擎/日志源 = 注册一个对象**，上层不改（测试用"假引擎"证明）。
+* 默认 **SQLite**（`embedded`，永远可用）；MySQL / PostgreSQL / openGauss
+  **只做诚实降级**：`available:false` + 原因 + 指向 `docs/LAB_DB_DEPLOY.md` §4.x。
+  配置读 `scripts/deploy-lab-db.sh` 写的 `.env`
+  （`LAB_DB_ENGINE` / `LAB_DB_HOST` / `LAB_DB_PORT` / `LAB_DB_NAME` / `LAB_DB_USER`
+  + `LAB_PG_PASSWORD` / `LAB_MYSQL_PASSWORD` / `LAB_OG_PASSWORD`）——
+  **密码只判断"在不在"，绝不读取/落盘/进事件流**。
+* 日志层次：SQLite **只有 L1**（引擎原文报错 + 我们的 audit_log）；
+  **没有 L2/L3**（嵌入式引擎无实例视图、无日志文件）→ `boundary` 字段明确要求 agent
+  「读不到引擎日志就如实说，不许假装看过」。
+
+## 11. 多引擎沙箱：**已验证 / 未验证**清单（如实交付的一部分）
+
+> 本机事实：**没有 MySQL / PostgreSQL / openGauss**，**没有 Docker**（不装）。
+> 所以「未验证」里**能验的部分已全部验掉**（契约层、错误路径、脚本自检），
+> 真连真跑的部分**列成可照做的步骤** —— 运维照着跑就能验，而不是只看到"未验证"四个字。
+
+### 11.1 已在本机验证（真跑，不是推断）
+
+| # | 项目 | 判据（实测） |
+|---|---|---|
+| 1 | 引擎注册表如实上报 | `sandbox.engines` → mysql/postgres/opengauss `available:false` + reason 指向 `docs/LAB_DB_DEPLOY.md §4.x`；sqlite `available:true` |
+| 2 | **未安装引擎不静默回退** | 三引擎 `sandbox.exec` → **exit 1 + `E_ENGINE_UNAVAILABLE`**；且沙箱目录**没有产生任何文件**（回退的物理证据） |
+| 3 | 方言标注与实际引擎一致 | `sandbox.init/schema/exec` 均报 `engine:"sqlite"` + `dialect:"sqlite"`；`schema` 指定 postgres → `E_ENGINE_UNAVAILABLE`（不拿 sqlite 的 schema 冒充） |
+| 4 | 凭据如实报缺失、**绝不回显** | 设 `LAB_PG_PASSWORD=<秘密>` 跑 → 输出里**搜不到该值**；缺密码时 reason 点名 `LAB_MYSQL_PASSWORD` |
+| 5 | 日志层能力如实 | `logSources`: sqlite `layers:["L1"]`、available；三 server 引擎 `layers:[]` + reason |
+| 6 | 可插拔性（**结构断言**） | 核心模块（exec/guard/schema/datasets/history/errmsg）**零** `engine == "..."` 分支；新增引擎只需 `register_engine()`（测试断言 `register_engine` 只接受一个对象） |
+| 7 | 结果里的 `engine` 标签**不硬编码** | 改前 `exec.py` 4 处写死 `"sqlite"`（接 MySQL 后标签会撒谎）→ 现在由引擎实例透传，测试直接断言 `execute(..., engine_id="mysql")` 返回 `engine:"mysql"` |
+| 8 | 部署脚本语法 | `bash -n scripts/deploy-lab-db.sh` → **exit 0** |
+| 9 | 部署脚本 `--dry-run` | sqlite/mysql/postgres → exit 0（打印 `[dry-run]` 命令，密码打码 `'***'`）；**opengauss → exit 3**（Ubuntu 上明确拒绝 + 理由） |
+| 10 | 部署脚本 `--check` 真自检 | sqlite → **exit 0**，真建表/插入/更新/回读/删除 + 报真实版本 3.45.1；mysql/postgres（有凭据、无客户端）→ **exit 4** `找不到 mysql/psql 客户端` |
+| 11 | 缺凭据 / 缺 TTY 的错误路径 | 无 TTY → exit 2 + `请改用：LAB_MYSQL_PASSWORD='...' ./scripts/deploy-lab-db.sh mysql` |
+| 12 | **缺 sudo / 缺包管理器** | 无 sudo → exit **1** + `需要 root 权限，但没有 sudo 命令。请以 root 身份运行；或加 --check 只做自检`；无 apt/dnf → exit **3** + `本机既没有 apt-get 也没有 dnf/yum…请按 docs/LAB_DB_DEPLOY.md §4 手工安装` |
+| 13 | 幂等性设计 | 代码证据：`CREATE USER IF NOT EXISTS`/`CREATE TABLE IF NOT EXISTS`、`pg_roles` 存在性检查 + `RAISE NOTICE '已存在 → 已更新密码与权限（幂等）'`、`pg_hba.conf` 行级 `grep -qF` 跳过、`.env` **upsert 不动其它键**、安装步骤 `已装则 apt/dnf 直接跳过`；脚本头声明"重复跑不报错、不重复建号" |
+| 14 | 退出码语义 | `EXIT_OK=0 / EXIT_FAIL=1 / EXIT_USAGE=2 / EXIT_UNSUPPORTED=3 / EXIT_SELFCHECK=4`（实测各分支与常量一致） |
+
+### 11.2 未验证清单（**照做就能验**）
+
+| 项目 | 为什么本机验不了 | 在有 DB 的机器上怎么验（具体命令） | 风险 |
+|---|---|---|---|
+| MySQL 真实执行（CRUD/事务/权限） | 本机无 MySQL；不装 Docker、不改系统 | `LAB_MYSQL_PASSWORD='…' bash scripts/deploy-lab-db.sh mysql -y`（末尾自检须 exit 0）→ 再 `python -m worker.cli --job sandbox.exec --in '{"engine":"mysql","user_id":"u1","session_id":"s1","sql":"SELECT 1 AS x"}'` → 期望 `engine:"mysql"`、`ok:true` | **高** |
+| PostgreSQL 真实执行 | 同上 | `LAB_PG_PASSWORD='…' bash scripts/deploy-lab-db.sh postgres -y` → `sandbox.schema`/`sandbox.exec` 同断言（`engine:"postgres"`） | **高** |
+| openGauss 真实执行 | 官方只支持 openEuler/CentOS；本机 Ubuntu + WSL | 在 openEuler 虚机/容器里 `bash scripts/deploy-lab-db.sh opengauss --check --host <host> --port 5432`；再跑同一批 `sandbox.exec` | 中 |
+| 服务器引擎上的**危险语句负例**（ATTACH / `load_extension` / 多语句 / GRANT） | 无 DB → 现在只会得到 `E_ENGINE_UNAVAILABLE`，**验不到**闸在真引擎上的行为 | 装好后跑 §10.2 那批负例 → 期望 `E_SQL_FORBIDDEN` / `E_SQL_MULTI`（**不是** `E_ENGINE_UNAVAILABLE`） | 中 |
+| 方言差异（`AUTO_INCREMENT` / `NOW()` / `LIMIT` 写法）的**引擎原生报错文案** | 无 DB（`hints` 的反向误导**已在 worker 侧修掉并断言**：`dialect_hints(sql, target_dialect)` 只对 sqlite 目标给 SQLite 建议） | 用 MySQL 方言 SQL 打 `sandbox.exec`（engine=mysql）→ 期望引擎**原生**错误文案（不是 SQLite 语法错），且 `hints == []` | 中 |
+| 跨调用事务拒绝在 server 引擎上同样生效 | 无 DB（逻辑在 `exec.py`，与引擎无关，但未在真 server 引擎上跑过） | 装好后单发 `{"engine":"mysql","sql":"BEGIN"}` → 期望 `E_SQL_UNSUPPORTED` + `who:"rules"` | 低 |
+| L2/L3 日志（slow log / `pg_stat_statements`） | adapter 未接入 + 无 DB | 按 `docs/LAB_DB_DEPLOY.md §8` 接 adapter → `sandbox.logs` 期望 `layers` 含 L2/L3、`status:"ok"`；`boundary` 不再说"该引擎没有 L2/L3" | 中 |
+| `--check` 的**真连通**（客户端在 + 服务在跑） | 本机无客户端 → 现在只验到"找不到客户端"这一层 | 装好后 `bash scripts/deploy-lab-db.sh mysql --check` → 期望 **exit 0** + 真查询回读（不是只看客户端存在） | 中 |
+| 部署脚本在 debian / rocky / openEuler 各分支的真安装 | 本机只有 WSL Ubuntu，且**不该改系统** | 目标发行版上先 `--dry-run` 核对命令 → 再真跑 → 期望 exit 0 且末尾自检通过（幂等：再跑一次输出一致） | 中 |
+| Node/TS 侧 `/capabilities.sandbox` 端到端 | `apps/server/**` 属 T-BACKEND 写域 | 由 backend-api 在真 HTTP 上验（worker 层字段已验：见 11.1 第 1/5 条） | 低 |
+
+### 11.3 结论（一句话）
+
+**契约层与错误路径：已验证**（14 项真跑）。
+**真连真跑：未验证**（10 项，逐项给了可执行命令）。
+没有任何一项是"看起来成功"—— 未安装引擎一律 `E_ENGINE_UNAVAILABLE`、缺客户端一律 exit 4、缺 sudo/包管理器一律 exit 1/3，**全部如实失败**。
+

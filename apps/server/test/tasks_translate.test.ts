@@ -428,12 +428,42 @@ test('★★ 回归：以 `.` 结尾的**证据句必须被翻译**（不被误�
   assert.equal(sent.includes('InnoDB provides MVCC.'), true, '证据句必须送译');
   assert.equal(sent.filter((t) => t.endsWith('.')).length, 2, '两条证据句都在送译列表里');
 
-  assert.equal(out.translate.kept_english, 1, '只有实体名 InnoDB 两条规则保留');
+  assert.equal(out.translate.kept_english, 1, '只有实体名 InnoDB 被规则保留');
   assert.equal(out.translate.translated, 4);
+  // 假 provider 返回 `<zh:原文>`（文本确实变了）→ unchanged 为 0
+  assert.equal(out.translate.unchanged_by_model, 0);
 
   // 证据译文确实落进了 meta
   const meta = JSON.parse(repo.getDocumentRow(docId)!.meta_json) as { translations_evidence: Record<string, string> };
   assert.equal(Object.keys(meta.translations_evidence).length, 2);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('★★ 回归：模型**原样回传**（文本没变）不算"已翻译"（真实数据跑出来的）', async () => {
+  const dir = tmpDir();
+  const { repo } = freshRepo();
+  const { docId } = seedDoc(repo);
+
+  // 模拟"模型按标识符规则原样回传"：`--allow-mismatches` 这类命令行参数
+  // （实测：translate 414 个实体名时，258 条被算作"已翻译"，其中一批其实原样返回）
+  const echoTranslate: TranslateFn = async (req) => ({
+    items: req.items.map((it) => ({ id: it.id, text: it.text, keptAsIs: false })),
+    usedProvider: 'llm-mt',
+  });
+
+  const handler = createTranslateHandler({ repo, db: repo.db, cfg: freshCfg(dir), translate: echoTranslate });
+  const out = (await handler(makeCtx(docId).ctx)) as { translate: Record<string, unknown> };
+
+  // 送译 4 条全部原样返回 → translated 必须为 0，且单列 unchanged_by_model
+  assert.equal(out.translate.translated, 0, '文本没变就不该算翻译');
+  assert.equal(out.translate.unchanged_by_model, 4);
+  assert.equal(out.translate.translated_ratio, 0);
+  assert.equal(out.translate.kept_english, 1, 'InnoDB 仍按规则保留');
+
+  // 原样返回的内容不落库（回写只写"文本确实变了"的）
+  const row = repo.db.get<{ name_zh: string }>('SELECT name_zh FROM entities WHERE name = ?', 'transaction');
+  assert.equal(String(row!.name_zh ?? ''), '', '原样回传不该当作译文写进 name_zh');
 
   fs.rmSync(dir, { recursive: true, force: true });
 });

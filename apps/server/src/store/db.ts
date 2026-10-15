@@ -275,6 +275,25 @@ CREATE INDEX IF NOT EXISTS idx_task_priority ON tasks(status, priority, created_
 CREATE INDEX IF NOT EXISTS idx_task_user ON tasks(user_id, status);
 `;
 
+/**
+ * 迁移 v3：`embeddings` 空表（`docs/RETRIEVAL.md`：rag 只留接口，**表先建、不填数据**）。
+ *
+ * 为什么现在建：rag retriever 的 `healthCheck()` 要如实回答"为什么不可用"——
+ * "没有 embedding provider" 与 "表都不存在" 是**两种不同的 reason**，不能混成一句。
+ */
+const DDL_V3_EMBEDDINGS = `
+CREATE TABLE IF NOT EXISTS embeddings (
+  model TEXT NOT NULL,
+  ref_kind TEXT NOT NULL,
+  ref_id TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  vector BLOB,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (model, ref_kind, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_ref ON embeddings(ref_kind, ref_id);
+`;
+
 export interface SearchRow {
   id: string;
   doc_id: string;
@@ -341,6 +360,12 @@ export class Db {
       this.db
         .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
         .run(2, 'rbac_v1_section3', Date.now());
+    }
+    if (!applied.has(3)) {
+      this.db.exec(DDL_V3_EMBEDDINGS);
+      this.db
+        .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
+        .run(3, 'retrieval_embeddings_table', Date.now());
     }
     return Math.max(1, ...applied);
   }

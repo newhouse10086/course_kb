@@ -26,7 +26,7 @@ from typing import Any
 
 from worker.sandbox import history as history_mod
 from worker.sandbox.errmsg import interpret_error
-from worker.sandbox.guard import check_sql, dialect_hints
+from worker.sandbox.guard import check_sql, dialect_hints, is_tx_control
 from worker.sandbox.paths import SandboxRoots
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,31 +54,72 @@ def _popen_kwargs() -> dict[str, Any]:
 def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
             timeout_ms: int = 5_000, user_id: str = "", session_id: str = "",
             allow_multi: bool = False, root: str | Path | None = None,
-            max_db_bytes: int | None = None, record_history: bool = True) -> dict[str, Any]:
+            max_db_bytes: int | None = None, record_history: bool = True,
+            engine_id: str = "sqlite", target_dialect: str = "sqlite") -> dict[str, Any]:
     """执行一条（或一批显式分隔的）SQL，返回 ``ExecResult`` 形状的字典。
 
     结果里有两个**给人看**的额外字段（S4 答疑要用）：
     * ``error.message`` —— **引擎原文**（一字不改）
     * ``error.hint``    —— 本地确定性解读（如"表不存在 → 先看 sqlite_master"）
+
+    ⚠️ **原错误写法**：结果里的 ``engine`` 字段曾**硬编码 "sqlite"** ——
+    一旦接入 MySQL/PG，标签就会**撒谎**（学生以为在练 MySQL，结果里写着 sqlite）。
+    现在由调用方（引擎实例）传入 ``engine_id``，**标签只能来自真正执行的引擎**。
     """
     roots = SandboxRoots.resolve(root)
     path = roots.validate(db_path)
-    hints = dialect_hints(sql)
+    # ★ 方言提示按**目标引擎方言**分派：对 MySQL 目标不能给 SQLite 建议
+    hints = dialect_hints(sql, target_dialect=target_dialect)
 
     # ① 词法闸（第一道）—— 不通过就不执行，并且**仍然记审计**（学生试过什么很重要）
     verdict = check_sql(sql, allow_multi=allow_multi)
     if not verdict.ok:
         result = {
             "columns": [], "rows": [], "rowCount": 0, "elapsedMs": 0,
-            "engine": "sqlite", "hints": hints,
+            "engine": engine_id, "hints": hints, "ok": False,
+            "killedBy": None, "hardKilled": False,
             "error": {"code": verdict.code, "message": verdict.msg, "raw": verdict.msg,
-                      "hint": "该语句被沙箱安全策略拒绝（并非 SQL 写错）"},
+                      "hint": "该语句被沙箱安全策略拒绝（并非 SQL 写错）",
+                      "localReading": verdict.msg, "localMatched": False},
         }
         if record_history:
             _record(roots, user_id, session_id, sql=sql, ok=False,
                     error=verdict.msg, code=verdict.code, kind=verdict.kind, elapsed_ms=0,
                     row_count=0)
         return result
+
+    # ①b ★**单独发**的事务控制语句：诚实拒绝（不是静默失败、也不是假成功）
+    #    为什么必须拒：每次执行都是**独立进程 + 独立连接**（这是硬超时安全的代价），
+    #    所以 `BEGIN` 开的事务在连接关闭时就没了 —— 单发 BEGIN 报成功，随后 ROLLBACK
+    #    报 "no transaction is active"，而中间的 INSERT **已被提交**（backend-api 独立复现：
+    #    期望 1 行、实际 2 行）。这是"看起来成功"的最坏形态，必须显式说清。
+    #    同一次调用内的批次（`multi:true`）**事务语义完全正确**，所以引导到批次。
+    if not allow_multi and is_tx_control(verdict.kind):
+        msg = ("沙箱每次执行都是独立进程，事务状态无法跨调用保留 → "
+               f"单发的 {verdict.kind} 不会生效（后续语句会被立即提交）")
+        if record_history:
+            _record(roots, user_id, session_id, sql=sql, ok=False, error=msg,
+                    code="E_SQL_UNSUPPORTED", kind=verdict.kind, elapsed_ms=0, row_count=0)
+        return {
+            "columns": [], "rows": [], "rowCount": 0, "elapsedMs": 0,
+            "engine": engine_id, "hints": hints, "ok": False,
+            "killedBy": None, "hardKilled": False, "txUnsupported": True,
+            "error": {
+                "code": "E_SQL_UNSUPPORTED",
+                "message": msg,
+                "raw": msg,
+                # ★ 文案里带**为什么**（教学场景里解释本身有价值 —— Lead 裁定），
+                #   并给出**可操作**的替代写法；与 HTTP 层闸的文案对齐（同码同 who）
+                "hint": ("本沙箱**每次执行都在独立进程中运行**（这是硬超时能强杀死循环查询、"
+                         "且学生之间互不影响的前提），因此事务必须在**同一次执行内**完成。"
+                         "做事务实验请把整批语句放进同一次请求："
+                         '{"sql":"BEGIN; INSERT INTO … ; ROLLBACK;","multi":true}（已实测可用）；'
+                         "或用 sandbox.reset 恢复初始数据"),
+                "localReading": "沙箱不支持**跨调用**事务（不是你的 SQL 写错了，也不是语法错）",
+                "localMatched": True,
+                "who": "rules",
+            },
+        }
 
     payload = {
         "db_path": str(path),
@@ -120,7 +161,7 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     if timed_out:
         result = {
             "columns": [], "rows": [], "rowCount": 0, "elapsedMs": elapsed_ms,
-            "engine": "sqlite", "hints": hints, "hardKilled": True, "killedBy": "process",
+            "engine": engine_id, "hints": hints, "hardKilled": True, "killedBy": "process",
             "error": {
                 "code": "E_SQL_TIMEOUT",
                 "message": f"执行超过 {timeout_ms}ms，**进程已被硬杀**（进程级超时）",
@@ -132,7 +173,10 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
         if record_history:
             _record(roots, user_id, session_id, sql=sql, ok=False,
                     error="E_SQL_TIMEOUT（进程被硬杀）", code="E_SQL_TIMEOUT",
-                    kind=verdict.kind, elapsed_ms=elapsed_ms, row_count=0, hard_killed=True)
+                    kind=verdict.kind, elapsed_ms=elapsed_ms, row_count=0,
+                    # ★ 审计要留下"是被硬杀的" —— S4 答疑靠它说清
+                    #   "你的递归 CTE 是被超时停掉的，不是语法错"（pi-bridge 的 P1）
+                    hard_killed=True, killed_by="process", timeout_ms=timeout_ms)
         return result
 
     parsed: dict[str, Any] | None = None
@@ -151,15 +195,21 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
             "hint": "沙箱执行体自身出错；这不是学生 SQL 的问题",
         }
         result = {"columns": [], "rows": [], "rowCount": 0, "elapsedMs": elapsed_ms,
-                  "engine": "sqlite", "hints": hints, "error": err}
+                  "engine": engine_id, "hints": hints, "error": err}
         if record_history:
             _record(roots, user_id, session_id, sql=sql, ok=False, error=err["message"],
                     code=err["code"], kind=verdict.kind, elapsed_ms=elapsed_ms, row_count=0)
         return result
 
     result = dict(parsed)
-    result.setdefault("engine", "sqlite")
-    result["hints"] = hints or result.get("hints") or []
+    # ★ 标签以**父进程传入的 engine_id 为准**（原错误写法：setdefault("engine","sqlite")）
+    #   子进程（runner）不设这个字段，所以 setdefault 会让 MySQL 的结果写着 sqlite
+    result["engine"] = engine_id
+    # ★ 方言提示也以**父进程**为准（只有它知道目标方言）。
+    #   ⚠️ 原写法 `hints or result.get("hints") or []` 有坑：**空列表是有意义的**
+    #   （"该目标方言没有提示"），`or` 把它当"缺失"→ 回落到子进程按 **SQLite** 算的提示
+    #   → MySQL 目标又收到 SQLite 建议（反向误导）。判"缺失"要用 `is None`。
+    result["hints"] = hints if hints is not None else (result.get("hints") or [])
     result.setdefault("elapsedMs", elapsed_ms)
     if proc.returncode not in (0,) and not result.get("error"):
         result["error"] = {
@@ -172,23 +222,51 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     # ② 错误附带**引擎原文 + 本地解读**（S4 的核心输入）
     err = result.get("error")
     if isinstance(err, dict):
-        raw = str(err.get("raw") or err.get("message") or "")
+        raw = str(err.get("raw") or "")
+        if not raw:
+            raw = str(err.get("msg") or err.get("message") or "")
         interp = interpret_error(raw)
+        child_msg = str(err.get("msg") or err.get("message") or "")
+        is_timeout = err.get("code") == "E_SQL_TIMEOUT"
+        if is_timeout:
+            # 子进程的 progress_handler 先触发 → 干净超时（父进程 kill 仍在待命）
+            err["message"] = (f"执行超过 {timeout_ms}ms 被中断"
+                              f"（SQLite progress_handler；父进程 {KILL_GRACE_S}s 后硬杀）")
+            err["killedBy"] = "progress"
+            err["hardKilled"] = False
+        else:
+            # ★ 原文优先：S4 必须拿到 `near "FROM": syntax error` 这种**一字不改**的文本
+            err["message"] = raw or child_msg
         err["raw"] = raw
-        err["message"] = raw or err.get("message", "")     # ★ 原文优先，不改写
-        err["hint"] = err.get("hint") or interp.hint
+        err.setdefault("hint", interp.hint)
         err["localReading"] = interp.message
         err["localMatched"] = interp.matched
+        err.pop("msg", None)
+        # 顶层也带一份（Node 侧不用深挖 error 就能判断"是不是被硬杀"）
+        result["killedBy"] = err.get("killedBy")
+        result["hardKilled"] = bool(err.get("hardKilled"))
     result["ok"] = not err
 
     if record_history:
+        err_code = (err or {}).get("code") if isinstance(err, dict) else None
+        err_msg = (err or {}).get("message") if isinstance(err, dict) else None
+        if err_code == "E_SQL_TIMEOUT" and err_msg:
+            # 让审计里的 error 文本也带码（两种超时路径格式统一，便于 grep/统计）
+            err_msg = f"E_SQL_TIMEOUT：{err_msg}"
         _record(roots, user_id, session_id, sql=sql, ok=result["ok"],
-                error=(err or {}).get("message") if isinstance(err, dict) else None,
-                code=(err or {}).get("code") if isinstance(err, dict) else None,
+                error=err_msg,
+                code=err_code,
                 kind=verdict.kind, elapsed_ms=result.get("elapsedMs", elapsed_ms),
                 row_count=result.get("rowCount", 0),
                 affected=result.get("affected"),
-                statements=result.get("statements"))
+                statements=result.get("statements"),
+                # ★ 超时信息一并落审计：S4 的 `sandbox.logs`/`sandbox.history` 要能
+                #   告诉学生"是被超时停掉的，不是你语法错"（progress=SQLite 层中断，
+                #   process=父进程硬杀）。⚠️ hardKilled 必须取**实际结果**，
+                #   不能一律写 True —— progress 路径并没有杀进程（实测抓出过这个不一致）
+                **({"killed_by": result.get("killedBy"),
+                    "hard_killed": bool(result.get("hardKilled")),
+                    "timeout_ms": timeout_ms} if err_code == "E_SQL_TIMEOUT" else {}))
     return result
 
 
