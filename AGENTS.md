@@ -86,9 +86,16 @@ course-kb/
 │   ├─ pipeline/          units/xref/search（**已验证的算法，别重写**）
 │   ├─ models/            Python 数据模型
 │   └─ tests/
-├─ web/                   ⚠️ v1 原生 HTML/JS，**将被 Vue3 取代**（参考用）
 └─ data/                  运行期
 ```
+
+> ⚠️ **v1 前端 `web/`（原生 HTML/JS）已于本轮删除** —— 已被 `apps/web`（Vue3）完全取代。
+> **删除依据**：① v2 服务端**没挂它**（连它自己推荐的 URL 都是死链）；
+> ② 它的配色是 `docs/DESIGN_SYSTEM.md` **点名的反例**（`#fff` 面板 / `#2f5fd0` 蓝）——
+> 与 v2 是**两套视觉语言**；③ `apps/web` 是它的功能超集（逐文件核对）。
+> **历史保留**：`git show 78798a3:web/<path>` 可取回。
+> ★ 删除前**先搬走了 `chat.html` 的 4 条行为**（其中"1013/1008 关闭码不再重连"是**真 bug**）——
+> **"先问再删"捞回了东西，不是流程冗余。**
 
 ### 写域规则（**硬约束**）
 
@@ -130,6 +137,7 @@ course-kb/
 | **20** | ★★ **用 PowerShell 文本管线改源码 → 中文注释整份变乱码**（`Get-Content \| Set-Content` 按 ANSI/带 BOM 重写，UTF-8 中文必坏） | **源码批量替换禁止走 PowerShell 文本管线**：用 `edit`/`write` 工具，或 Node/Python 的**显式 UTF-8 读写**。<br>⚠️ **它不会立刻报错** —— 文件写"成功"了，直到下一次 `node --test` 才炸，**而且报的是 `SyntaxError`（中文字符串里的引号被破坏）→ 极易误判成代码逻辑问题**。<br>**本坑一轮内被两个不同的人各踩一次**（`backend-api` 改 `capabilities.ts`、`kg-rag-architect` 改测试文件），两人都靠 `git checkout HEAD -- <file>` 恢复后用 `edit` 重做。 |
 | **21** | ★★ **自述字段（`*_source` / `*_status` / `*_warning`）与实际生效值不同源 → 它会在两个方向上都撒谎** | **判据：实际值（如 `ready.tools`）是唯一真相；自述字段只是标签。** 必须加**同源断言**：`tools_source='kb-readonly'` → `tools` 必须含 KB 工具；`='disabled-by-role'` → `tools` 必须 `=== []`；**反向**：`tools` 非空 → `source` 不许是"已关闭"。<br>**实证（同一 bug 的三个实例，都真实发生）**：<br>· `tools_source:'none'` 但实际拿到 4 个危险工具 → **说关了其实开着**（🔴 安全事故：学生能执行 shell）<br>· `tools_source:'kb-readonly'` 但 `tools:[]` → **说开了其实关着**（功能失效，模型直接说"没有这两个工具"）<br>· **`context` 帧回报 `used/resolved`（"用了"），但解析出的标题根本没拼进 prompt** → 问"我在看哪一章"，模型答"我读不到你的浏览状态"（**说用了其实没用**）<br>⚠️ **后两个只有真 WS 端到端能抓到** —— 单元测试与 `/capabilities` 断言**全绿**。<br>**推广**："同源"不止 `tools_source` —— **任何 `used` / `resolved` / `x_available` / `x_enabled` 都要有"真的用上了"的证据**（如：断言它**真的出现在发给模型的这一轮消息里**）。<br>与坑 19（缓存冻住实时字段）、`available`/`dataReady` 正交、`interim` 缺字段**同族**：**都是"上报的东西必须是真的"**。 |
 | **22** | ★★ **`空` ≠ `缺失`** —— `x or y or []` 把**有意义的空列表**当成"没有值" | **判"缺失"必须用 `is None`**，不能用真假值。<br>**实证**：`hints or result.get("hints") or []` —— **空列表是有意义的**（"该方言没有提示"），`or` 把它当缺失 → 回落到子进程按 SQLite 算的提示 → **反向误导又回来了**（真 MySQL 上 `NOW()` 本来就正确，却给了"改用 SQLite 写法"的建议）。<br>同族：`interim` 缺字段被当假值 · `tools_source` 缺字段被当"已关闭"。**"没有这个说法"和"明确说是空"语义不同。** |
+| **25** | ★★ **Vite 构建通过 ≠ 页面能渲染** —— `<script setup>` 顶层 `await import()` 会让组件变成 **async setup**，整页渲染不出来 | **`<script setup>` 里禁止顶层 `await`**（除 `<Suspense>` 包裹）；改**静态导入**。<br>**实证**：`Chat.vue` 用了顶层 `await import()` → `vue-tsc` **0 错**、`vite build` **通过**，但 e2e **直接 timed out**（页面空白）。改静态导入后 DOM 断言 243/243。<br>**判据**：**构建期检查（tsc/build）覆盖不了运行期渲染** —— 与坑 19/21「不走真实路径就测不出」同族。<br>**必须用 headless DOM 断言真实渲染**，不能只靠 typecheck/build。 |
 | **24** | ★★ **"死旋钮"：配置项被文档/类型承诺可配，代码却从不读它** | **比"没有这个配置"更坏** —— 运维按注释配了**以为生效了**，实际撞硬编码默认值。<br>**实证**：`providers/llm/openai_compatible.ts` 硬编码 `setTimeout(…, 120_000)`；<br>而 `types.ts` 注释写"其它可选参数（如 `timeoutMs`）"，但 `extra` **只读了 `maxContextTokens`** → **`timeoutMs` 是死旋钮**。<br>**同族**：`ExtractDocumentRequest.maxTokens` **只有声明、没有调用方** → 抽取恒用 4096（**声明 ≠ 生效**）。<br>**判据**：**"能配"和"真的会生效"是两件事** —— 与"能读/真的读到"（坑 21）同族。<br>**修法**：要么让它**真的生效**（并断言**请求体里的值**，不是断言"我们传了参数"），要么**删掉那句承诺**。**不许留着"承诺但不生效"。**<br>⚠️ **排查手段**：给一个**极小值**看是否立刻触发 → 证明它真的被读。 |
 | **23** | ★ **本机 `bash` 是 WSL，而 Windows→WSL 不自动透传环境变量**（只透传 `WSLENV` 里列的） | 从 Windows 侧用 `env=X bash script.sh` 注入的变量**到不了 Linux 侧** → 脚本报"没有 TTY/读不到变量"，**看起来像脚本的 bug**。<br>**验法**：改成在 bash 内部设置 —— `X=值 bash script.sh`（在 WSL 命令行里），或先 `export WSLENV=...`。<br>**本机实测**：`C:\WINDOWS\system32\bash.EXE`；同一脚本从 Python 注入密码 → 报错；在 bash 内部设置 → 立刻正常。**任何人从 Windows 侧验 shell 脚本都会踩到。** |
 | 10 | 能力不可用**假装可用** | **Provider 层强制**：`configured` vs `available` 分开 + 可读 `reason` |
