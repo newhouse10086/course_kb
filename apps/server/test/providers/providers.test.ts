@@ -352,12 +352,39 @@ describe('LLM provider', () => {
     );
   });
 
-  test('capabilities 声明 jsonSchemaStrict=true（坑 4：不用 json_object）', () => {
+  /**
+   * ★★ **能力上报不许无条件乐观**（坑 10「能力不可用假装可用」+ 坑 24「声明 ≠ 生效」）。
+   *
+   * ## 原测试为什么被改（**原断言本身编码了缺陷**）
+   * 原实现无条件写 `structuredOutput: true` / `jsonSchemaStrict: true`，本测试就断言这两个 `true`。
+   * 但**实测该端点**（同一端点、时间相邻的 3 次调用）：
+   * ```
+   * 裸 schema + strict:true            → 200（**strict 被忽略**）
+   * 真 strict schema（required + …）   → **400** `This response_format type is unavailable now`
+   * ```
+   * ⟹ 无条件 `true` 是**假绿的能力声明** —— 任何依赖它的代码都会以为"结构化输出有保证"。
+   * 现在：初始值 = **false（未验证）** + 可读 `structuredOutputReason`；
+   * **真实调用结果**写回（strict 成功 → true；被拒回落 → false + 端点原始文案）—— 同源（坑 21）。
+   *
+   * ★ 坑 4 的**真正判据**（"必须用 `json_schema` + `strict:true`，不许退回 `json_object`"）
+   * 断言在**真实请求体**上 —— 见 `test/providers_llm_structured_fallback.test.ts`
+   * （它断言第 1 次请求带严格 schema、第 2 次回落裸 schema，且 `strict:true` 始终在）。
+   */
+  test('★ capabilities **不无条件**声称支持严格结构化输出（未验证 → false + 可读 reason）', () => {
     const llm = new OpenAiCompatibleLlm({
       baseUrl: 'https://example.com/v1', apiKey: 'sk-test1234567890', model: 'm',
     });
-    assert.equal(llm.info.capabilities.jsonSchemaStrict, true);
-    assert.equal(llm.info.capabilities.structuredOutput, true);
+    assert.equal(
+      llm.info.capabilities.structuredOutput,
+      false,
+      '★ 未验证不许声称 true（原实现无条件 true = 坑 10：能力不可用假装可用）',
+    );
+    assert.equal(llm.info.capabilities.jsonSchemaStrict, false, '★ 同上');
+    assert.match(
+      String(llm.info.capabilities.structuredOutputReason),
+      /尚未验证/,
+      '★ 必须给出可读的未验证原因（前端/运维据此理解"为什么不是 true"）',
+    );
     assert.equal(llm.info.limits?.concurrency, 1, 'limits 必须声明并发=1');
   });
 

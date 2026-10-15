@@ -53,6 +53,15 @@ export const ERROR_HTTP = {
   E_MODEL_BUSY: 409,
   /** 切换后**真探测新模型失败** → 已回滚到旧模型（502：上游不可用，可重试/换模型）。 */
   E_MODEL_PROBE: 502,
+  // ── 会话命名（docs/SESSION_NAMING.md §3.2）──
+  /**
+   * ★ `title_source === 'user'` 时 AI 命名被拒绝（409）。
+   *
+   * 为什么必须**显式拒绝**而不是静默跳过：用户点了"生成名字"却什么都没发生，
+   * 会被当成 bug（契约 §3.2①）。带 409 + 可读 `msg`（"该会话名由你手动设定，未被 AI 覆盖"）
+   * 才能让前端如实提示。
+   */
+  E_TITLE_USER_SET: 409,
   // ── 内部 ──
   E_INTERNAL: 500,
 } as const;

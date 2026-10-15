@@ -22,6 +22,15 @@ import { can, reasonOf } from '../auth/permissions.ts';
 import { requireUser, scopeFor, GLOBAL } from '../auth/middleware.ts';
 import { isRole, type Action, type Resource } from '../auth/types.ts';
 import { intParam, pageParams, sendError, strParam } from './util.ts';
+import {
+  buildTitleMessages,
+  cleanGeneratedTitle,
+  pickNamingInput,
+  titleFromModelData,
+  TITLE_GEN_MAX_TOKENS,
+  TITLE_MAX_CHARS,
+  TITLE_SCHEMA,
+} from './conversation-title.ts';
 
 /** 判定 → 抛 403（`reason` 是给人看的，但**不含资源细节**）。 */
 function ensure(req: FastifyRequest, action: Action, resource: Resource, deps: AppDeps): void {
@@ -310,6 +319,137 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
       const conv = repo.rbac.getConversation(user.id, id);
       if (!conv) throw notFound('会话', id);
       return reply.send({ conversation: conv });
+    } catch (err) {
+      return sendError(reply, err);
+    }
+  });
+
+  /**
+   * ★ **重命名**（契约 `docs/SESSION_NAMING.md` §3.1）。
+   *
+   * ```
+   * ① 归属 fail-closed：条件写在 SQL 的 `user_id = ?` 里；**不可见 → 404（不泄露存在性）**
+   *    （与 reparse 端点同策略：别人的会话一律 404，不是 403）
+   * ② trim 后 1..80；全空白 / 超长 → **400**（**不静默截断**）
+   * ③ 设定后 `title_source='user'` ⟹ ★ **AI 永远不许再覆盖**（铁律）
+   * ④ 幂等：重复设同一 title → 200
+   * ```
+   */
+  app.patch('/api/v1/conversations/:id', async (req, reply) => {
+    try {
+      const user = requireUser(req);
+      const { id } = req.params as { id: string };
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      if (typeof body.title !== 'string') {
+        throw new ApiError('E_BADREQUEST', 'title 必须是字符串', { hint: 'Body: { "title": "…" }' });
+      }
+      const title = body.title.trim();
+      if (title === '') {
+        throw new ApiError('E_BADREQUEST', '会话名不能为空白', { hint: '至少 1 个非空白字符' });
+      }
+      if (Array.from(title).length > TITLE_MAX_CHARS) {
+        throw new ApiError('E_BADREQUEST', `会话名过长（上限 ${TITLE_MAX_CHARS} 字）`, {
+          detail: `实际 ${Array.from(title).length}`,
+          hint: '服务端**不静默截断**：请自行缩短',
+        });
+      }
+      const updated = repo.rbac.setConversationTitle(user.id, id, title);
+      if (!updated) throw notFound('会话', id); // ★ 不存在 / 不属于你 → **一律 404**
+      return reply.send({ conversation: updated });
+    } catch (err) {
+      return sendError(reply, err);
+    }
+  });
+
+  /**
+   * ★★ **AI 生成会话名**（契约 §3.2）。
+   *
+   * ```
+   * ① title_source==='user' → **409 E_TITLE_USER_SET**（★ 不静默跳过 ——
+   *    用户点了"生成"却什么都没发生会被当成 bug）
+   * ② 输入 = 首条**用户提问** + 首条助手回答（各截断 ~500 字符）；
+   *    没有任何消息 → **400（不编名字）**
+   * ③ 清洗：取首行 · 去首尾引号 · 去结尾标点 · 截 20 字 · **空 → 保留原名 + 如实警告**
+   * ④ `max_tokens` 极小（32）—— 命名成本必须极低
+   * ⑤ **失败 → 保留原名**（不阻塞聊天、不写占位、不假装成功）
+   * ⑥ 走同一个 `LLM_QUEUE`（并发=1）⟹ 长抽取在跑时会排队；本接口**同步**返回（命名很快）
+   * ⑦ ★ **输入与 UI 同源**：历史来自注入的 `sessionHistory`（= `entriesToHistory`），
+   *    不另写一套读法（Lead 硬要求："只许一份实现"）
+   * ```
+   */
+  app.post('/api/v1/conversations/:id/title/generate', async (req, reply) => {
+    try {
+      const user = requireUser(req);
+      const { id } = req.params as { id: string };
+      const conv = repo.rbac.getConversation(user.id, id);
+      if (!conv) throw notFound('会话', id); // ★ 不可见 → 404
+
+      // ① ★ 铁律：用户手动命名的会话，AI **永远不许覆盖**（409，不静默）
+      if (conv.title_source === 'user') {
+        throw new ApiError('E_TITLE_USER_SET', '该会话名由你手动设定，未被 AI 覆盖', {
+          hint: '若要改名请用 PATCH /api/v1/conversations/:id（或先改成别的名字）',
+          detail: `title=${conv.title} title_source=${conv.title_source}`,
+        });
+      }
+
+      // ② 取**同源**历史
+      if (!deps.sessionHistory) {
+        throw new ApiError('E_INTERNAL', '会话历史不可用（sessionHistory 未接入）', {
+          hint: '命名需要与 UI 同源的历史；未接入时**不编名字**',
+        });
+      }
+      const history = deps.sessionHistory(id);
+      const input = history ? pickNamingInput(history.messages) : null;
+      if (!input) {
+        throw new ApiError('E_BADREQUEST', '这个会话还没有消息，先聊一句再生成名字', {
+          hint: '命名输入 = 首条用户提问 + 首条助手回答',
+        });
+      }
+
+      // ③ 调模型（极小 max_tokens；失败 → 保留原名，如实上报）
+      let rawTitle = '';
+      let usedProvider = '';
+      const warnings: { code: string; msg: string; detail?: Record<string, unknown> }[] = [];
+      try {
+        const res = await deps.providers!.completeJson<Record<string, unknown>>({
+          messages: buildTitleMessages(input),
+          schema: TITLE_SCHEMA,
+          maxTokens: TITLE_GEN_MAX_TOKENS,
+          temperature: 0,
+        });
+        rawTitle = titleFromModelData(res.data);
+        usedProvider = res.usedProvider ?? '';
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warnings.push({
+          code: 'W_TITLE_GEN_FAILED',
+          msg: `命名失败 → **保留原名**（未写占位、未假装成功）：${msg}`,
+          detail: { reason: msg.slice(0, 300) },
+        });
+        return reply.send({ conversation: conv, generated: false, warnings });
+      }
+
+      // ④ 清洗（空 → 保留原名 + 如实警告）
+      const cleaned = cleanGeneratedTitle(rawTitle);
+      warnings.push(...cleaned.warnings);
+      if (cleaned.title === '') {
+        return reply.send({ conversation: conv, generated: false, warnings });
+      }
+
+      // ⑤ 写入（SQL 层原子守卫：若这期间用户手动改了名 → 不覆盖）
+      const out = repo.rbac.setConversationTitleAi(user.id, id, cleaned.title);
+      if (!out.applied) {
+        throw new ApiError('E_TITLE_USER_SET', '该会话名由你手动设定，未被 AI 覆盖', {
+          hint: '（在你点"生成"的同一瞬间被设为手动名 → 守卫拒绝覆盖）',
+          detail: `title=${out.row?.title ?? conv.title}`,
+        });
+      }
+      return reply.send({
+        conversation: out.row,
+        generated: true,
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(usedProvider ? { used_provider: usedProvider } : {}),
+      });
     } catch (err) {
       return sendError(reply, err);
     }

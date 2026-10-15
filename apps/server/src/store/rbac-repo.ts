@@ -65,6 +65,11 @@ export interface ConversationRow {
   user_id: string;
   doc_id: string | null;
   title: string;
+  /**
+   * ★ 名字是谁定的（契约 §2）：`'default'`（系统占位）| `'ai'` | `'user'`。
+   * ★ 铁律：`'user'` → **AI 永远不许覆盖**（判定必须用它，**不许**用 `title === '新问答'`）。
+   */
+  title_source: 'default' | 'ai' | 'user';
   created_at: number;
 }
 
@@ -465,6 +470,49 @@ export class RbacRepo {
 
   getConversation(userId: string, id: string): ConversationRow | undefined {
     return this.db.get<ConversationRow>('SELECT * FROM conversations WHERE user_id = ? AND id = ?', userId, id);
+  }
+
+  /**
+   * ★ **用户手动改名**（契约 §3.1）：设 `title` 并**同时**把 `title_source` 置为 `'user'`。
+   *
+   * 为什么两条 UPDATE 合成一条：`title` 与 `title_source` 必须**同源** ——
+   * 分两次写会出现"名字改了但 source 还是 default"的窗口（AI 随后就能覆盖它）。
+   * 归属条件 `user_id = ?` 写在 SQL 里（**fail-closed**：不是自己的会话 → 0 行受影响）。
+   */
+  setConversationTitle(userId: string, id: string, title: string): ConversationRow | undefined {
+    const res = this.db.run(
+      "UPDATE conversations SET title = ?, title_source = 'user' WHERE user_id = ? AND id = ?",
+      title,
+      userId,
+      id,
+    );
+    if (res.changes === 0) return undefined; // 不存在 / 不属于你 —— **对外一律 404**（不泄露存在性）
+    return this.getConversation(userId, id);
+  }
+
+  /**
+   * ★ **AI 命名**（契约 §3.2）：**只在 `title_source !== 'user'` 时**写入。
+   *
+   * ## 为什么守卫写在 SQL 的 WHERE 里（而不是"先查再写"）
+   * "先查 `title_source` 再决定写"存在 **TOCTOU 窗口**：用户可能在这两步之间手动改名，
+   * 于是 AI 仍会覆盖用户刚设的名字。`WHERE title_source <> 'user'` 是**原子**的 ——
+   * 数据库层保证"用户的名字永不被 AI 覆盖"（**铁律**），而不是靠调用方记得检查。
+   *
+   * @returns `{ applied: false }` = 因为 source='user' 被守卫拒绝（**不是错误**，调用方要如实告知）
+   */
+  setConversationTitleAi(
+    userId: string,
+    id: string,
+    title: string,
+  ): { applied: boolean; row?: ConversationRow } {
+    const res = this.db.run(
+      "UPDATE conversations SET title = ?, title_source = 'ai' WHERE user_id = ? AND id = ? AND title_source <> 'user'",
+      title,
+      userId,
+      id,
+    );
+    const row = this.getConversation(userId, id);
+    return res.changes > 0 ? { applied: true, ...(row ? { row } : {}) } : { applied: false, ...(row ? { row } : {}) };
   }
 
   deleteConversation(userId: string, id: string): boolean {

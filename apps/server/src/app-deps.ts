@@ -16,6 +16,21 @@ import type { WorkerRunnerWithRaw } from './worker/runner.ts';
 import type { WorkerCapability } from './worker/probe.ts';
 
 /** provider 层的门面（结构化声明，避免与 providers/types.ts 耦合）。 */
+/**
+ * ★ **同源历史访问口**（会话命名用）。
+ *
+ * 为什么要它：会话命名需要"首条用户提问 + 首条助手回答"，而聊天消息**不落库**
+ * （真相源是 pi 会话条目）。契约与 Lead 都要求**只许一条读法** ——
+ * 命名必须与 UI 的 `history` 帧走**同一个** `agent/history.ts::entriesToHistory`。
+ *
+ * ⚠️ 因此这里注入的是 `AgentSessionManager.get(id)?.history()`（它内部就是 `entriesToHistory`），
+ * **不是**另写一套从磁盘读 pi 转录的代码（那会造成"两套真相"）。
+ * 未接入时返回 `null` → 路由**如实报错**，绝不编名字（坑 10）。
+ */
+export type SessionHistoryFn = (
+  sessionId: string,
+) => { messages: { role: 'user' | 'assistant'; text: string; ts: number }[]; truncated: boolean } | null;
+
 export interface ProviderFacade {
   capabilities(opts?: { deep?: boolean }): Promise<{
     providers?: Record<string, unknown[]>;
@@ -169,6 +184,8 @@ export interface AppDeps {
   enums: SchemaEnums;
   /** provider 层；`null` = 未就绪（如实降级，不假装有模型能力） */
   providers: ProviderFacade | null;
+  /** ★ 同源历史访问口（会话命名用；见 `SessionHistoryFn` 注释） */
+  sessionHistory?: SessionHistoryFn;
   /** 组装期的失败原因（透给 `/capabilities`） */
   providersError: string | null;
   /** T-AGENT 的能力上报；`null` = agent 模块未就绪 */

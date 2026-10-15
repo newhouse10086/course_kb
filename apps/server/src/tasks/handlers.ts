@@ -65,6 +65,117 @@ export type ExtractStatusValue = (typeof EXTRACT_STATUS)[keyof typeof EXTRACT_ST
 export interface ExtractAvailability {
   ok: boolean;
   reason: string;
+  /**
+   * ★ **第三态**（坑 32）：真探测**还在进行中** —— 此时 `ok:true` 的含义是
+   * "**允许尝试**（按轻量判据放行）"，**不是**"已验证可用"。
+   *
+   * 为什么必须有这一态：布尔值在"检测中"这个状态下**必然要说谎** ——
+   * 说 `true` = 假装可用（坑 10）；说 `false` = 假装不可用（用户明明配好了却被拒）。
+   *
+   * ⚠️ 消费者必须**如实转述**它（给用户看"正在检测"），不许把它当成 `ready`。
+   */
+  detecting?: boolean;
+  /** 探测已等待时长（ms）；仅 `detecting` 时有意义 —— 用来如实告知"在等什么、等了多久" */
+  waitedMs?: number;
+}
+
+/**
+ * ★★ 可用性解析器：**三态 + 后台探测 + 只探一次**（坑 32 的核心）。
+ *
+ * ## 修的是什么
+ * 原来 `index.ts` 里是**惰性 await**：第一个抽取任务走到这里 → 真发一次 LLM 探测（**实测 67,986ms**）
+ * → 用户看到"运行中"却**没有任何解释**，以为卡死。
+ *
+ * ## 现在的行为
+ * - `warmUp()`：服务启动时**后台**开探（不阻塞任何请求）
+ * - `current()`：**立即返回**，绝不 `await` 进行中的探测
+ *   · 已知结果 → 返回真实结果
+ *   · 探测中 → `{ok:true, detecting:true, waitedMs}`（放行 + 如实告知）
+ * - 探测**只发一次**（进程内缓存）；失败**如实降级**（`ok:false + reason`），
+ *   **绝不会因为"预热过了"就报可用**（反例判据）
+ *
+ * ## 兜底（不许静默）
+ * `detecting` 期间放行的那次**真调用**若失败，错误由调用方**如实抛出/记录** ——
+ * 见 `runExtraction` 的 detail 与任务失败原因。
+ */
+export function createAvailabilityResolver(opts: {
+  /** 真探测（会真发一次网络/LLM 请求） */
+  probe: () => Promise<{ ok: boolean; reason: string }>;
+  /** 硬性不可用的同步判据（如"没有抽取器"/"枚举没加载"）—— 有值时**不探测**，直接如实降级 */
+  hardUnavailable?: () => { ok: false; reason: string } | null;
+  /** 探测结果回调（写日志/上报用；只回调一次） */
+  onResolved?: (result: ExtractAvailability) => void;
+  now?: () => number;
+}): {
+  current: () => Promise<ExtractAvailability>;
+  warmUp: () => void;
+  /** 测试/诊断：探测是否已开始/已完成 */
+  state: () => 'idle' | 'detecting' | 'resolved';
+  /** 测试用：等探测结束（生产**不要**用它阻塞请求） */
+  settled: () => Promise<ExtractAvailability>;
+} {
+  const now = opts.now ?? ((): number => Date.now());
+  let resolved: ExtractAvailability | null = null;
+  let inflight: Promise<ExtractAvailability> | null = null;
+  let startedAt = 0;
+
+  const run = (): Promise<ExtractAvailability> => {
+    if (inflight) return inflight;
+    const hard = opts.hardUnavailable?.() ?? null;
+    if (hard) {
+      // 硬性不可用：不浪费一次真探测
+      resolved = { ok: false, reason: hard.reason, detecting: false };
+      opts.onResolved?.(resolved);
+      return Promise.resolve(resolved);
+    }
+    startedAt = now();
+    inflight = opts
+      .probe()
+      .then((r) => {
+        resolved = { ok: r.ok, reason: r.reason || '', detecting: false };
+        opts.onResolved?.(resolved);
+        return resolved;
+      })
+      .catch((err: unknown) => {
+        // ★ 探测抛异常 = **不可用**，不是"可用"（反例判据）
+        resolved = {
+          ok: false,
+          reason: `LLM 可用性探测异常：${err instanceof Error ? err.message : String(err)}`,
+          detecting: false,
+        };
+        opts.onResolved?.(resolved);
+        return resolved;
+      })
+      .finally(() => {
+        inflight = null;
+      });
+    return inflight;
+  };
+
+  return {
+    async current(): Promise<ExtractAvailability> {
+      if (resolved) return resolved;
+      // ★ 探测**在进行中** → 立即返回 `detecting`（这就是"预热"要保证的状态：生产 `main()` 启动即预热）
+      if (inflight) {
+        return { ok: true, reason: '', detecting: true, waitedMs: now() - startedAt };
+      }
+      // ⚠️ 没人预热过（测试/嵌入式用法）→ **只能等一次真探测**。
+      //   故意保留这个语义：否则"抽取器不可用"的路由判据（503 + reason）会在第一次请求时失效
+      //   —— 实测踩到：`★ 抽取器不可用 → 503 + 可读 reason，不排任务、不假装成功` 变红。
+      //   生产路径不会走到这里（`main()` 已 `warmUp()`）。
+      return run();
+    },
+    warmUp(): void {
+      void run();
+    },
+    state(): 'idle' | 'detecting' | 'resolved' {
+      if (resolved) return 'resolved';
+      return inflight ? 'detecting' : 'idle';
+    },
+    async settled(): Promise<ExtractAvailability> {
+      return inflight ?? run();
+    },
+  };
 }
 
 export interface PipelineDeps {
@@ -350,6 +461,18 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
       extract_error: '',
       extract_started_at: Date.now(),
     });
+
+    // ★ 三态如实上报（坑 32）：探测未完成时**放行**（不阻塞用户），但**必须说明"正在检测"** ——
+    //   绝不写成"已验证可用"（坑 10：不许假装可用）。用户/前端据此显示"正在检测模型可用性"。
+    if (av.detecting) {
+      repo.mergeDocumentMeta(docId, {
+        extract_note:
+          `模型可用性检测中（首次约 1 分钟，已等待 ${Math.round((av.waitedMs ?? 0) / 1000)}s）` +
+          `—— 本次已直接开始抽取；若模型实际不可用会如实报错`,
+      });
+    } else if (av.ok) {
+      repo.mergeDocumentMeta(docId, { extract_note: '' });
+    }
 
     let unitRows = repo.allUnitRows(docId);
     if (opts.unitOrdWhitelist && opts.unitOrdWhitelist.length > 0) {

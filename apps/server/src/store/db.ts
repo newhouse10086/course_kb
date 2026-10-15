@@ -266,6 +266,16 @@ const V2_ADDED_COLUMNS: Record<string, Record<string, string>> = {
     priority: 'INTEGER NOT NULL DEFAULT 0',
     user_id: 'TEXT REFERENCES users(id)',
   },
+  conversations: {
+    /**
+     * ★ v7：**名字是谁定的** —— `'default' | 'ai' | 'user'`（契约 `docs/SESSION_NAMING.md` §2）。
+     *
+     * ⚠️ **不许**用 `title === '新问答'` 当判据：用户可以把会话命名成"新问答"，
+     * 之后 AI 会以为"还是默认值"而**覆盖用户的名字** ⟹ **用内容当状态 = 坑 21**（自述与生效不同源）。
+     * ★ 铁律：`title_source === 'user'` → **AI 永远不许覆盖**。
+     */
+    title_source: "TEXT NOT NULL DEFAULT 'default'",
+  },
 };
 
 /** v2 索引（列补完后再建）。 */
@@ -443,6 +453,23 @@ export class Db {
       this.db
         .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
         .run(5, 'doc_collection_index_backfill', Date.now());
+    }
+    /**
+     * ★ 迁移 **v7**：`conversations.title_source`（会话命名契约 §2）。
+     *
+     * ## 为什么必须是**新版本号**（而不是只往 `V2_ADDED_COLUMNS` 里加一列）
+     * v2 的补列块被 `if (!applied.has(2))` 门住 —— **已迁移过的库永远不会重跑它**
+     * ⟹ 只加进 `V2_ADDED_COLUMNS` 的话，**现有库拿不到这一列**（v5 已经吃过一次这个教训）。
+     * 所以：① 列声明进 `V2_ADDED_COLUMNS`（新库直接有）；② **新块 v7 调 `addMissingColumns()`**
+     * （已迁移的库在这里补上）——`addMissingColumns` 幂等（先读 `PRAGMA table_info` 判缺）。
+     *
+     * ⚠️ 已存在的行 → `title_source='default'`（它们的 title 本来就是 '新问答' 占位）。
+     */
+    if (!applied.has(7)) {
+      this.addMissingColumns();
+      this.db
+        .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
+        .run(7, 'conversation_title_source', Date.now());
     }
     return Math.max(1, ...applied);
   }

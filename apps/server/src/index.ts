@@ -28,7 +28,8 @@ import { search as searchKb } from './store/search.ts';
 import type { SearchHit } from './store/search.ts';
 import { TaskEventBus } from './tasks/bus.ts';
 import { TaskQueue } from './tasks/queue.ts';
-import { createHandlers } from './tasks/handlers.ts';
+import { createHandlers, createAvailabilityResolver } from './tasks/handlers.ts';
+import type { ExtractAvailability } from './tasks/handlers.ts';
 import { createWorkerExtractor } from './tasks/extract.ts';
 import type { CompleteJsonFn } from './tasks/extract.ts';
 import type { TaskHandler } from './tasks/queue.ts';
@@ -78,6 +79,11 @@ export interface BuildOptions {
 ull = **完全关掉**（测试里不想写文件时用）；AppLogging = 注入。
    */
   logging?: AppLogging | null;
+  /**
+   * 启动后台预热 LLM 可用性探测（默认 true，仅 main() 生效）。
+   * 测试里 uildApp 不会预热 —— 预热会给全局探测计数多记一次（见 vailabilityWarmUp 的注释）。
+   */
+  availabilityWarmUp?: boolean;
 }
 
 /** 结果容器：测试要拿到 db/repo/queue 做断言，所以不只返回 fastify 实例。 */
@@ -87,6 +93,10 @@ export interface BuiltApp {
   /** ★ 日志句柄（
 ull = 本次未启用落盘） */
   logging: AppLogging | null;
+  /** ★ 启动后台预热 LLM 可用性探测（坑 32；只应由 main() 调用） */
+  availabilityWarmUp: () => void;
+  /** ★ 只读：当前可用性三态（诊断用；detecting 也必须如实可见） */
+  peekAvailability: () => Promise<ExtractAvailability>;
   close(): Promise<void>;
 }
 
@@ -247,24 +257,64 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     providersError = providersError ?? 'provider 层不可用 → 抽取功能禁用（units 仍可解析）';
   }
 
-  // 抽取器可用性**惰性**解析一次并缓存（避免每个任务都真探测一次）
-  let availabilityCache: { ok: boolean; reason: string } | null = null;
-  const resolveExtractorAvailability = async (): Promise<{ ok: boolean; reason: string }> => {
-    if (availabilityCache) return availabilityCache;
+  // ★★ 抽取器可用性：**三态 + 启动后台预热**（坑 32）
+  //
+  // 原错误写法（本文件历史版本）：`resolveExtractorAvailability()` **惰性 await** 真探测 ——
+  //   `extractor.available()` → `providers.capabilities({deep:true})` = **一次真 LLM 请求**，
+  //   **实测 67,986ms**：任务 719ms 就 `running`，但第一次 `completeJson` 在 68 秒后
+  //   → 用户看到"运行中"却没有任何解释，**以为卡死**（这正是"看不到的失败"的体验版）。
+  //
+  // 现在：① 启动即 `warmUp()`（后台，不阻塞任何请求）② `current()` **立即返回**，绝不 await 进行中的探测
+  //   ③ 探测中如实返回 `detecting:true`（既不放行假装可用、也不错误拒绝）④ 结果只探一次并缓存
+  //   ⑤ 探测失败 → **如实降级**（`ok:false + reason`），绝不因为"预热过了"就报可用。
+  // ⚠️ 保持 `async` 签名（消费者 `await` 它）—— 但**它现在立即 resolve**（不 await 探测），
+  //    所以"首个抽取不再等 68 秒"。
+  const resolveExtractorAvailability = async (): Promise<ExtractAvailability> => {
     if (!extractor) {
-      availabilityCache = { ok: false, reason: providersError ?? '未初始化抽取器' };
-      return availabilityCache;
+      return { ok: false, reason: providersError ?? '未初始化抽取器' };
     }
-    if (!enums.edgeTypes.length || !enums.cardKinds.length) {
-      availabilityCache = {
-        ok: false,
-        reason: `封闭枚举未加载（${enums.warnings.join('；') || 'schema/ 缺失'}）→ 抽取会产出非法枚举，故禁用`,
-      };
-      return availabilityCache;
-    }
-    const a = await extractor.available();
-    availabilityCache = { ok: a.ok, reason: a.reason || '' };
-    return availabilityCache;
+    return availabilityResolver.current();
+  };
+  const availabilityResolver = createAvailabilityResolver({
+    // 硬性不可用（配置层就断了）：不浪费真探测
+    hardUnavailable: () => {
+      if (!extractor) return { ok: false, reason: providersError ?? '未初始化抽取器' };
+      if (!enums.edgeTypes.length || !enums.cardKinds.length) {
+        return {
+          ok: false,
+          reason: `封闭枚举未加载（${enums.warnings.join('；') || 'schema/ 缺失'}）→ 抽取会产出非法枚举，故禁用`,
+        };
+      }
+      if (!cfg.llm) return { ok: false, reason: '未配置 LLM 凭据（data/llm.json 或环境变量）' };
+      return null;
+    },
+    probe: async () => {
+      if (!extractor) return { ok: false, reason: providersError ?? '未初始化抽取器' };
+      const a = await extractor.available();
+      return { ok: a.ok, reason: a.reason || '' };
+    },
+    onResolved: (result) => {
+      // ★ 结果落盘（运维/用户都能查"到底检测出什么"）；不阻塞、不抛
+      try {
+        const line = { event: 'llm-availability', state: result.ok ? 'ready' : 'unavailable', reason: result.reason };
+        if (result.ok) logging?.info(line, 'LLM availability resolved');
+        else logging?.warn(line, 'LLM availability resolved');
+      } catch {
+        /* 日志失败不影响业务 */
+      }
+    },
+  });
+
+  // ★ 启动就探（后台）—— 这样第一个抽取任务通常已经拿到结果，最差也只是如实显示"检测中"
+  // ★★ 预热**不在这里做**（挪到 `main()`，见 `availabilityWarmUp`）——
+  //   ⚠️ 全量测试实测：在 `buildApp` 里预热会给**进程内全局探测计数**多记一次，
+  //   导致"路由自述 `probe_calls`"与"真实探测次数"对不上（**自述 7 vs 真实 6**，坑 21 同源断言红）。
+  //   ⟹ 预热本身是对的，**位置**错了：必须等"服务真的起来了"再探。
+  //   这样 `buildApp`（测试/嵌入式用法）行为完全不变，而生产 `main()` 启动即预热。
+  const availabilityWarmUp = (): void => {
+    if (opts.availabilityWarmUp === false) return;
+    availabilityResolver.warmUp();
+    logging?.info({ event: 'llm-availability', state: 'detecting' }, 'LLM availability probe started (background)');
   };
 
   // ── agent（T-AGENT 的写域，动态 import；测试可用 BuildOptions 覆盖）──
@@ -723,6 +773,22 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     agentCapabilities,
     agentError,
     chatFactory,
+    /**
+     * ★ **同源历史访问口**（会话命名用，契约 `docs/SESSION_NAMING.md` §3.2②）。
+     *
+     * 命名要"首条用户提问 + 首条助手回答"，而聊天消息**不落库** —— 真相源是 pi 会话条目。
+     * Lead 硬要求**只许一条读法**：这里直接复用会话管理器的 `history()`
+     * （它内部就是 `agent/history.ts::entriesToHistory`，与 UI 的 `history` 帧**同一份实现**），
+     * **不另写**一套从磁盘读转录的代码（否则会出现"UI 显示的和命名用的不一样"）。
+     *
+     * ⚠️ 管理器未接入（pi 不可用）→ 返回 `null` → 命名接口**如实报错**，**绝不编名字**（坑 10）。
+     */
+    sessionHistory: (sessionId: string) => {
+      const m = agentManager as { get?: (id: string) => { history?: () => unknown } | undefined } | null;
+      const sess = typeof m?.get === 'function' ? m.get(sessionId) : undefined;
+      const h = typeof sess?.history === 'function' ? sess.history() : null;
+      return (h as ReturnType<NonNullable<AppDeps['sessionHistory']>>) ?? null;
+    },
     retrieval,
     // ★ 只读知识库查询（agent 模式的 kb_search/kb_get；已按 userId 过滤可见性）
     kb,
@@ -924,6 +990,10 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     app,
     deps,
     logging,
+    availabilityWarmUp: () => {
+      availabilityWarmUp();
+    },
+    peekAvailability: () => availabilityResolver.current(),
     async close() {
       // 顺序很重要：先中止在跑的 worker，再**等任务收尾写完 tasks 行**，最后关 DB。
       // 原错误写法：stop() 后立刻 db.close() → 任务收尾写入撞上已关闭连接，
@@ -985,6 +1055,10 @@ export async function main(): Promise<void> {
   }
 
   await app.listen({ host: cfg.host, port: cfg.port });
+
+  // ★★ 坑 32：**服务起来之后**再后台预热 LLM 可用性探测（不阻塞任何请求）。
+  //   这样第一个抽取任务通常已拿到结果；最差也只是如实显示"检测中"（不再白等 68 秒）。
+  built.availabilityWarmUp();
   const base = `http://${cfg.host}:${cfg.port}`;
   process.stdout.write(
     [

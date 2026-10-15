@@ -122,6 +122,8 @@ before(async () => {
       },
       raw: '{}',
       usedProvider: 'spy',
+      // ★ 回执带"实测模式"（模拟 provider 降级链：端点拒绝严格 schema → 回落）
+      structuredOutputMode: 'lenient' as const,
     };
   };
   const runner = (built.deps as unknown as { runner: WorkerRunnerWithRaw }).runner;
@@ -224,7 +226,14 @@ test('★★ 空正文单元不发 LLM + 其余单元照常出卡片 + meta 如�
     .map((u) => u.id);
   assert.deepEqual(ids, [EMPTY_UNIT, TEXT_UNIT], '★ 空正文单元必须**保留**在 units 表里（只跳过 LLM，不删单元）');
 
-  // ⑤ 抽取状态不是 failed
+  // ⑤ ★ 实测的**结构化输出模式**必须写进 meta（可观测：网关恢复/退化看得见）
+  assert.equal(
+    m.structured_output_mode,
+    'lenient',
+    `★ provider 回执的 structuredOutputMode 必须落进 meta（实际 ${String(m.structured_output_mode)}）`,
+  );
+
+  // ⑥ 抽取状态不是 failed
   assert.notEqual(m.extract_status, 'failed', `★ 不该因为一个空单元把整篇判失败（实际 ${String(m.extract_status)}）`);
   assert.ok(calls.every((c) => c.maxTokens === 8192), '既有判据不许退化：maxTokens 仍须显式传 8192');
 });
