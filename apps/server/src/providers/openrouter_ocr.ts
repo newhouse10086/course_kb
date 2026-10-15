@@ -217,7 +217,15 @@ export function createOpenRouterOcr(entry: ProviderConfigEntry): CloudOcr {
     vendor: 'OpenRouter',
     runtime: 'cloud',
     languages: ['zh', 'en'],
-    pricing: { unit: 'per_1k_tokens', amount: 0.0001, currency: 'USD' },
+    /**
+     * ★ `[实测]` 真实单价（USD / 1M tokens）—— 对应主模型 `qwen/qwen3-vl-235b-a22b-instruct`。
+     *
+     * ⚠️ **原值 `{unit:'per_1k_tokens', amount:0.0001}` 是错的**：
+     * ① 单位标成 "per_1k_tokens" 但没说是输入还是输出；
+     * ② 实测**输出单价是输入的 9 倍**（in $0.21/M · out $1.90/M），
+     *    只按单一单价估算会**低估约 6.5 倍**（真实 $0.57/434 页 vs 原估 $0.087）。
+     */
+    pricing: { unit: 'per_1m_tokens_input', amount: 0.21, currency: 'USD', note: '输入 $0.21/M · 输出 $1.90/M（实测口径，见 worker/adapters/pdf.py 常量注释）' },
     ...(notConfiguredReason ? { notConfiguredReason } : {}),
     /**
      * ★ **真探测**：用一张**极小空白图**真发一次请求 —— 同时验证

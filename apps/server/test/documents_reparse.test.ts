@@ -166,14 +166,34 @@ test('★ 代价可见：正文为空/图片型 → 响应给 `needs_ocr` + `est
   const r = await fetch(`${base}/api/v1/documents/${docId}/reparse`, { method: 'POST', headers: { cookie: teacherCookie } });
   // 可能在跑 → 409 也算"如实拒绝"（幂等），但代价可见只在 202 上断言
   if (r.status === 202) {
-    const body = (await r.json()) as { task_id?: string; needs_ocr?: boolean; est_minutes?: number[]; cost_note?: string };
+    const body = (await r.json()) as {
+      task_id?: string;
+      needs_ocr?: boolean;
+      est_minutes?: number;
+      est_usd?: number;
+      ocr_mode?: string;
+      ocr_provider?: string;
+      cost_note?: string;
+    };
     assert.ok(body.task_id, '必须返回 task_id');
     assert.equal(body.needs_ocr, true, '★ 图片型必须标 needs_ocr');
-    const est = body.est_minutes;
-    assert.ok(Array.isArray(est) && est.length === 2, `★ 必须给时长区间（434 页 ≈ 65 分钟），实际 ${JSON.stringify(est)}`);
-    assert.ok(Number(est[1]) >= 60, `★ 434 页应是"小时级"，实际上限 ${JSON.stringify(est)} 分钟`);
-    assert.match(String(body.cost_note), /OCR/, '★ 必须说明会走本地 OCR（用户要**先知道**）');
-    assert.match(String(body.cost_note), /不消耗 LLM|LLM/, 'cost_note 要说清 LLM 与 OCR 的差别');
+    /**
+     * ★★ 2026-10-16 起 OCR 改走**云端 OpenRouter**（用户裁定"不要接本地的模型"），
+     * 本用例原断言的是**本地** OCR 的旧口径（`est_minutes` 数组、"不消耗 LLM"）——
+     * 那是**已废弃的行为**。现断言云端口径：
+     *   `[实测]` qwen3-vl-235b 1.21s/页、$0.00132/页 ⟹ 434 页 ≈ 9 分钟 / $0.57
+     */
+    assert.equal(body.ocr_mode, 'cloud', '★ OCR 必须走云端（用户明确不要本地）');
+    assert.equal(body.ocr_provider, 'openrouter', '★ provider 必须是 openrouter');
+    // ★ 云端后 434 页是"分钟级"（不是本地那种"小时级"）
+    assert.equal(typeof body.est_minutes, 'number', `est_minutes 应为单个数字，实际 ${JSON.stringify(body.est_minutes)}`);
+    assert.ok((body.est_minutes ?? 0) >= 5 && (body.est_minutes ?? 0) <= 20, `★ 434 页云端应约 9 分钟，实际 ${body.est_minutes}`);
+    // ★ 费用必须可见（用户要"跑之前看得见"）
+    assert.equal(typeof body.est_usd, 'number', '必须给费用估算');
+    assert.ok((body.est_usd ?? 0) > 0.1, `★ 434 页应有可见费用，实际 $${body.est_usd}`);
+    assert.match(String(body.cost_note), /OCR/, '★ 必须说明会走 OCR');
+    assert.match(String(body.cost_note), /OpenRouter|云端/, '★ 必须说明走**云端**（用户要**先知道**）');
+    assert.match(String(body.cost_note), /账单为准/, '★ 估算必须声明"以账单为准"（估算 ≠ 账单）');
     const t = await waitTask(body.task_id!);
     assert.ok(['done', 'failed', 'partial'].includes(t?.status ?? ''), '任务必须能到达终态（不卡 parsing）');
     const st = (built!.deps.repo.getDocumentRow(docId) as { status?: string } | undefined)?.status;

@@ -409,9 +409,24 @@ def job_parse(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
 
     max_pages_per_unit = int(opt(payload, "max_pages_per_unit", 8) or 8)
     max_pages = int(opt(payload, "max_pages", 0) or 0)
-    # 允许覆盖 adapter 的构造参数（PDF 的页窗 / 页数上限）
+    # ★★ 云端 OCR 第二趟：Node 调完 OpenRouter 后，把 `{页号: 文本}` 从这里传回来。
+    #    ⚠️ **必须显式透传** —— 否则 Node 传了、这里不读 → **静默无效**
+    #    （任务报成功、stage 不变，而 OCR 文本根本没进正文 —— 最危险的那类"看起来成功"）。
+    #    阶段一（不传）= 只渲染并如实报 `stage='rendered_awaiting_cloud_ocr'`；
+    #    阶段二（传了）= 采用云端文本，`stage='cloud_texts_applied'`。
+    #    守卫测试：`worker/tests/test_pdf_textmode.py` 的 marker 用例
+    #    （断言标记字符串**真的出现在 unit 正文里**，不是断言"我们传了参数"）。
+    raw_cloud_texts = opt(payload, "cloud_texts")
+    cloud_texts: dict[int, str] | None = None
+    if isinstance(raw_cloud_texts, dict):
+        cloud_texts = {int(k): str(v) for k, v in raw_cloud_texts.items()}
+    # 允许覆盖 adapter 的构造参数（PDF 的页窗 / 页数上限 / 云端 OCR 文本）
     if adapter.kind == "pdf":
-        adapter = type(adapter)(max_pages_per_unit=max_pages_per_unit, max_pages=max_pages)
+        adapter = type(adapter)(
+            max_pages_per_unit=max_pages_per_unit,
+            max_pages=max_pages,
+            **({"cloud_ocr_texts": cloud_texts} if cloud_texts is not None else {}),
+        )
 
     stream_units = bool(opt(payload, "stream_units", True))
     emit.progress("parse", 0.0, {"adapter": type(adapter).__name__, "kind": adapter.kind})

@@ -43,6 +43,8 @@ export interface ProviderFacade {
     maxTokens?: number;
     temperature?: number;
     signal?: AbortSignal;
+    /** ★ `'interactive'`（人在等）插到批量前面；缺省 = 批量（行为不变） */
+    priority?: 'interactive' | 'batch';
   }): Promise<{ data: T; usedProvider?: string; degradedFrom?: string; degradedReason?: string }>;
   transcribe?(req: unknown): Promise<unknown>;
 }

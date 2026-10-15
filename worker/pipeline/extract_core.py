@@ -1214,7 +1214,21 @@ def plan_prompts(
     for pu in picked:
         # ★ 长文本分块（**不再截断**）：超长单元 → 多块，逐块一次调用。
         #   短单元 → 单块，行为与改前**逐字一致**（chunk.split_unit 保证）。
+        #
+        # ★★ 空正文单元：用 `empty_chunk()` 产出**一个零长块**，**仍列进 items**。
+        #    谁负责跳过空正文？**只有 Node 的闸门**（`extract.ts` 的
+        #    `if (known && text.trim() === '')` → `W_EMPTY_INPUT`）；它必须
+        #    "在 plan items 里看到这个单元"才能报出来。
+        #
+        #    ⚠️ 原错误写法（我 01:00 引入的**真回归**）：
+        #        `for ch in split_unit(pu.text)`:  ← 空正文 → **0 块 → 循环不执行**
+        #        → 空正文单元**根本不在 plan items 里** → Node 闸门 `known=false`
+        #        → **闸门不触发** → 没有 `W_EMPTY_INPUT` → 既有测试变红。
+        #        本质：worker 悄悄替 Node 做了"跳过" ⟹ 两处判断、两套真相（坑 27 家族），
+        #        且把 Node 的防线**架空**——"看起来有防线、实际不触发"比没有更危险。
         chunks = chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)
+        if not chunks:
+            chunks = [chunk_mod.empty_chunk(pu.span)]
         for ch in chunks:
             items.append(
                 {
@@ -1241,6 +1255,9 @@ def plan_prompts(
                     "chars": ch.chars,
                     #: ★ 分块元信息（块数/本块序号/字符区间）—— 单调可回溯、可观测
                     "chunk": ch.to_dict(),
+                    #: ★ 空正文明示（`chars=0` 的块）—— 调用方据此跳过 LLM，
+                    #:   但**这个单元仍照常出现在 items 里**（闸门要能看见它）
+                    "empty_body": ch.chars == 0,
                     "system": system_prompt,
                     "user": build_user_prompt(
                         source_name=source_name,
@@ -1259,9 +1276,15 @@ def plan_prompts(
         "items": items,
         # ★ 代价可见：分块后的**实际调用数**（> 单元数时说明发生了分块）。
         #   `needs_confirm` 闸门与 meta 都按这个数上报（坑 24：承诺必须与生效一致）。
-        "chunks": len(items),
+        #   ⚠️ 空正文单元**不计入** `calls`：它在 items 里（好让 Node 闸门看见），
+        #      但**不会发 LLM**（Node 会跳过它）⟹ 把它算进调用数会**虚报花费**。
+        "chunks": sum(1 for it in items if not it.get("empty_body")),
         "units_planned": len(picked),
-        "chunked_units": sum(1 for pu in picked if len(chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)) > 1),
+        "empty_units": sum(1 for it in items if it.get("empty_body")),
+        "chunked_units": sum(
+            1 for pu in picked
+            if len(chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)) > 1
+        ),
         "max_chunks_per_unit": chunk_mod.max_chunk_count([pu.text or "" for pu in picked], chunk_chars),
     }
 
@@ -1299,7 +1322,13 @@ def convert_payloads(
     #    其余块的卡片被静默丢弃（与 `make_key` 注释里那个"花钱抽出却全丢"同源）。
     chunked: dict[str, tuple[units_mod.PickedUnit, chunk_mod.Chunk]] = {}
     for pu in picked:
-        for ch in chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars):
+        # ⚠️ 与 `plan_prompts` **必须同构**：空正文单元在 plan 里有一个零长块占位，
+        #    这里也要能匹配到它（否则 Node 万一对空单元也发了 payload，
+        #    convert 会报 `E_PICK_KEY` —— 两侧索引形状不一致）。
+        chunks = chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)
+        if not chunks:
+            chunks = [chunk_mod.empty_chunk(pu.span)]
+        for ch in chunks:
             chunked[make_key(pu.unit_id, ch.span)] = (pu, ch)
     by_key: dict[str, tuple[units_mod.PickedUnit, chunk_mod.Chunk]] = dict(chunked)
     by_unit: dict[str, units_mod.PickedUnit] = {}

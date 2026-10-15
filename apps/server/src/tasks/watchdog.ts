@@ -181,3 +181,58 @@ export function createTaskWatchdog(opts: WatchdogOptions): Watchdog {
 export function lastHeartbeatOf(task: TaskRow): number {
   return task.heartbeat_at ?? task.created_at;
 }
+
+/**
+ * ★★ **运行期周期扫描**（用户症状的主修复）。
+ *
+ * ## 为什么启动扫描不够（实测才看清）
+ * `queue.recover()`（契约 C4，在 `buildApp` 里）会把**上一个进程遗留的 `running`
+ * 重新排成 `queued`** → 启动扫描通常扫不到它们（实测 `killed:0`，且它们被真的重跑了）。
+ * 用户的症状"任务卡在 `running` **永远不动**、后面全排不上"发生在**运行期**：
+ * worker 子进程死了/无响应，**没人判死** → 一条 `running` 行永久占住**并发=1** 的唯一槽位。
+ *
+ * ⟹ 必须有周期扫描：每隔 `min(staleMs/2, maxMs)`（下限 `minMs`）把心跳超时的任务判失败。
+ * 抽成独立函数（而不是写在 `main()` 里）的唯一原因是**可测** ——
+ * 周期行为必须能在测试里用**小间隔**验证，而不是靠"读代码觉得对"。
+ *
+ * @returns `stop()`：停表（测试/关停用）。定时器 `unref()`，**不阻塞进程退出**。
+ */
+export function startPeriodicSweep(opts: {
+  watchdog: Watchdog;
+  staleMs: number;
+  /** 采样间隔上限（默认 5 分钟） */
+  maxMs?: number;
+  /** 采样间隔下限（默认 5 秒；测试可给 30ms） */
+  minMs?: number;
+  /** 每次巡检的处置回调（写日志/上报；只在**真的处置了东西**时回调） */
+  onSwept?: (r: { killed: string[]; alive: string[]; docsHealed: string[] }) => void;
+  /** 直接指定间隔（测试用；优先于派生值） */
+  intervalMsOverride?: number;
+}): { stop: () => void; intervalMs: number; sweeps: () => number } {
+  const maxMs = opts.maxMs ?? 5 * 60_000;
+  const minMs = opts.minMs ?? 5_000;
+  const intervalMs = Math.max(
+    1,
+    opts.intervalMsOverride ?? Math.max(minMs, Math.min(Math.floor(opts.staleMs / 2), maxMs)),
+  );
+  let sweeps = 0;
+  const timer = setInterval(() => {
+    sweeps += 1;
+    try {
+      const stale = opts.watchdog.sweepStale();
+      // 文档自愈顺手一起做（同一批巡检，成本几乎为零）
+      const docs = opts.watchdog.healDocuments();
+      if (stale.killed.length > 0 || docs.healed.length > 0) {
+        opts.onSwept?.({ killed: stale.killed, alive: stale.alive, docsHealed: docs.healed });
+      }
+    } catch {
+      /* 巡检失败不能把服务搞挂；下一次继续 */
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return {
+    stop: (): void => clearInterval(timer),
+    intervalMs,
+    sweeps: (): number => sweeps,
+  };
+}

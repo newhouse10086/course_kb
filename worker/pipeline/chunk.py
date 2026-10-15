@@ -155,8 +155,35 @@ def map_span(unit_span: Span, char_start: int, char_end: int, total_chars: int) 
     return Span(unit_span.kind, lo, hi)
 
 
+def empty_chunk(unit_span: Span) -> Chunk:
+    """空正文单元的**占位块**（`chars: 0`）。
+
+    ## 为什么空正文也要有"一个块"
+    这是"**谁负责跳过空正文**"的单一职责问题。
+    真正判"空正文不发 LLM + 报 `W_EMPTY_INPUT`"的是 **Node 侧闸门**
+    （`tasks/extract.ts`，它遍历 `extract.plan` 的 items 来判断"这个单元正文为空"）。
+
+    ⟹ plan **必须把空正文单元也列出来**，否则闸门 `known=false` → 不触发 →
+    **防线被架空**（"看起来有防线、实际不触发"，比没有防线更危险）。
+    worker 只**如实描述**（`chars=0`），**不替 Node 做跳过决定**（两处判断 = 两套真相）。
+    """
+    return Chunk(
+        index=0,
+        total=1,
+        text="",
+        char_start=0,
+        char_end=0,
+        span=Span(unit_span.kind, int(unit_span.start), int(unit_span.end)),
+    )
+
+
 def split_unit(text: str, unit_span: Span, chunk_chars: int = DEFAULT_CHUNK_CHARS) -> list[Chunk]:
-    """把一个单元的正文切成若干 :class:`Chunk`（**短文本返回单块**）。"""
+    """把一个单元的正文切成若干 :class:`Chunk`（**短文本返回单块**）。
+
+    ⚠️ 空正文返回 **0 块**（"没有内容可切"是事实）——
+    需要"空单元也占一个位"的调用方（如 `plan_prompts`）应显式用 :func:`empty_chunk`。
+    这个区分是刻意的：**"切不出块"与"有一个空块"是两件事**，调用方按自己的职责选。
+    """
     spans = split_text(text, chunk_chars)
     total = len(spans)
     n = len(text or "")

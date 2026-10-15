@@ -124,6 +124,21 @@ export interface ExtractDocumentResult {
     itemsSkippedEmpty?: number;
     /** ★ 被跳过的单元 id 列表（如实上报，便于排查"为什么这篇没出卡片"） */
     skippedEmptyUnitIds?: string[];
+    // ── ★ 长文本分块（坑 24：`chunkChars` 从死旋钮变成真生效）────────────
+    /** 分块后 plan 产出的**块级** item 数（= 预期 LLM 调用数） */
+    chunksPlanned?: number;
+    /** plan 的**单元**数（与 `chunksPlanned` 不等 ⟹ 发生了分块） */
+    unitsPlanned?: number;
+    /** 发生分块的单元数（`>0` 说明长文本被拆分而非截断） */
+    chunkedUnits?: number;
+    /** 单元内最大块数（诊断"有没有单元被切得很碎"） */
+    maxChunksPerUnit?: number;
+    /** worker convert 侧自报的块总数（与 plan 对账，不一致 = key 匹配出问题） */
+    chunksTotal?: number;
+    /** worker convert 侧真正处理完的块数 */
+    chunksDone?: number;
+    /** 本次生效的分块阈值（字符）—— 让"死旋钮"变成可观测的真值 */
+    chunkChars?: number;
     errorMessages?: string[];
   };
 }
@@ -157,6 +172,15 @@ export interface Extractor {
  * worker 侧契约对结构化输出的建议是 ≥2000，这里是"结构化 + 推理开销"的取值。
  */
 export const EXTRACT_MAX_TOKENS = 8192;
+
+/**
+ * ★ 长文本分块阈值（字符）的**单一默认值**。
+ *
+ * ⚠️ 与 worker 侧 `worker/pipeline/chunk.py::DEFAULT_CHUNK_CHARS` **必须一致**：
+ * plan 与 convert 两次独立进程调用都按它分块，**两侧不同 → 块级 key 对不上
+ * → 卡片被静默丢弃**（E_PICK_KEY）。改这里必须同步改 worker 侧（有测试对账）。
+ */
+export const DEFAULT_CHUNK_CHARS = 24_000;
 
 export interface WorkerExtractorDeps {
   runner: WorkerRunnerWithRaw;
@@ -202,6 +226,12 @@ function normalizeSpan(v: unknown, fallbackKind = 'page'): Span {
 export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
   const maxPages = deps.maxPages ?? 8;
   const schemaName = deps.schemaName ?? 'knowledge_cards';
+  /**
+   * ★ 生效的分块阈值（坑 24：`chunkChars` 原先是**死旋钮** ——
+   * `WorkerExtractorDeps.chunkChars` 只被 plan 读了一次，而 worker 侧真正用的是
+   * 自己的默认 24_000；现在**plan 与 convert 都传同一个值**，且默认值下沉到一处）。
+   */
+  const chunkCharsEffective = Math.max(1_000, Math.trunc(deps.chunkChars ?? DEFAULT_CHUNK_CHARS));
 
   return {
     name: 'worker-plan-convert',
@@ -235,7 +265,8 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
           source_name: deps.sourceName ?? req.title ?? '课程资料',
           max_pages: maxPages,
           pages_total: req.pagesTotal ?? 0,
-          ...(deps.chunkChars ? { chunk_chars: deps.chunkChars } : {}),
+          // ★ 长文本分块阈值（不再是"死旋钮"：plan 与 convert 都传这个值）
+          chunk_chars: chunkCharsEffective,
           ...(req.excludedRanges ? { excluded_ranges: req.excludedRanges } : {}),
           // ★ 断点续跑（模型热切换 `mode:"abort"` 依赖它）：
           //   契约 `worker/README.md` §7 —— `payload.checkpoint_file` + `resume:true`
@@ -442,6 +473,8 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
           payloads,
           max_pages: maxPages,
           pages_total: req.pagesTotal ?? 0,
+          // ★ 与 plan **同一个** chunk_chars（否则块级 key 对不上 → 卡片全丢）
+          chunk_chars: chunkCharsEffective,
           ...(req.excludedRanges ? { excluded_ranges: req.excludedRanges } : {}),
           ...(req.checkpointFile ? { checkpoint_file: req.checkpointFile } : {}),
           ...(req.resume ? { resume: true } : {}),
@@ -583,6 +616,18 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
           unitsDone: asNumber(convStats.units_done, 0),
           pick: asRecord(plan.pick) ?? {},
           skippedUnits: asNumber(plan.skipped_units, 0),
+          // ★★ 长文本分块（坑 24：`chunkChars` 从"死旋钮"变成"真生效"）——
+          //    `items` 是**块级**清单（长单元 → 多块 → 多次调用）。
+          //    `unitsPlanned` 是单元数；两者不等 说明发生了分块（`chunkedUnits` > 0）。
+          //    ⚠️ 代价必须可见：`llmCalls`（= payloads.length）就是**真实调用数**。
+          chunksPlanned: asNumber(plan.chunks, 0),
+          unitsPlanned: asNumber(plan.units_planned, 0),
+          chunkedUnits: asNumber(plan.chunked_units, 0),
+          maxChunksPerUnit: asNumber(plan.max_chunks_per_unit, 0),
+          // worker convert 侧自报的块计数（与 plan 对账：不一致说明 key 匹配出了问题）
+          chunksTotal: asNumber(convStats.chunks_total, 0),
+          chunksDone: asNumber(convStats.chunks_done, 0),
+          chunkChars: chunkCharsEffective,
           ...(errorMessages.length > 0 || failureMessages.length > 0
             ? { errorMessages: [...failureMessages, ...errorMessages] }
             : {}),

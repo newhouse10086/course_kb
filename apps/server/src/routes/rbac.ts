@@ -416,6 +416,8 @@ export function registerRbacRoutes(app: FastifyInstance, deps: AppDeps): void {
           schema: TITLE_SCHEMA,
           maxTokens: TITLE_GEN_MAX_TOKENS,
           temperature: 0,
+          // ★ **交互车道**：用户在等这个名字 —— 长抽取在跑时**插到它前面**（Lead 裁定）
+          priority: 'interactive',
         });
         rawTitle = titleFromModelData(res.data);
         usedProvider = res.usedProvider ?? '';

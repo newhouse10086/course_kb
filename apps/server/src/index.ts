@@ -29,7 +29,7 @@ import type { SearchHit } from './store/search.ts';
 import { TaskEventBus } from './tasks/bus.ts';
 import { TaskQueue } from './tasks/queue.ts';
 import { createHandlers, createAvailabilityResolver } from './tasks/handlers.ts';
-import { createTaskWatchdog } from './tasks/watchdog.ts';
+import { createTaskWatchdog, startPeriodicSweep } from './tasks/watchdog.ts';
 import type { ExtractAvailability } from './tasks/handlers.ts';
 import { createWorkerExtractor } from './tasks/extract.ts';
 import type { CompleteJsonFn } from './tasks/extract.ts';
@@ -110,6 +110,10 @@ ull = 本次未启用落盘） */
   };
   /** 看门狗判死阈值（ms）—— 诊断/测试断言用，与 queue 的心跳周期**同源** */
   taskStaleMs: number;
+  /** 只做"判死超时任务"（运行期周期扫描调用；不写汇总日志） */
+  sweepStaleTasks: () => { killed: string[]; alive: string[]; cutoff: number };
+  /** 只做"孤儿 `extracting` 文档自愈" */
+  healOrphanDocs: () => { healed: string[]; keptRunning: string[] };
   close(): Promise<void>;
 }
 
@@ -811,7 +815,7 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       `LLM 并发配置非法，拒绝启动：${llmConc.rejected}`,
     );
   }
-  // ← 注入：删掉接线（回到默认 1）
+  LLM_QUEUE.setLimit(llmConc.value, llmConc.max);
   process.stderr.write(
     `[llm] 并发 = ${LLM_QUEUE.concurrency}（默认 1；上限 ${llmConc.max}；` +
       `${llmConc.requested === null ? '未显式配置' : `显式配置 ${llmConc.requested}`}；改配置需重启）\n`,
@@ -1072,6 +1076,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       return r;
     },
     taskStaleMs,
+    sweepStaleTasks: () => watchdog.sweepStale(),
+    healOrphanDocs: () => watchdog.healDocuments(),
     async close() {
       // 顺序很重要：先中止在跑的 worker，再**等任务收尾写完 tasks 行**，最后关 DB。
       // 原错误写法：stop() 后立刻 db.close() → 任务收尾写入撞上已关闭连接，
@@ -1153,6 +1159,34 @@ export async function main(): Promise<void> {
     // 看门狗失败**不能**让服务起不来（它是自愈，不是主链路），但必须如实报
     process.stderr.write(`[watchdog] 启动扫描失败：${err instanceof Error ? err.message : String(err)}\n`);
   }
+
+  /**
+   * ★★ **运行期周期扫描（用户症状的主修复）** —— 逻辑在 `startPeriodicSweep`（可测）。
+   *
+   * 为什么需要它：`queue.recover()`（C4，在 `buildApp` 里）会把**上个进程遗留的 `running`
+   * 重新排成 `queued`** ⟹ 启动扫描扫不到它们（实测 `killed:0`）。
+   * 用户撞到的"任务卡在 running 永远不动、后面全排不上"发生在**运行期**：
+   * worker 死了没人判死 → 一条 `running` 永久占住**并发=1** 的唯一槽位。
+   */
+  const sweeper = startPeriodicSweep({
+    // 用 BuiltApp 暴露的两个"单项"动作拼出 Watchdog 形状（`watchdog` 闭包在 buildApp 内）
+    watchdog: {
+      sweepStale: () => built.sweepStaleTasks(),
+      healDocuments: () => built.healOrphanDocs(),
+      runStartup: () => ({ stale: built.sweepStaleTasks(), docs: built.healOrphanDocs() }),
+      staleMs: built.taskStaleMs,
+    },
+    staleMs: built.taskStaleMs,
+    onSwept: (r) => {
+      process.stdout.write(
+        `[watchdog] 运行期处置：判死 ${r.killed.length} 个超时任务（心跳新鲜保留 ${r.alive.length} 个）` +
+          `${r.docsHealed.length > 0 ? `；自愈 ${r.docsHealed.length} 个 extracting 文档` : ''} → 队列放行\n`,
+      );
+    },
+  });
+  process.stdout.write(
+    `[watchdog] 运行期周期扫描已启用：每 ${Math.round(sweeper.intervalMs / 1000)}s（判死阈值 ${Math.round(built.taskStaleMs / 1000)}s）\n`,
+  );
   const base = `http://${cfg.host}:${cfg.port}`;
   process.stdout.write(
     [

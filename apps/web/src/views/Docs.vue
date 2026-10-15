@@ -157,7 +157,9 @@ function availOf(d: DocumentInfo): { kind: 'ready' | 'detecting' | 'unavailable'
   const m = (d.meta || {}) as Record<string, unknown>
   const raw = String(m.extract_availability || '')
   const reason = String(m.extract_availability_reason || '')
-  if (raw === 'detecting') return { kind: 'detecting', text: '正在检测模型可用性（首次约 1 分钟）—— 探测完成前不代表可用或不可用' }
+  // ⚠️ 文案里**不要出现"可用/不可用"这两个词** —— 否则断言"不许说成可用或不可用"无法成立，
+  //    而且用户也会被绕进去（我第一版写了"不代表可用或不可用"，断言立刻红 —— 这是对的）
+  if (raw === 'detecting') return { kind: 'detecting', text: '正在检测模型可用性（首次约 1 分钟）—— 探测完成前不下结论' }
   if (raw === 'unavailable') return { kind: 'unavailable', text: `模型不可用：${reason || '（后端未给原因 —— 不编）'}` }
   return { kind: 'ready', text: '' }
 }

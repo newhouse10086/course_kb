@@ -218,6 +218,13 @@ export interface LlmJsonSchemaRequest {
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
+  /**
+   * ★ **优先级车道**（Lead 裁定的"最小形态公平性"）：
+   * `'interactive'` = **人在等**（会话命名/答疑）→ 插到批量前面；
+   * `'batch'`（默认）= 后台批量（抽取/OCR/翻译）→ 兜底。
+   * ⚠️ 缺省即 `'batch'` ⟹ 既有调用方**行为不变**（同优先级仍 FIFO）。
+   */
+  priority?: 'interactive' | 'batch';
 }
 
 export interface LlmJsonSchemaResult<T = unknown> {

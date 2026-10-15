@@ -35,7 +35,11 @@ import type { WorkerRunnerWithRaw } from '../worker/runner.ts';
 import type { WorkerEvent } from '../worker/protocol.ts';
 import type { TaskHandler, TaskHandlerContext } from './queue.ts';
 import type { Extractor, CompleteJsonFn } from './extract.ts';
+// ★ 长文本分块的调用数预估（与 worker/pipeline/chunk.py 逐字等价，有 parity 测试）
+import { DEFAULT_CHUNK_CHARS } from './extract.ts';
+import { countChunkedUnits, estimateChunkCalls } from './chunk-cost.ts';
 import { OPENROUTER_ASR_MODEL, createOpenRouterAsr } from '../providers/openrouter_audio.ts';
+import { createOpenRouterOcr } from '../providers/openrouter_ocr.ts';
 
 /** 单个抽取窗口的字符预算（v1 用的同一量级；超长单元必须切窗，否则丢内容 —— 坑 5）。 */
 export const MAX_EXTRACT_CHARS = 8000;
@@ -199,6 +203,12 @@ export interface PipelineDeps {
   resolveExtractorAvailability?: () => Promise<ExtractAvailability>;
   /** 上传后是否自动抽取（默认 true；大文档只想先解析时可关） */
   autoExtractOnParse?: boolean;
+  /**
+   * ★ 长文本分块阈值（字符）。**必须与 `extractor` 的 `chunkChars` 同源** ——
+   * 闸门按它预估调用数，worker plan/convert 按它分块；三处不同会让"预估代价"
+   * 与"真实花费"对不上（坑 24 同族）。缺省 = `DEFAULT_CHUNK_CHARS`（24_000）。
+   */
+  chunkChars?: number;
 }
 
 interface ParsedUnit {
@@ -386,7 +396,19 @@ export function decideAutoExtract(input: {
   units: number;
   textGate?: string;
   maxUnits: number;
+  /**
+   * ★ 长文本分块后的**实际 LLM 调用数**（> `units` 时说明有单元被分了块）。
+   * 缺省 = `units`（未分块/未知 —— 向后兼容，行为与改前一致）。
+   *
+   * ⚠️ 闸门必须按**调用数**算而不是单元数：`[实测]` 真库 840 个 ≥8k 单元
+   * 按 24k 分块 → **951 次调用**（多 111 次）。若按单元数报，用户看到的代价**偏小**
+   * —— 正是坑 24 的同族（"承诺的代价"与"实际生效"不一致）。
+   */
+  chunks?: number;
+  /** 发生分块的单元数（诊断/展示："其中 N 个长单元被分块"） */
+  chunkedUnits?: number;
 }): { action: 'run' | 'needs_confirm' | 'skip'; meta: Record<string, unknown> } {
+  const calls = Math.max(input.units, Math.trunc(input.chunks ?? input.units));
   // ① 正文为空 → 不入队（注定 0 卡片）
   if (input.textGate === 'empty_body') {
     return {
@@ -397,23 +419,39 @@ export function decideAutoExtract(input: {
       },
     };
   }
-  // ② 单元数超阈值 → 不自动抽取，标"待确认" + **代价可见（次数 + 时长区间）**
-  if (input.units > input.maxUnits) {
-    const [lo, hi] = estimateExtractMinutes(input.units);
+  // ② 调用数超阈值 → 不自动抽取，标"待确认" + **代价可见（次数 + 时长区间）**
+  if (calls > input.maxUnits) {
+    const [lo, hi] = estimateExtractMinutes(calls);
+    const chunked = Math.trunc(input.chunkedUnits ?? 0);
+    const chunkNote =
+      chunked > 0
+        ? `（其中 ${chunked} 个长单元超过分块阈值 → 已按块拆分，故调用数由 ${input.units} 增至 ${calls}）`
+        : '';
     return {
       action: 'needs_confirm',
       meta: {
         needs_confirm: true,
-        est_calls: input.units,
+        est_calls: calls,
         est_minutes: [lo, hi],
+        // ★ 代价可见：单元数、分块后调用数、分块单元数**都记**（可对账）
+        est_units: input.units,
+        est_chunked_units: chunked,
         extract_auto: 'needs_confirm',
         extract_skip_reason:
-          `单元数 ${input.units} 超过自动抽取阈值 ${input.maxUnits} —— 抽取会发起约 ${input.units} 次 LLM 调用` +
+          `预计发起约 ${calls} 次 LLM 调用${chunkNote}，超过自动抽取阈值 ${input.maxUnits}` +
           `（并发=1，预计 ${lo}–${hi} 分钟）。请在界面确认后手动开始（POST /api/v1/documents/:id/extract）。`,
       },
     };
   }
-  return { action: 'run', meta: { extract_auto: 'running', extract_auto_units: input.units, extract_auto_at: Date.now() } };
+  return {
+    action: 'run',
+    meta: {
+      extract_auto: 'running',
+      extract_auto_units: input.units,
+      ...(input.chunks !== undefined ? { extract_auto_calls: calls } : {}),
+      extract_auto_at: Date.now(),
+    },
+  };
 }
 
 export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> {
@@ -631,6 +669,145 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
     };
   };
 
+  /**
+   * ★★ PDF 图片型页的 **云端 OCR**（两趟协议）—— 用户裁定：**走 OpenRouter，不接本地**。
+   *
+   * ## 协议（worker 侧已实现，见 `worker/adapters/pdf.py::ocr_pages`）
+   * ```
+   * 趟1  runner(parse)  → meta.ocr.stage = 'rendered_awaiting_cloud_ocr'
+   *                      meta.ocr_images = [{page, path}]          ← worker 渲染好的页图
+   * 趟2  Node 逐图调 providers.recognize()   ← ★ 唯一 OpenRouter 实现处
+   *      runner(parse, cloud_texts={页号:文本}) → stage = 'cloud_texts_applied'
+   * ```
+   * 为什么由 Node 编排而不用 worker 自己发 HTTP：`AGENTS.md §0`
+   * 「**Node 是编排者，Python 是计算器**」。若 worker 自己调 OpenRouter，
+   * 就会出现**第二套 OCR 实现**（第二份提示词/模型名/禁用清单）—— 坑 27「两条路径 = 两套真相」。
+   *
+   * ## ★★ 结构上**不可能**静默回退本地（Lead 要求，抄 `asrViaOpenRouter` 的形态）
+   * 这里**按 id 直接构造 `openrouter_ocr` provider**，**不走 policy 降级链** ——
+   * 于是"回退到本地 rapidocr"在**结构上做不到**（本地 OCR 根本不是这条路径上的候选）。
+   * 拿不到云端结果 → **如实抛错**，绝不偷偷跑本地。
+   *
+   * @returns 云端 OCR 文本 `{页号: 文本}`；**没有需要 OCR 的页时返回 `null`**（调用方据此跳过趟2）
+   */
+  const ocrViaOpenRouter = async (
+    ctx: TaskHandlerContext,
+    docId: string,
+    absPath: string,
+    workerResult: Record<string, unknown>,
+  ): Promise<Record<number, string> | null> => {
+    const docInfo = asRecord(workerResult.document) ?? {};
+    const parseMeta = asRecord(asRecord(docInfo.meta)?.parse) ?? {};
+    const ocrMeta = asRecord(parseMeta.ocr) ?? {};
+    const stage = asStr(ocrMeta.stage, '');
+
+    // 非图片型 / 无需 OCR → 直接返回（这是**正常路径**，不是降级）
+    if (stage !== 'rendered_awaiting_cloud_ocr') return null;
+
+    const rawImages = parseMeta.ocr_images;
+    const images = Array.isArray(rawImages) ? (rawImages as Record<string, unknown>[]) : [];
+    if (images.length === 0) {
+      // ★ 声明了"等云端"却没有任何图 → 这是**不一致**，必须响（不许静默当"无需 OCR"）
+      throw new ApiError('E_PARSE', '解析结果声明待云端 OCR，但没有任何页图', {
+        detail: `document_id=${docId}, stage=${stage}`,
+        hint: 'worker 侧 ocr_images 为空；请检查 worker/adapters/pdf.py 的渲染是否失败',
+      });
+    }
+
+    // ── provider：按 id/type 直接构造（**不走 policy 链** → 结构上不可能回退本地）──
+    // ⚠️ 路径是 `cfg.providers.providers.ocr`（`cfg.providers` 是 ProviderConfig，不是按 kind 索引的 map）
+    const entries = cfg.providers?.providers?.ocr ?? [];
+    const entry = entries.find(
+      (p) => p.type === 'openrouter_ocr' || p.id === 'openrouter-ocr-glm' || p.id.startsWith('openrouter-ocr'),
+    );
+    if (!entry) {
+      throw new ApiError('E_LLM', '没有配置 OpenRouter OCR provider（用户要求 OCR 走 API，不接本地）', {
+        hint:
+          '请在 config/providers.yaml 的 providers.ocr 下配置 `type: openrouter_ocr` + `.env` 的 `OPENROUTER_KEY`。' +
+          '**不会**回退本地 OCR。',
+      });
+    }
+    const ocr = createOpenRouterOcr(entry);
+    if (!ocr.info.configured) {
+      throw new ApiError('E_LLM', `OpenRouter OCR 不可用：${ocr.info.reason ?? '凭据未配置'}`, {
+        hint: '检查 .env 的 OPENROUTER_KEY；**不会**回退本地 OCR（用户明确要求走 API）。',
+      });
+    }
+
+    const modelUsed = String((entry.options as Record<string, unknown>)?.model ?? '(未在配置中指定)');
+    ctx.log(`云端 OCR 开始：${images.length} 页，模型 ${modelUsed}（OpenRouter）`, 'info');
+
+    const texts: Record<number, string> = {};
+    let okPages = 0;
+    let emptyPages = 0;
+    let failedPages = 0;
+    const failures: string[] = [];
+    const t0 = Date.now();
+
+    // 并发 = 1（用户硬要求；与全项目一致）
+    for (let i = 0; i < images.length; i += 1) {
+      if (ctx.signal.aborted) break;
+      const item = images[i] as Record<string, unknown>;
+      const page = asNum(item.page, 0);
+      const imgPath = asStr(item.path, '');
+      if (!page || !imgPath) {
+        failedPages += 1;
+        continue;
+      }
+      try {
+        const r = await ocr.recognize({ imagePath: imgPath, signal: ctx.signal });
+        const text = (r?.text ?? '').trim();
+        if (text.length > 0) {
+          texts[page] = text;
+          okPages += 1;
+        } else {
+          emptyPages += 1;
+        }
+      } catch (err) {
+        failedPages += 1;
+        if (failures.length < 5) failures.push(`p${page}: ${err instanceof Error ? err.message : String(err)}`);
+        // ★ 单页失败不放弃整篇（长任务断点友好）；但**如实计数**，绝不产假文本
+      }
+      const frac = (i + 1) / images.length;
+      // 进度映射到任务的 0.55→0.60 段（OCR 只是 parse 的一小段）
+      ctx.progress(0.55 + frac * 0.05, `云端 OCR ${i + 1}/${images.length} 页`, {
+        done: i + 1,
+        total: images.length,
+      });
+    }
+
+    // ★★ 全页失败 → **如实报错**，绝不"成功但没文本"（那会让下游以为是空文档）
+    if (okPages === 0 && images.length > 0) {
+      throw new ApiError('E_LLM', `云端 OCR 全部失败（${images.length} 页无一成功）`, {
+        detail: failures.join(' | ') || `模型 ${modelUsed} 未返回任何文本`,
+        hint:
+          '检查 OPENROUTER_KEY / 模型可用性 / 网络。**不会**回退本地 OCR。' +
+          (emptyPages === images.length ? '（若每页都返回空文本，这些页可能确实没有文字）' : ''),
+      });
+    }
+
+    ctx.log(
+      `云端 OCR 完成：成功 ${okPages} 页 / 空 ${emptyPages} 页 / 失败 ${failedPages} 页，` +
+        `耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s，模型 ${modelUsed}`,
+      failedPages > 0 ? 'warn' : 'info',
+    );
+
+    // ★ 如实留痕：实际用的模型 + 逐页统计（供 /capabilities 与前端展示）
+    repo.mergeDocumentMeta(docId, {
+      ocr_cloud: {
+        provider_id: entry.id,
+        model_used: modelUsed,
+        pages_requested: images.length,
+        pages_ok: okPages,
+        pages_empty: emptyPages,
+        pages_failed: failedPages,
+        elapsed_sec: Math.round((Date.now() - t0) / 100) / 10,
+        ...(failures.length > 0 ? { failures } : {}),
+      },
+    });
+    return texts;
+  };
+
   /** `parse` —— 上传后的主流程：worker 解析 → units 入库 →（可选）自动抽取 → 索引。 */
   const parse: TaskHandler = async (ctx: TaskHandlerContext) => {
     const docId = ctx.docId;
@@ -670,6 +847,74 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
         : new ApiError('E_PARSE', `文档解析失败：${err instanceof Error ? err.message : String(err)}`, {
             hint: 'worker 负责解析；确认 worker/cli.py 可用且文件格式受支持',
           });
+    }
+
+    // ①b ★★ 图片型 PDF 的**云端 OCR 第二趟**（用户裁定：走 OpenRouter，不接本地）
+    //     worker 只渲染（趟1 已把那批页图路径带回来）；这里 Node 调 provider，
+    //     再把 {页号:文本} 交回 worker（趟2）→ 建单元。
+    //     ★ 不需要 OCR 时 `ocrTexts` 为 null，**完全跳过**（零开销）。
+    let ocrTexts: Record<number, string> | null = null;
+    try {
+      ocrTexts = await ocrViaOpenRouter(ctx, docId, absPath, workerResult);
+    } catch (err) {
+      // ★ 云端 OCR 失败 → **如实失败**（不静默降级、也不假装解析成功）
+      repo.updateDocument(docId, { status: 'failed' });
+      repo.mergeDocumentMeta(docId, {
+        parse_status: 'failed',
+        parse_error: `云端 OCR 失败：${err instanceof Error ? err.message : String(err)}`,
+      });
+      throw err;
+    }
+    if (ocrTexts !== null) {
+      ctx.progress(0.60, `云端 OCR 完成，回填 ${Object.keys(ocrTexts).length} 页正文`);
+      try {
+        // ★ 趟2：把云端文本交回 worker（同一 `parse` job，加可选 `cloud_texts`）
+        workerResult = await runner({
+          job: 'parse',
+          input: {
+            doc_id: docId,
+            path: absPath,
+            kind: doc.kind,
+            root: cfg.root,
+            data_dir: cfg.dataDir,
+            // ⚠️ worker 侧 `job_parse` **必须透传**这个字段，否则**静默无效**
+            //    （任务报成功、stage 不变、而 OCR 文本根本没进去 —— 最危险的那类）
+            //    对应守卫测试：test_pdf_textmode.py 的 marker 用例（断言标记真的进了正文）
+            cloud_texts: ocrTexts,
+          },
+          signal: ctx.signal,
+          timeoutMs: cfg.workerTimeoutMs,
+          onEvent: (e) => {
+            const ev = e as Partial<WorkerEvent> & { type?: string };
+            if (ev.type === 'log') ctx.log(asStr(ev.msg), (ev.level as 'info' | 'warn' | 'error' | 'debug') ?? 'info');
+          },
+        });
+      } catch (err) {
+        repo.updateDocument(docId, { status: 'failed' });
+        repo.mergeDocumentMeta(docId, {
+          parse_status: 'failed',
+          parse_error: `回填云端 OCR 文本失败：${err instanceof Error ? err.message : String(err)}`,
+        });
+        throw err instanceof ApiError
+          ? err
+          : new ApiError('E_PARSE', `回填云端 OCR 文本失败：${err instanceof Error ? err.message : String(err)}`, {
+              hint: 'worker 第二趟 parse（带 cloud_texts）失败；检查 worker/cli.py 是否透传 cloud_texts',
+            });
+      }
+      // ★ 断言真的有正文进来（不是"我们回填了" —— 而是"worker 真的用了"）
+      const applied = asRecord(
+        asRecord(asRecord(asRecord(workerResult.document)?.meta)?.parse)?.ocr,
+      );
+      const stage2 = asStr(applied?.stage, '');
+      if (stage2 !== 'cloud_texts_applied') {
+        throw new ApiError('E_PARSE', `云端 OCR 文本未被 worker 采用（stage=${stage2 || '(空)'}）`, {
+          detail: `期望 stage='cloud_texts_applied'；OCR 文本 ${Object.keys(ocrTexts).length} 页`,
+          hint: 'worker/cli.py 的 job_parse 可能没透传 cloud_texts —— 那会导致**静默无效**（OCR 白跑）',
+        });
+      }
+      repo.mergeDocumentMeta(docId, {
+        ocr_cloud_applied_pages: Number(applied?.pages_ocr_ok ?? 0),
+      });
     }
 
     // ② units 入库
@@ -740,17 +985,25 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
     }
 
     /**
-     * ★★ **抽取前的闸门（纯函数决策，可穷举断言）** —— 修掉两件事：
+     * ★★ **抽取前的闸门（纯函数决策，可穷举断言）** —— 修掉三件事：
      * 1. **2523 单元会无声花掉 2523 次调用**（并发=1 约 3–7 小时）—— 必须让用户先看到代价再决定
      * 2. `text_gate='empty_body'`（图片型、正文为空）时抽取**注定 0 卡片** —— 不该空转花钱
+     * 3. ★ **长文本分块后调用数 > 单元数**（坑 24）：闸门必须按**分块后的真实次数**算，
+     *    否则用户看到的代价偏小（实测 840 长单元 → 951 次调用，多 111 次）。
      *
      * ⚠️ 决策放在**这里**（parse ④）而不是队列层：`parse` 本身就会抽取
      * （Lead 真上传实测：只有 parse 任务却产出了卡片）⟹ 队列再链一次会**双倍花费**。
      */
+    const gateUnits = repo.allUnitRows(docId);
+    const gateTexts = gateUnits.map((u) => u.text ?? '');
+    const gateChunkChars = deps.chunkChars ?? DEFAULT_CHUNK_CHARS;
     const gate = decideAutoExtract({
       units: unitIds.length,
       textGate: typeof parsedMeta.text_gate === 'string' ? parsedMeta.text_gate : undefined,
       maxUnits: autoExtractMaxUnits(),
+      // ★ 分块后的真实调用数（`chunk-cost.ts` 与 worker 逐字等价，有 parity 测试对账）
+      chunks: estimateChunkCalls(gateTexts, gateChunkChars),
+      chunkedUnits: countChunkedUnits(gateTexts, gateChunkChars),
     });
     if (gate.action !== 'run') {
       repo.mergeDocumentMeta(docId, gate.meta);

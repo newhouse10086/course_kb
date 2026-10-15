@@ -683,7 +683,8 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
    * 2. **权限**：可见 + 能抽取（owner/teacher/admin）—— 服务端权威判定，**不读客户端帧**
    * 3. **幂等**：已有 parse 在跑 → **409**（如实说明"正在跑"，**不造第二条**）
    * 4. 状态回写复用已修好的队列终态回写（`parse` → ready/failed）
-   * 5. ★ **代价可见**：图片型/正文为空的文档要重跑 OCR（**~9–12 秒/页**）→ **先告诉用户要多久**
+   * 5. ★ **代价可见**：图片型/正文为空的文档要重跑 OCR（**云端 OpenRouter**，
+   *    `[实测]` ~1.21 秒/页、~$0.00132/页）→ **先告诉用户要多久 + 花多少**
    * 6. ★ **判据**：重跑后 `units` 正文**真的变了**（空 → OCR 文本），不是"接口返回 200"
    */
   app.post('/api/v1/documents/:id/reparse', async (req, reply) => {
@@ -719,7 +720,7 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
         });
       }
 
-      // ⑤ 代价可见：图片型/正文为空 → 要跑 OCR（~9–12 秒/页），**先让用户知道要等多久**
+      // ⑤ 代价可见：图片型/正文为空 → 要跑**云端 OCR**，**先让用户知道要多久 + 花多少**
       let meta: Record<string, unknown> = {};
       try {
         meta = JSON.parse(String((row as { meta_json?: string }).meta_json ?? '{}')) as Record<string, unknown>;
@@ -728,20 +729,35 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
       }
       const pages = Number(row.page_count ?? 0) || 0;
       const needsOcr = meta.text_mode === 'image' || meta.text_gate === 'empty_body';
-      const ocrSecondsPerPage = 11; // 实测 ~9–12 秒/页（CPU ONNX，无 GPU）
+      /**
+       * ★★ OCR 已改走**云端 OpenRouter**（用户裁定："不要接本地的模型"）。
+       *
+       * ⚠️ **本段原先是错的**：写"走**本地** OCR（~9–12 秒/页，不消耗额度）"——
+       * 那是本地 rapidocr 的实测值，换云端后**口径全变**（走 API、按 token 计费、更快）。
+       * 用户会据此做"要不要重跑"的决定 ⟹ 报错的估时/费用=**替他做错决定**。
+       *
+       * `[实测]` 2026-10-16 真端点（`qwen/qwen3-vl-235b-a22b-instruct`，真实教材页）：
+       * 每页 1211ms · 1457 prompt + 533 completion tokens · in $0.21/M · out $1.90/M
+       * ⟹ 约 **$0.00132/页**（434 页 ≈ **$0.57** / **~9 分钟**）。
+       */
+      const OCR_SECS_PER_PAGE = 1.21; // 实测（qwen3-vl-235b；旧本地值 11s/页 已废弃）
+      const OCR_USD_PER_PAGE = 0.00132; // 实测口径：1457 in×$0.21/M + 533 out×$1.90/M
+      const estSecs = pages * OCR_SECS_PER_PAGE;
+      const estUsd = pages * OCR_USD_PER_PAGE;
       const cost = needsOcr
         ? {
             needs_ocr: true,
-            est_minutes: [
-              Math.max(1, Math.round((pages * 9) / 60)),
-              Math.max(1, Math.round((pages * 12) / 60)),
-            ] as [number, number],
+            ocr_mode: 'cloud',
+            ocr_provider: 'openrouter',
+            est_minutes: pages > 0 ? Math.max(1, Math.round(estSecs / 60)) : null,
+            est_usd: pages > 0 ? Math.round(estUsd * 10000) / 10000 : null,
             cost_note:
               pages > 0
-                ? `该文档正文为空（图片型）→ 重跑会走**本地 OCR**（~9–12 秒/页，约 ${pages} 页）` +
-                  `，预计 ${Math.max(1, Math.round((pages * 9) / 60))}–${Math.max(1, Math.round((pages * 12) / 60))} 分钟；` +
-                  'OCR 不消耗 LLM 额度，但会占用 CPU（并发=1）。解析完成后会自动抽取（那一步会消耗 LLM）。'
-                : '该文档正文为空（图片型）→ 重跑会走本地 OCR（~9–12 秒/页）。页数未知，耗时会随页数增长。',
+                ? `该文档正文为空（图片型）→ 重跑会走**云端 OCR（OpenRouter 视觉模型）**，约 ${pages} 页；` +
+                  `预计 **${Math.max(1, Math.round(estSecs / 60))} 分钟**，费用约 **$${(Math.round(estUsd * 10000) / 10000).toFixed(4)}**` +
+                  `（按 token 计费，实测口径；**以 OpenRouter 账单为准**）。` +
+                  '解析完成后会自动抽取（那一步消耗 LLM 额度）。'
+                : '该文档正文为空（图片型）→ 重跑会走云端 OCR（OpenRouter）。页数未知，耗时与费用随页数增长。',
           }
         : { needs_ocr: false, cost_note: '重跑会重新解析并在完成后自动抽取（抽取会消耗 LLM 额度）。' };
 

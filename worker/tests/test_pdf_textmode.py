@@ -562,7 +562,9 @@ def test_estimate_ocr_cost_is_honest_about_currency_and_unit() -> None:
         434 * CLOUD_OCR_PROMPT_TOKENS_PER_PAGE / 1_000_000 * CLOUD_OCR_USD_PER_M_INPUT
         + 434 * CLOUD_OCR_COMPLETION_TOKENS_PER_PAGE / 1_000_000 * CLOUD_OCR_USD_PER_M_OUTPUT
     )
-    assert abs(c["est_usd"] - expect) < 1e-6, f"估算 {c['est_usd']} ≠ 复算 {expect}"
+    # ★ 函数把 USD 四舍五入到 4 位（账单精度足够）→ 容差取 1e-4
+    assert abs(c["est_usd"] - expect) < 1e-4, f"估算 {c['est_usd']} ≠ 复算 {expect}"
+    assert abs(c["est_usd"] - expect) < 5e-5, "两者应只差四舍五入"
     # ★ 输出单价 > 输入单价（这正是"必须分开算"的原因）；若哪天反了，本断言会提醒复核
     assert CLOUD_OCR_USD_PER_M_OUTPUT > CLOUD_OCR_USD_PER_M_INPUT
     # 本地：0 费用但有时长

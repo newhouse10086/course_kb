@@ -46,8 +46,16 @@ import { ProviderError } from '../types.ts';
 export class LlmSemaphore {
   private limit: number;
   private running = 0;
-  /** 等待队列（FIFO —— 保证**公平**：长任务不会饿死短任务） */
-  private readonly waiters: (() => void)[] = [];
+  /**
+   * ★★ **两条 FIFO 车道**（Lead 裁定的"最小形态公平性"）：
+   * - `interactive`：**人在等**的调用（会话命名、答疑）—— 先取号
+   * - `batch`：后台批量（抽取 / OCR / 翻译 / 汇总）—— 兜底
+   *
+   * ★ 车道内仍 **FIFO**（各自不饿死）；★ `drain()` **先取交互**，无交互时才取批量
+   *   ⟹ 长批量**不会**堵住交互请求；★ 但只要没有交互在等，**批量照跑**（不做"交互独占"）。
+   */
+  private readonly interactiveWaiters: (() => void)[] = [];
+  private readonly batchWaiters: (() => void)[] = [];
   /** 观测：历史峰值并发（`/capabilities` 与测试据此断言"真的同时跑了几路"） */
   private peak = 0;
 
@@ -70,7 +78,14 @@ export class LlmSemaphore {
     return this.running;
   }
   get pending(): number {
-    return this.waiters.length;
+    return this.interactiveWaiters.length + this.batchWaiters.length;
+  }
+  /** 观测：两条车道各有多少在等（判断"调大并发有没有用"时用） */
+  get pendingInteractive(): number {
+    return this.interactiveWaiters.length;
+  }
+  get pendingBatch(): number {
+    return this.batchWaiters.length;
   }
   /** 历史峰值（★ 断言"真的同时跑 N 路"靠它，而不是断言"我们读了配置"） */
   get peakInFlight(): number {
@@ -84,8 +99,9 @@ export class LlmSemaphore {
   }
 
   private drain(): void {
-    while (this.running < this.limit && this.waiters.length > 0) {
-      const next = this.waiters.shift();
+    while (this.running < this.limit) {
+      // ★ 先交互、后批量（车道内各自 FIFO）
+      const next = this.interactiveWaiters.shift() ?? this.batchWaiters.shift();
       if (!next) break;
       this.running += 1;
       this.peak = Math.max(this.peak, this.running);
@@ -93,10 +109,17 @@ export class LlmSemaphore {
     }
   }
 
-  async run<T>(task: () => Promise<T>): Promise<T> {
+  /**
+   * 跑一个任务。
+   *
+   * @param opts.priority `'interactive'` = **人在等**（会话命名/答疑）→ 插到批量前面；
+   *   `'batch'`（默认）= 后台批量 → 兜底。★ 默认值是 `batch` ⟹ **既有调用方行为不变**（同优先级 FIFO）。
+   */
+  async run<T>(task: () => Promise<T>, opts: { priority?: 'interactive' | 'batch' } = {}): Promise<T> {
     if (this.running >= this.limit) {
+      const lane = opts.priority === 'interactive' ? this.interactiveWaiters : this.batchWaiters;
       await new Promise<void>((resolve) => {
-        this.waiters.push(resolve); // 槽位释放时 `drain()` 会 resolve 我们
+        lane.push(resolve); // 槽位释放时 `drain()` 会按优先级 resolve 我们
       });
     } else {
       this.running += 1;
@@ -425,7 +448,8 @@ export class OpenAiCompatibleLlm implements Provider {
     }
 
     // ★ 并发 = 1
-    return LLM_QUEUE.run(async () => {
+    return LLM_QUEUE.run(
+      async () => {
       const body = {
         model: this.model,
         messages: req.messages,
@@ -526,7 +550,9 @@ export class OpenAiCompatibleLlm implements Provider {
           ? { promptTokens: resp.usage.prompt_tokens ?? 0, completionTokens: resp.usage.completion_tokens ?? 0 }
           : undefined,
       };
-    });
+      },
+      { priority: req.priority ?? 'batch' },
+    );
   }
 
   // ─────────────────────────────────────────────

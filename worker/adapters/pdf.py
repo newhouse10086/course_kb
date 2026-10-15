@@ -159,10 +159,13 @@ OCR_MODE_OFF = "off"
 #: 默认 OCR 模式 —— **云端**（用户指令）。
 DEFAULT_OCR_MODE = OCR_MODE_CLOUD
 
-#: 云端 OCR 的**预计单页耗时（秒）**，用于诚实的耗时/成本预估。
-#: ⚠️ `[实测-外部]` Lead 实测：glm-5.3-flash **3821ms/页**、gemini-2.5-flash-lite **5460ms/页**。
-#: 本值取较快档 + 网络余量，仅用于**预估提示**；真实耗时由实测更新。
-CLOUD_OCR_SECS_PER_PAGE_EST = 3.82
+#: 云端 OCR 的**实测单页耗时（秒）**，用于诚实的耗时预估。
+#:
+#: ★ `[实测]` 2026-10-16 真端点（`qwen/qwen3-vl-235b-a22b-instruct`，真实教材页 150 DPI）：
+#: **1211 ms/页**（备选 `qwen3-vl-30b` 为 1344 ms/页）。
+#: 历史值 3.82 来自旧模型 `z-ai/glm-5.3-flash` —— 换国产后**快约 3 倍**。
+#: 取 1.5（**留网络余量**，比实测略保守）用于预估提示。
+CLOUD_OCR_SECS_PER_PAGE_EST = 1.5
 
 #: 云端 OCR **每页 token 的实测值**（用于计费估算）。
 #:
