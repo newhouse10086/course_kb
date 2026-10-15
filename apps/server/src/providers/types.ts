@@ -226,6 +226,13 @@ export interface LlmJsonSchemaResult<T = unknown> {
   usedProvider: string;
   degradedFrom?: string;
   degradedReason?: string;
+  /**
+   * ★ 这一份产物是用哪种结构化输出模式拿到的（**实测**，不是声明）：
+   * `'strict'` = 端点接受了严格 schema（`required` + `additionalProperties:false`）；
+   * `'lenient'` = 端点拒绝严格 schema，已回落裸 schema（`strict:true` 不被强制）。
+   * ⟹ 上游应把它写进 `meta.structured_output_mode`，让"网关恢复/退化"**可观测**。
+   */
+  structuredOutputMode?: 'strict' | 'lenient';
   usage?: { promptTokens: number; completionTokens: number };
 }
 

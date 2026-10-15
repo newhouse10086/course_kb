@@ -18,6 +18,7 @@
  *   （长任务断点友好，契约 C4）。
  */
 
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import type { ServerConfig } from '../config.ts';
@@ -27,6 +28,7 @@ import type { CardDraft, EdgeDraft, EntityDraft, Repo, UnitDraft, UnitApi } from
 import { unitToApi } from '../store/repo.ts';
 import { indexDocument } from '../store/search.ts';
 import { applyXrefs } from '../store/xref.ts';
+import { autoExtractMaxUnits, estimateExtractMinutes } from './queue.ts';
 import { enumsComplete, type SchemaEnums } from '../store/schema-enums.ts';
 import type { Span } from '../store/types.ts';
 import type { WorkerRunnerWithRaw } from '../worker/runner.ts';
@@ -157,6 +159,149 @@ export function windowUnit(
     parts.push({ text: text.slice(i * maxChars, (i + 1) * maxChars), part: i + 1, total });
   }
   return parts;
+}
+
+/**
+ * ★★ **自动抽取的闸门决策（纯函数）** —— 放在 `parse` ④ 之前调用。
+ *
+ * ## 为什么要有闸门（真实代价）
+ * - 并发=1 下**一次调用约 20–120 秒**；refman 有 **2523 个单元** ⟹ 自动抽取 = **3–7 小时 + 2523 次真实花费**
+ *   （用户明确在意 LLM 花费 —— kimi 事件）。**不能无声发生**。
+ * - `text_gate='empty_body'`（图片型且无文字层/OCR）时抽取**注定 0 卡片** —— 空转花钱。
+ *
+ * ## 为什么是纯函数
+ * 决策要能被**穷举断言**（含"阈值真的被读" —— 坑 24），而不是只能靠跑真任务碰运气。
+ *
+ * @returns `run` = 放行；`needs_confirm` = 超阈值，交用户确认；`skip` = 正文为空，不入队
+ */
+/**
+ * ★★ **单元 id 计划**（机制 2 修复：id 不稳定 → FK 级联删卡）。
+ *
+ * ## 被修的真实缺陷（零 LLM 实测证据）
+ * ```
+ * 重跑前 cards=1  units=unt_old_1
+ * parse 终态 done            ← 解析**成功**
+ * 重跑后 cards=0             ← ★ 卡片没了
+ * 重跑后 units=unt_0cd7d866e78e,unt_1f7970dfe6e1   ← 单元 id 全变
+ * ```
+ * 根因：`handlers.ts` 构造 `drafts` 时**不带 id** → `repo.replaceUnits` 对每个单元
+ * `newUnitId()` → 新 id 与旧 id 不同 → `cards.unit_id REFERENCES units(id) ON DELETE CASCADE`
+ * **级联删掉全部卡片** —— **与抽取成功与否无关**（成功的 reparse 也清卡）。
+ *
+ * ## 两条规则
+ * 1. **结构未变 → 复用旧 id**（条件 2(ii)）：按 `(ord, span)` 配对且**正文相同**时，
+ *    直接沿用旧 id。⟹ **真实升级路径**（库里现存 id 是随机的）第一次 reparse **也不丢卡**；
+ *    只做确定性哈希的话，迁移那一次仍会因 id 变化而清卡 —— 等于没修。
+ * 2. 否则用**确定性 id** `unt_<sha1(docId|ord|span|title)[:12]>`：同一文件重跑得到同一 id。
+ *    ⚠️ `span` 可能缺失：null/undefined 用 `'-'` 占位（**不许与 `''` 算出同一个哈希**）。
+ *
+ * ## 碰撞（条件 1）
+ * 同一文档内 `(docId, ord, span, title)` 相同时哈希相同 → 若直接覆盖就是**静默丢单元**。
+ * 这里**加后缀** `-2`/`-3`… 并**如实记录** `collisions`（调用方写进 meta）——**绝不静默覆盖**。
+ */
+export interface UnitIdPlan {
+  /** 与 drafts 一一对应的 id */
+  ids: string[];
+  /** 复用旧 id 的数量（结构未变） */
+  reused: number;
+  /** 用确定性哈希新算的数量 */
+  deterministic: number;
+  /** 碰撞（同哈希）→ 已加后缀；如实上报，便于排查"为什么有重复结构" */
+  collisions: { index: number; base: string; final: string }[];
+}
+
+export function planUnitIds(opts: {
+  docId: string;
+  drafts: { ord: number; title?: string; span?: { kind?: string; start?: number; end?: number }; text?: string }[];
+  oldUnits: { id: string; ord: number; span_kind?: string; span_start?: number; span_end?: number; text?: string | null }[];
+}): UnitIdPlan {
+  const { docId, drafts, oldUnits } = opts;
+  const part = (v: unknown): string => (v === null || v === undefined || v === '' ? '-' : String(v));
+  const detId = (d: { ord: number; title?: string; span?: { kind?: string; start?: number; end?: number } }): string => {
+    const kind = part(d.span?.kind);
+    const start = Number.isFinite(d.span?.start) ? String(d.span?.start) : '-';
+    const end = Number.isFinite(d.span?.end) ? String(d.span?.end) : '-';
+    const h = createHash('sha1').update(`${docId}|${d.ord}|${kind}|${start}|${end}|${part(d.title)}`).digest('hex');
+    return `unt_${h.slice(0, 12)}`;
+  };
+  const key = (ord: number, kind: unknown, start: unknown, end: unknown): string =>
+    `${ord}|${part(kind)}|${Number.isFinite(start) ? String(start) : '-'}|${Number.isFinite(end) ? String(end) : '-'}`;
+
+  // 旧单元按 (ord, span) 分组 → 供"结构未变则复用 id"
+  const oldByKey = new Map<string, { id: string; text: string }[]>();
+  for (const u of oldUnits) {
+    const k = key(u.ord, u.span_kind, u.span_start, u.span_end);
+    const list = oldByKey.get(k) ?? [];
+    list.push({ id: u.id, text: u.text ?? '' });
+    oldByKey.set(k, list);
+  }
+  const consumed = new Set<string>();
+  const used = new Set<string>();
+  const ids: string[] = [];
+  const collisions: { index: number; base: string; final: string }[] = [];
+  let reused = 0;
+  let deterministic = 0;
+
+  drafts.forEach((d, i) => {
+    const k = key(d.ord, d.span?.kind, d.span?.start, d.span?.end);
+    let id = '';
+    const cands = oldByKey.get(k) ?? [];
+    const hit = cands.find((c) => !consumed.has(c.id) && c.text === (d.text ?? ''));
+    if (hit) {
+      id = hit.id;
+      consumed.add(id);
+      reused += 1;
+    } else {
+      id = detId(d);
+      deterministic += 1;
+    }
+    // 碰撞：同批次内 id 已被占用 → 加后缀（**不许静默覆盖**）
+    if (used.has(id)) {
+      const base = id;
+      let n = 2;
+      while (used.has(`${base}-${n}`)) n += 1;
+      id = `${base}-${n}`;
+      collisions.push({ index: i, base, final: id });
+    }
+    used.add(id);
+    ids.push(id);
+  });
+
+  return { ids, reused, deterministic, collisions };
+}
+
+export function decideAutoExtract(input: {
+  units: number;
+  textGate?: string;
+  maxUnits: number;
+}): { action: 'run' | 'needs_confirm' | 'skip'; meta: Record<string, unknown> } {
+  // ① 正文为空 → 不入队（注定 0 卡片）
+  if (input.textGate === 'empty_body') {
+    return {
+      action: 'skip',
+      meta: {
+        extract_auto: 'skipped',
+        extract_skip_reason: '该资料正文为空（图片型且未产出文字层/OCR）—— 抽取会注定产出 0 张卡片，故不自动抽取',
+      },
+    };
+  }
+  // ② 单元数超阈值 → 不自动抽取，标"待确认" + **代价可见（次数 + 时长区间）**
+  if (input.units > input.maxUnits) {
+    const [lo, hi] = estimateExtractMinutes(input.units);
+    return {
+      action: 'needs_confirm',
+      meta: {
+        needs_confirm: true,
+        est_calls: input.units,
+        est_minutes: [lo, hi],
+        extract_auto: 'needs_confirm',
+        extract_skip_reason:
+          `单元数 ${input.units} 超过自动抽取阈值 ${input.maxUnits} —— 抽取会发起约 ${input.units} 次 LLM 调用` +
+          `（并发=1，预计 ${lo}–${hi} 分钟）。请在界面确认后手动开始（POST /api/v1/documents/:id/extract）。`,
+      },
+    };
+  }
+  return { action: 'run', meta: { extract_auto: 'running', extract_auto_units: input.units, extract_auto_at: Date.now() } };
 }
 
 export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> {
@@ -301,7 +446,29 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
       ...(result.degradedFrom
         ? { extract_degraded_from: result.degradedFrom, extract_degraded_reason: result.degradedReason ?? '' }
         : {}),
+      /**
+       * ★ **实测**的结构化输出模式（`strict` = 端点接受严格 schema；`lenient` = 已回落裸 schema）。
+       * 为什么写进 meta：该端点对严格 schema **时好时坏**（实测 200/400 都出现过）——
+       * 记下来才能**看见**"网关恢复（strict 命中率上升）/ 退化（掉到 lenient 的比例上升）"，
+       * 而不是靠猜（坑 21：抓了但没上报 = 等于没抓）。
+       */
+      ...(result.structuredOutputMode ? { structured_output_mode: result.structuredOutputMode } : {}),
     });
+
+    /**
+     * ★★ **抽取结束后必须把文档状态从 `extracting` 放出来**（用户直接撞到的 bug）。
+     *
+     * 缺陷证据：`doc_473f915e315f` 的 `tasks.status='failed'` 而 `documents.status` **仍是 `extracting`**
+     * ⟹ 界面不显示失败/原因，用户以为还在跑（"显示是可用的，请问抽取的结果在哪"）。
+     * 本 handler 原先只写 `meta.extract_status`，**从不更新 `documents.status`** —— 于是它永远停在 `extracting`。
+     *
+     * 映射（如实）：
+     * - `failed` → `documents.status='failed'`（原因在 meta 的 `extract_error`，前端可读）
+     * - `done` / `partial` / `done_empty` → **回到 `ready`**（抽取这一阶段结束了；卡片数在 meta 里如实报）
+     *   ⚠️ `done_empty` **不是** ready 意义上的"有内容"—— 前端要读 `extract_status` 显示"未产出卡片"，
+     *   不许只看 `documents.status`（那是**阶段**状态，不是**产出**状态）。
+     */
+    repo.updateDocument(docId, { status: status === EXTRACT_STATUS.failed ? 'failed' : 'ready' });
 
     const pick = result.stats.pick ?? {};
     return {
@@ -393,7 +560,23 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
       span: u.span,
       text: u.text,
     }));
+    // ★★ 机制 2 修复（Lead 授权方案 4 + 条件 2(ii)）：**单元 id 必须稳定**。
+    //    原实现不带 id → `repo.replaceUnits` 每次 `newUnitId()` → 新 id ≠ 旧 id
+    //    → `cards.unit_id REFERENCES units(id) ON DELETE CASCADE` **级联删掉全部卡片**
+    //    （实测：**成功的 reparse 也清卡**，与抽取成功与否无关）。
+    const idPlan = planUnitIds({ docId, drafts, oldUnits: repo.allUnitRows(docId) });
+    drafts.forEach((d, i) => {
+      d.id = idPlan.ids[i];
+    });
     const unitIds = repo.replaceUnits(docId, drafts);
+    if (idPlan.collisions.length > 0) {
+      // ★ 碰撞**不许静默**：已加后缀保证"都还在"，但原因要能被排查
+      repo.mergeDocumentMeta(docId, {
+        unit_id_collisions: idPlan.collisions,
+        unit_id_collision_note:
+          '同一文档内有单元的 (ord, span, title) 完全相同 → 确定性 id 会撞；已加后缀保留全部单元',
+      });
+    }
     ctx.progress(0.58, '单元入库', { done: unitIds.length, total: unitIds.length });
 
     const stats = asRecord(workerResult.stats) ?? {};
@@ -409,6 +592,9 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
       parse_status: 'done',
       parse_mode: asStr(stats.parse_mode, 'unknown'),
       parse_units: unitIds.length,
+      // ★ 单元 id 来源如实记录（复用旧 id = 结构未变；deterministic = 新算）
+      //   为什么记：迁移期用户会问"为什么这次没丢卡片/为什么 id 变了"
+      unit_id_plan: { reused: idPlan.reused, deterministic: idPlan.deterministic },
     });
 
     // ③ 检索索引（units 先可搜）
@@ -426,6 +612,28 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
     if (!autoExtract) {
       detail.note = '自动抽取已关闭，请调用 POST /api/v1/documents/{id}/extract';
       ctx.progress(1, '完成（未抽取卡片）');
+      return detail;
+    }
+
+    /**
+     * ★★ **抽取前的闸门（纯函数决策，可穷举断言）** —— 修掉两件事：
+     * 1. **2523 单元会无声花掉 2523 次调用**（并发=1 约 3–7 小时）—— 必须让用户先看到代价再决定
+     * 2. `text_gate='empty_body'`（图片型、正文为空）时抽取**注定 0 卡片** —— 不该空转花钱
+     *
+     * ⚠️ 决策放在**这里**（parse ④）而不是队列层：`parse` 本身就会抽取
+     * （Lead 真上传实测：只有 parse 任务却产出了卡片）⟹ 队列再链一次会**双倍花费**。
+     */
+    const gate = decideAutoExtract({
+      units: unitIds.length,
+      textGate: typeof parsedMeta.text_gate === 'string' ? parsedMeta.text_gate : undefined,
+      maxUnits: autoExtractMaxUnits(),
+    });
+    if (gate.action !== 'run') {
+      repo.mergeDocumentMeta(docId, gate.meta);
+      detail.extract_status = gate.action === 'needs_confirm' ? 'needs_confirm' : 'skipped';
+      detail.counts = repo.counts(docId);
+      Object.assign(detail, gate.meta);
+      ctx.progress(1, gate.action === 'needs_confirm' ? '完成（待确认是否抽取）' : '完成（未抽取卡片）');
       return detail;
     }
 

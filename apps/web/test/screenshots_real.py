@@ -6,7 +6,7 @@
   · screenshots.py 是设计系统的证据（契约 mock 的饱满数据，14 张）
   · 本脚本是**真后端**的证据：登录真流程（httpOnly cookie）+ 真数据（cards=0 的空态也照样拍）
 
-用法：python test/screenshots_real.py [--backend http://127.0.0.1:8799] [--user admin] [--pass Admin2026lab]
+用法：python test/screenshots_real.py [--backend http://127.0.0.1:8787] [--user admin] [--pass Admin2026lab]
 产出：test/screenshots/real-{wiki,graph,docs,lab,settings}-{light,dark}.png
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ sys.path.insert(0, str(HERE))
 from cdp import Chrome, find_chrome  # noqa: E402
 
 OUT = HERE / 'screenshots'
-BACKEND = 'http://127.0.0.1:8799'
+BACKEND = 'http://127.0.0.1:8787'
 USER = 'admin'
 PASSWORD = 'Admin2026lab'
 for i, a in enumerate(sys.argv):

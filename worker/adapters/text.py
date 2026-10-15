@@ -54,6 +54,61 @@ _NOISE_TITLE = re.compile(r"[\s\u3000]*$")
 
 # ── 标题识别（pdf/slide/docx/text 共用）─────────────────────────────────
 _MD_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+#: 代码围栏标记（``` 或 ~~~，3 个以上，可带语言后缀如 ```sql）。
+#:
+#: ★ 存在的理由（实测 bug）：Markdown 代码块里的 `# 注释` 会被标题正则
+#: 误判成 Markdown 标题（两者都是行首 `#`），造出**假层级**并打乱父子树。
+#: CommonMark 规定围栏是 3 个以上连续反引号/波浪号，且关闭围栏需
+#: **同类且不短于**开启围栏 —— 这里照此实现。
+_FENCE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
+
+#: 含 CJK 字符的行（用于"全大写标题"判据的排除）。
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
+
+
+#: 标题行**不得**以这些标点结尾（句末标点意味着它是正文句子，不是标题）。
+#:
+#: ★ 这个常量必须被**所有**"用编号猜标题"的地方共用（`text.py`、`docx.py`…）。
+#: `[实测]` 教训：原先 `text.py` 有这份护栏、`docx.py` 的编号兜底**没有** →
+#: 一份 60 段的纯文字 Word 文档被判出 **60 个假标题**（详见 `docx.py::_heading_level`）。
+#: **护栏只有一处实现，就不会漂移。**
+_TITLE_FORBIDDEN_TAIL = (".", ",", ";", ":", "。", "，", "；", "：", "！", "？", "!", "?")
+
+
+def is_title_like(line: str) -> bool:
+    """该行是否**可能**是标题（不含句末标点）。
+
+    `text.py` 与 `docx.py` 共用本判据 —— 一处实现，不会漂移。
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    return not s.endswith(_TITLE_FORBIDDEN_TAIL)
+
+
+def _looks_like_shouting_heading(stripped: str) -> bool:
+    """是否是"全大写英文标题"（如 ``DATABASE SYSTEMS``）。
+
+    ★★ 必须**排除含 CJK 的行** —— 这是实测 bug：
+
+    原错误写法：``len <= 40 and stripped.isupper() and any(isalpha)``。
+
+    ``str.isupper()`` 对**无大小写的字符（中文）一律返回 True**（只要行内有 ≥1 个
+    有大小写的字母且都是大写）。实测反例：
+
+    ```
+    '索引把随机 IO 变成顺序 IO。下面是建索引的 SQL：'.isupper()  →  True
+    ```
+    因为中文没有大小写、`IO`/`SQL` 恰好都是大写 → 整行被判成"全大写标题"
+    → **一段普通正文变成了标题**（并参与父子推断，打乱层级）。
+
+    含 CJK 的行本就该走"编号标题"那条路（``1.2 xxx``），不该走这条。
+    """
+    if _CJK_RE.search(stripped):
+        return False
+    return len(stripped) <= 40 and stripped.isupper() and any(c.isalpha() for c in stripped)
 _NUM_HEADING = re.compile(r"^(\d+(?:\.\d+)*)[.)、]?\s+(\S.*)$")
 _CHAPTER_HEADING = re.compile(
     r"^(chapter|part|appendix|section|第)\s*([0-9一二三四五六七八九十]+|[A-Z])[.:：、]?\s*(\S.*)$",
@@ -181,9 +236,30 @@ def fixed_windows(total: int, size: int, *, snap_newline: str | None = None) -> 
     while start < total:
         end = min(total, start + size) - 1
         if snap_newline is not None and end < total - 1:
-            nl = snap_newline.find("\n", end)
-            if nl != -1 and nl - end < size // 3:
-                end = nl
+            # ★★ 必须**先向前、再向后**找换行 —— 这是实测 bug（会切坏词）。
+
+            # `[实测]` 原错误写法（只有向前找）：
+            # ```python
+            # nl = snap_newline.find("\n", end)          # 只向后找
+            # if nl != -1 and nl - end < size // 3:      # 太远就不用
+            #     end = nl
+            # ```
+            # 后果：当 `end` 落在一段的**中间**、而其后很久才有换行时（如 2000 字符窗口
+            # 恰好切在"第 60 段"的"第 6"之后），`find` 返回的距离远超 `size//3` →
+            # **不吸附 → 从词中间切开**。实测把 `第 60 段` 切成 `第 6` + `0 段`，
+            # 两个单元各拿到半截数字 → **正文静默损坏**（不报错）。
+            #
+            # 修法：向后找不到"足够近"的换行时，**退而向前**找最近的一个换行，
+            # 让窗口**变短一点**而不是切坏词。向前搜索限定在 `size//2` 内，
+            # 避免窗口严重缩水导致切出过多碎片。
+            nl_fwd = snap_newline.find("\n", end)
+            if nl_fwd != -1 and nl_fwd - end < size // 3:
+                end = nl_fwd
+            else:
+                lower = max(start, end - size // 2)
+                nl_back = snap_newline.rfind("\n", lower, end + 1)
+                if nl_back > start:
+                    end = nl_back
         out.append((start, end))
         start = end + 1
     return out
@@ -290,11 +366,46 @@ class TextAdapter(DocumentAdapter):
 
     # ── 标题切分 ────────────────────────────────────────────────────
     def _headings(self, text: str) -> list[RawNode]:
+        """识别标题行 → 层次节点。
+
+        ★★ **必须跳过代码围栏内的内容**（实测 bug，见下方 `_FENCE_RE` 注释）。
+
+        `[实测]` 原错误写法（我第一版就是）：逐行直接匹配 `^#{1,6}\\s+`，
+        **完全没有围栏感知**。对一份真实 Markdown 实测后果：
+        ```
+        输入:  # 数据库索引 / ```sql ... -- # 这是注释 ... ```
+               ## 聚簇索引 / ```python ... # 注释 ...
+        产出:  **6 个单元**（应为 3 个），且 `## 聚簇索引` 被挂到假标题
+               `也不是标题` 之下（parent=3）
+        ```
+        ⟹ 代码块里的 `#` 注释会变成**假标题**，并**打乱真实层级树** ——
+        因为假标题的 level 会参与 `build_parents` 的父子推断，
+        把真正的 `##` 小节挂到它下面。这是"能跑、但结构是错的"那一类。
+        """
         spans: list[tuple[int, int, str, int]] = []  # (offset, level, title, line_end)
         offset = 0
         lines = text.split("\n")
-        for idx, line in enumerate(lines):
+        fence: str | None = None  # 当前打开中的围栏标记（``` 或 ~~~，含长度）
+        for line in lines:
             line_with_nl = len(line) + 1
+            stripped_line = line.strip()
+
+            # ① 围栏开关：进入/离开代码块。围栏内**一律不算标题**。
+            fm = _FENCE_RE.match(stripped_line)
+            if fm:
+                marker = fm.group(1)
+                if fence is None:
+                    fence = marker
+                elif marker[0] == fence[0] and len(marker) >= len(fence):
+                    # 只有同类且不短于开启标记的围栏才能关闭
+                    fence = None
+                offset += line_with_nl
+                continue
+            if fence is not None:
+                # 代码块内容：原样跳过（不当标题）
+                offset += line_with_nl
+                continue
+
             m = _MD_HEADING.match(line)
             lvl: int | None = None
             title = ""
@@ -303,18 +414,13 @@ class TextAdapter(DocumentAdapter):
                 title = m.group(2).strip()
             else:
                 stripped = line.strip()
-                if (
-                    0 < len(stripped) <= 90
-                    and not stripped.endswith((".", ",", ";", ":", "。", "，", "；"))
-                ):
+                if 0 < len(stripped) <= 90 and is_title_like(stripped):
                     n = level_from_numbering(stripped)
                     if n is not None:
                         lvl = n
                         title = stripped
                     elif (
-                        len(stripped) <= 40
-                        and stripped.isupper()
-                        and any(c.isalpha() for c in stripped)
+                        _looks_like_shouting_heading(stripped)
                     ):
                         lvl = 1
                         title = stripped

@@ -234,6 +234,11 @@ def main() -> int:
             return json.loads(r.read().decode("utf-8"))
 
     READY_VIEW = "!!document.getElementById('selftest-report') || !!document.getElementById('docs-report')"
+    # ★ 页面级 `current-session` 选择器：**排除抽屉内的同名节点**
+    #   （抽屉与整页共用 testid；不限定作用域时"抽屉打开就可能在读另一个实例"——
+    #    现在能过只是因为抽屉是 v-if 关闭态，属"碰巧对"）
+    SID_PAGE = ("Array.from(document.querySelectorAll('[data-testid=\"current-session\"]'))"
+                ".find(e => !e.closest('[data-testid=\"assistant-drawer\"]'))")
     READY_WIKI_STATIC = "!!document.getElementById('wiki-report')"
 
     try:
@@ -510,7 +515,8 @@ def main() -> int:
                                " t.value='讲讲复杂度'; t.dispatchEvent(new Event('input',{bubbles:true}));"
                                " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
             # 限定在**助手**消息内取富文本（用户消息也会渲染 RichText）
-            ASSIST = "document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"rich-text\"]')"
+            # ⚠️ 取**最后一条**助手消息：history 恢复后第一条是历史里的助手消息（我第一版取第一条 → 全是假失败）
+            ASSIST = "Array.from(document.querySelectorAll('[data-testid=\"assistant-text\"] [data-testid=\"rich-text\"]')).pop()"
             # ⚠️ 必须等**这一轮流式结束**再断言：只等 math≠0 会拿到中途快照
             #    （第一版就是这样 → "代码块/未闭合/失败"全红，其实渲染是对的）
             driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"code-unclosed\"]')",
@@ -531,6 +537,40 @@ def main() -> int:
             ok("代码块：未闭合围栏**照样按代码块渲染**并标注（不整段崩成纯文本）",
                'data-unclosed="1"' in dom and "代码围栏未闭合" in dom, "未闭合容错未生效")
             ok("代码块：有复制按钮 + 行数", 'data-testid="code-copy"' in dom and "data-lines=" in dom)
+            # ★★ 用户实测反馈：**Markdown 没渲染**（标题/表格/粗体/列表全是纯文本）
+            # ⚠️ 这些统计在**根元素的 dataset** 上（我第一版从旧 JSON 读 → 全是 None 假失败）
+            ds = driver.ch.evaluate("(() => { const r=" + ASSIST + "; return r ? JSON.stringify(Object.assign({}, r.dataset)) : '{}' })()")
+            d = json.loads(ds)
+            ok("Markdown：标题渲染成 <h2>（不是 `##` 纯文本）", int(d.get("h2", "0")) >= 1, ds)
+            ok("Markdown：表格渲染成 <table>（不是 `|` 纯文本）", int(d.get("table", "0")) >= 1, ds)
+            ok("Markdown：粗体渲染成 <strong>", int(d.get("strong", "0")) >= 1, ds)
+            ok("Markdown：列表渲染成 <ul>/<ol>", int(d.get("list", "0")) >= 1, ds)
+            ok("Markdown：引用渲染成 <blockquote>", int(d.get("quote", "0")) >= 1, ds)
+            ok("Markdown：链接渲染成 <a>（白名单协议）", int(d.get("link", "0")) >= 1, ds)
+            md = driver.ch.evaluate("(() => { const r=" + ASSIST + ";"
+                                    " return JSON.stringify({h2:r.querySelectorAll('h2').length,"
+                                    " table:r.querySelectorAll('table.md-table').length,"
+                                    " th:r.querySelectorAll('table.md-table th').length,"
+                                    " td:r.querySelectorAll('table.md-table td').length,"
+                                    " strong:r.querySelectorAll('strong').length,"
+                                    " ul:r.querySelectorAll('ul.md-list').length,"
+                                    " ol:r.querySelectorAll('ol.md-list').length,"
+                                    " quote:r.querySelectorAll('blockquote.md-quote').length,"
+                                    " hr:r.querySelectorAll('hr.md-hr').length,"
+                                    " a:r.querySelectorAll('a.md-a').length,"
+                                    " rawHash:(r.textContent.match(/^#{1,6}\s/m)||[]).length,"
+                                    " rawPipe:(r.textContent.match(/^\|/m)||[]).length}) })()")
+            mdj = json.loads(md)
+            ok("Markdown：DOM 里真有 h2/table/th/td/strong/ul/ol/blockquote/hr/a",
+               all(int(mdj[k]) >= 1 for k in ("h2", "table", "th", "td", "strong", "ul", "ol", "quote", "hr", "a")), md)
+            ok("Markdown：**没有**残留的 `##` / `|` 行首纯文本",
+               int(mdj["rawHash"]) == 0 and int(mdj["rawPipe"]) == 0, md)
+            # 表格样式必须走设计 token（不是浏览器默认）
+            tw = driver.ch.evaluate("(() => { const th=document.querySelector('table.md-table th');"
+                                    " if (!th) return ''; const s=getComputedStyle(th);"
+                                    " return JSON.stringify({border:s.borderTopWidth, pad:s.paddingTop, weight:s.fontWeight}) })()")
+            ok("Markdown：表格有样式（边框/内边距/表头加粗）",
+               '"border":"0px"' not in str(tw) and str(tw) != '""', str(tw))
             # ★ 语法高亮（Lead 裁定：highlight.js 按需语言 + 设计 token 配色）
             ok("代码块：sql 真的有高亮（hljs-* 类名）",
                'data-hl="1"' in dom and "hljs-keyword" in dom, "未见 hljs 类名")
@@ -610,8 +650,19 @@ def main() -> int:
                                timeout=60, interval=0.3)
             dom = driver.ch.outer_html()
             ok("小助手：能发消息并流式回答", 'data-testid="assistant-text"' in dom)
+            # ★ 显式等 `context-used`（`context` 帧与流式回答是竞态 → 取一次快照会偶发失败，实测 308/307/307）
+            try:
+                driver.ch.wait_for("!!document.querySelector('[data-testid=\"context-used\"]')", timeout=30, interval=0.2)
+                ctx_ok = True
+            except Exception:
+                ctx_ok = False
+            dom2 = driver.ch.outer_html()
             ok("小助手：显示正在参考（服务端解析出的真实标题）",
-               'data-testid="context-used"' in dom and "MySQL 26.7 Reference Manual" in dom, "未显示 context 帧的 resolved 标题")
+               ctx_ok and 'data-testid="context-used"' in dom2 and "MySQL 26.7 Reference Manual" in dom2,
+               "未显示 context 帧的 resolved 标题")
+            # ★ 真正要保的性质：**抽屉发 prompt 时确实带上了 doc_id/unit_id**（不是"碰巧显示了标题"）
+            keys = driver.ch.evaluate("(document.querySelector('[data-testid=\"input-context\"]')||{}).dataset?.keys || ''")
+            ok("小助手：prompt 带上页面上下文（doc_id/unit_id）", "doc_id" in str(keys), f"keys={keys}")
 
         def check_assistant_entry() -> None:
             # 视频页：小助手的 WS 必须带 `assistant=video`（否则跑的是通用提示词 —— 契约不生效）
@@ -677,6 +728,411 @@ def main() -> int:
                not any(x in str(tools2) for x in ("bash", "read", "edit", "write")), f"tools={tools2}")
 
         run_view("工具自述 vs 实际（同源断言，坑 21）", check_tools_consistency)
+
+        # ============ 9b-4. AI 助教页体验（用户判据：消息分明 / 流式光标 / 工具步骤 / 会话列表） ============
+        def check_chat_ux() -> None:
+            api("/api/v1/_fixture/config?rich=1")
+            dump_dom(driver, url(normal, "chat?selftest=0"),
+                     "!!document.getElementById('chat-report')", timeout=120)
+            # ① 会话列表（平铺，接后端接口；不本地造假）
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"session-item\"]').length >= 2", timeout=60, interval=0.3)
+            dom = driver.ch.outer_html()
+            ok("会话列表：平铺显示（来自后端 /chat/sessions）", 'data-testid="session-list"' in dom and 'data-testid="session-item"' in dom)
+            # ⚠️ mock 的 cnv_mock0001 现在故意是**默认名 '新问答'**（用于验证派生显示名），
+            #    所以这里断言**有真名的那条**（另一条的服务端 title）
+            ok("会话列表：有标题与时间", "B+ 树节点分裂的代价" in dom, "列表里没有服务端 title")
+            ok("会话列表：标出当前会话 id", 'data-testid="current-session"' in dom)
+            # ② 输入区：上下文 chip（可点掉）+ 控件 + 发送
+            ok("输入区：有上下文指示（可点掉）",
+               'data-testid="input-context"' in dom or 'data-testid="input-context-none"' in dom)
+            ok("输入区：模式/检索/发送都在输入区里",
+               'data-testid="mode-select"' in dom and 'data-testid="retrieval-select"' in dom and 'data-testid="chat-send"' in dom)
+            # ③ 发一轮 → 流式光标 / 消息分明 / 工具步骤
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='讲讲 B+ 树'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(()=>document.querySelector('[data-testid=\"chat-send\"]').click(),150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"stream-cursor\"]')", timeout=30, interval=0.15)
+            ok("流式：生成中有可见光标（stream-cursor）", True)
+            ok("流式：busy 时发送按钮变『停止』",
+               driver.ch.evaluate("!!document.querySelector('[data-testid=\"chat-abort\"]') && !document.querySelector('[data-testid=\"chat-send\"]')"))
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"code-unclosed\"]')",
+                               timeout=120, interval=0.3)
+            # ⚠️ 文本到达 ≠ 这一轮结束：`settled` 之后 busy 才 false（光标消失、发送按钮回来）
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"chat-send\"]')", timeout=60, interval=0.3)
+            time.sleep(0.5)
+            ux = driver.ch.evaluate("(() => {"
+                                    " const user=document.querySelector('.msg.user'); const ai=document.querySelector('.msg.assistant');"
+                                    " const cs=(el)=>{ const s=getComputedStyle(el); return s.backgroundColor+'|'+s.borderTopWidth+'|'+s.textAlign };"
+                                    " const steps=Array.from(document.querySelectorAll('[data-testid=\"tool-call\"]'));"
+                                    " return JSON.stringify({userBg: cs(user.querySelector('.body')), aiBg: cs(ai.querySelector('.body')),"
+                                    " userCount: document.querySelectorAll('.msg.user').length, aiCount: document.querySelectorAll('.msg.assistant').length,"
+                                    " toolTag: steps[0] ? steps[0].tagName : '', toolSummary: steps[0] ? steps[0].querySelector('summary').textContent.trim().slice(0,60) : '',"
+                                    " toolCount: steps.length, cursorGone: !document.querySelector('[data-testid=\"stream-cursor\"]')}) })()")
+            u = json.loads(ux)
+            ok("消息结构：用户与 AI 是**不同的块**（各自底色/边框不同）", u["userBg"] != u["aiBg"], ux)
+            ok("消息结构：多轮消息累积显示（user+assistant 都在）", int(u["userCount"]) >= 1 and int(u["aiCount"]) >= 1, ux)
+            # 人话标签：不是原始工具名（`read`/`kb_search`），而是中文说明（读文件 / 检索知识库 …）
+            summ = str(u["toolSummary"])
+            ok("工具调用：渲染成可折叠的一步（<details> + **人话标签**）",
+               u["toolTag"] == "DETAILS" and any(w in summ for w in ("读文件", "检索知识库", "读知识库原文", "执行命令"))
+               and not summ.strip().startswith(("read", "kb_search", "bash")), ux)
+            ok("流式结束后光标消失（不是一直闪）", bool(u["cursorGone"]), ux)
+            # ④ 切会话：点第二个 → 当前会话 id 变化（新连接）
+            before = driver.ch.evaluate("document.querySelector('[data-testid=\"current-session\"]').textContent")
+            driver.ch.evaluate("Array.from(document.querySelectorAll('[data-testid=\"session-item\"]'))[1].click()")
+            time.sleep(2)
+            after = driver.ch.evaluate("document.querySelector('[data-testid=\"current-session\"]').textContent")
+            ok("会话列表：点击可切换会话（当前会话 id 变化）", str(before) != str(after), f"{before} → {after}")
+            api("/api/v1/_fixture/config?rich=0")
+
+        run_view("AI 助教页体验 / 消息分明 + 流式 + 工具步骤 + 会话列表", check_chat_ux)
+
+        # ============ 9b-5. 会话登记（IDOR 安全修复）：**必须用 POST /conversations 的 id 连 WS** ============
+        def check_conversation_registration() -> None:
+            dump_dom(driver, url(normal, "chat?selftest=0"),
+                     "!!document.getElementById('chat-report')", timeout=120)
+            # ① 会话来源必须是**服务端签发**（不是本地 web-<uuid>）
+            driver.ch.wait_for("document.querySelector('[data-testid=\"session-origin\"]')?.dataset.origin === 'server'",
+                               timeout=60, interval=0.3)
+            sid = driver.ch.evaluate("document.querySelector('[data-testid=\"current-session\"]').textContent")
+            ok("会话登记：当前会话 id 来自 POST /conversations（cnv_ 前缀）", "cnv_" in str(sid), str(sid))
+            ok("会话登记：UI 标明会话由服务端登记",
+               "服务端登记" in str(driver.ch.evaluate("document.querySelector('[data-testid=\"session-origin\"]').textContent")))
+            # ② WS 真的连上了（说明服务端认这个 id）
+            driver.ch.wait_for("document.querySelector('[data-testid=\"ws-state\"]')?.textContent === 'open'",
+                               timeout=60, interval=0.3)
+            ok("会话登记：用该 id 连 WS 成功（state=open）", True)
+            # ③ 会话列表来自 GET /conversations（真实接口）
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"session-item\"]').length >= 2", timeout=60, interval=0.3)
+            ok("会话列表：来自 GET /conversations（cnv_ 前缀）",
+               "cnv_mock0001" in driver.ch.outer_html())
+            # ④ 新建会话 → **再登记一个**（id 变化，且仍是服务端签发）
+            before = str(sid)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"chat-newsession\"]').click()")
+            time.sleep(3)
+            after = driver.ch.evaluate("document.querySelector('[data-testid=\"current-session\"]').textContent")
+            ok("新建会话：走登记流程（id 变化且仍为服务端签发）",
+               str(after) != before and "cnv_" in str(after), f"{before} → {after}")
+
+        run_view("会话登记 / 先 POST /conversations 再连 WS", check_conversation_registration)
+
+        # ============ 9b-6. history 帧（刷新恢复）+ ready.reason（不清空） ============
+        def check_history_and_reason() -> None:
+            api("/api/v1/_fixture/config?history=1")
+            dump_dom(driver, url(normal, "chat?selftest=0"),
+                     "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"history-note\"]')", timeout=60, interval=0.3)
+            hn = driver.ch.evaluate("(() => { const n=document.querySelector('[data-testid=\"history-note\"]');"
+                                    " return JSON.stringify({count:n.dataset.historyCount, truncated:n.dataset.truncated,"
+                                    " text:n.textContent.trim().slice(0,60), msgs:document.querySelectorAll('.msg').length,"
+                                    " hasTable: !!document.querySelector('.msg.assistant table.md-table')}) })()")
+            h = json.loads(hn)
+            ok("history 帧：把历史消息铺进列表（≥2 条）", int(h["count"]) >= 2 and int(h["msgs"]) >= 2, hn)
+            ok("history 帧：如实标注条数", "已从服务端恢复" in str(h["text"]), hn)
+            ok("history 帧：内容按富文本渲染（历史里的表格也渲染）", bool(h["hasTable"]), hn)
+            api("/api/v1/_fixture/config?history=0")
+
+        run_view("history 帧 / 刷新后恢复消息列表", check_history_and_reason)
+
+        # ============ 9b-7. 登记失败 → 输入禁用（Lead 判据：别给注定失败的会话） ============
+        def check_conv_fail_blocks() -> None:
+            # ★ 先清掉本地会话（有了 localStorage 兜底后，旧 id 会让 ensureSession 提前返回，
+            #   夹具注入的"登记失败"根本走不到 —— 第一版就是这样超时的）
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            driver.ch.evaluate("localStorage.removeItem('ckb.chat.session')")
+            api("/api/v1/_fixture/config?conv_fail=1")
+            dump_dom(driver, url(normal, "chat?selftest=0"),
+                     "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"session-blocked\"]')", timeout=90, interval=0.3)
+            dom = driver.ch.outer_html()
+            ok("登记失败：显示无法对话门控（不是先给一个连不上的会话）", 'data-testid="session-blocked"' in dom)
+            ok("登记失败：写明原因（可读，不是网络错误）",
+               "会话登记失败" in dom or "登记" in dom)
+            ok("登记失败：给出出路（重试登记 / 新建会话）",
+               'data-testid="session-retry"' in dom and 'data-testid="session-new"' in dom)
+            disabled = driver.ch.evaluate("document.querySelector('[data-testid=\"chat-input\"]').disabled")
+            ok("★ 登记失败：输入区**禁用**（判据）", bool(disabled), f"disabled={disabled}")
+            api("/api/v1/_fixture/config?conv_fail=0")
+
+        run_view("会话登记失败 / 输入禁用 + 可读提示", check_conv_fail_blocks)
+
+        # ============ 9b-8. 抽取状态（done_empty 不是成功；needs_confirm 报次数+时长） ============
+        def check_extract_status() -> None:
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"extract-status\"]')", timeout=60, interval=0.3)
+            dom = driver.ch.outer_html()
+            # ★ 抽取状态是**按文档**的（不是"最新那份"）→ 取 PDF 那一行的单元格
+            CELL = "document.querySelector('[data-doc-extract=\"" + DOC_PDF + "\"]')"
+            st = driver.ch.evaluate(f"({CELL}?.querySelector('[data-testid=\"extract-status\"]')||{{}}).dataset?.status || ''")
+            txt = driver.ch.evaluate(f"({CELL}?.querySelector('[data-testid=\"extract-status\"]')||{{}}).textContent?.trim() || ''")
+            est = driver.ch.evaluate(f"({CELL}?.querySelector('[data-testid=\"extract-estimate\"]')||{{}}).textContent || ''")
+            prog = driver.ch.evaluate(f"({CELL}?.querySelector('[data-testid=\"extract-progress\"]')||{{}}).textContent || ''")
+            ok("抽取状态：读的是 meta.extract_status", str(st) == "done_empty", f"status={st}")
+            ok("★ done_empty 不显示成成功（文案含零卡片）", "零卡片" in str(txt) and "成功" not in str(txt), str(txt))
+            ok("★ done_empty 有如实说明（跑完但没产出）",
+               "没有产出任何卡片" in dom, "缺少解释")
+            ok("★ needs_confirm：按钮显示**次数 + 时长**（都要有）",
+               "2523" in str(est) and ("3–7 小时" in str(est) or "3-7" in str(est)), str(est))
+            ok("抽取进度：显示已抽取/总数", "340" in str(prog) and "2523" in str(prog), str(prog))
+            ok("抽取按钮存在（needs_confirm 时才出现）", 'data-testid="extract-start"' in dom)
+
+        run_view("抽取状态 / done_empty 不是成功 + 代价（次数+时长）", check_extract_status)
+
+        # ============ 9b-9. 🔴 切走再回来消息还在（用户实测 bug） ============
+        def check_session_survives_navigation() -> None:
+            api("/api/v1/_fixture/config?conv_fail=0")   # 防御：上一个用例超时会让夹具残留
+            dump_dom(driver, url(normal, "chat?selftest=0"),
+                     "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"ws-state\"]')?.textContent === 'open'", timeout=90, interval=0.3)
+            sid1 = driver.ch.evaluate(f"({SID_PAGE}).textContent")
+            ok("会话 id 已写进 URL（可分享/可刷新）", "session=cnv_" in str(driver.ch.evaluate("location.hash")),
+               str(driver.ch.evaluate("location.hash"))[:120])
+            # 发 1 轮（快，避免等太久；"2 轮"用下面的第二条断言覆盖多轮累积）
+            for q in ("第一轮：聚簇索引是什么", "第二轮：那二级索引呢"):
+                driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                                   f" t.value={q!r}; t.dispatchEvent(new Event('input',{{bubbles:true}}));"
+                                   " setTimeout(()=>document.querySelector('[data-testid=\"chat-send\"]').click(),150); return 1 })()")
+                driver.ch.wait_for("!!document.querySelector('[data-testid=\"chat-send\"]')", timeout=90, interval=0.3)
+                time.sleep(0.6)
+            n_before = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"chat-log\"] .msg').length")
+            ok("多轮消息累积显示（≥2 条）", int(n_before) >= 2, f"msgs={n_before}")
+            # ★ 切到知识库页 → 再切回对话页
+            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"), READY_WIKI_STATIC, timeout=120)
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"ws-state\"]')?.textContent === 'open'", timeout=90, interval=0.3)
+            time.sleep(1.0)
+            sid2 = driver.ch.evaluate(f"({SID_PAGE}).textContent")
+            ok("★ 切走再回来：**sessionId 不变**（根因判据）", str(sid1) == str(sid2), f"{sid1} → {sid2}")
+            n_after = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"chat-log\"] .msg').length")
+            ok("★ 切走再回来：**消息仍在**（history 帧恢复）", int(n_after) >= 2, f"before={n_before} after={n_after}")
+            hist = driver.ch.evaluate("(document.querySelector('[data-testid=\"history-note\"]')||{}).textContent || ''")
+            ok("★ 恢复走的是 history 帧（有可核验提示）", "恢复" in str(hist), str(hist)[:80])
+            # ★ 反例：点"新会话" → id 变化 + 消息清空
+            driver.ch.evaluate("document.querySelector('[data-testid=\"chat-newsession\"]').click()")
+            time.sleep(3)
+            sid3 = driver.ch.evaluate(f"({SID_PAGE}).textContent")
+            n_new = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"chat-log\"] .msg').length")
+            ok("★ 点新会话：sessionId **变化**（只在用户要求时新建）", str(sid3) != str(sid2), f"{sid2} → {sid3}")
+            ok("★ 新会话：消息**清空**（不能把旧消息填到新会话）", int(n_new) == 0, f"msgs={n_new}")
+
+        run_view("🔴 切走再回来 / 会话与消息都还在", check_session_survives_navigation)
+
+        # ============ 9b-10. 🔴 抽屉与整页必须是**两个独立会话**（polysemy-prober 复验抓出） ============
+        def check_dock_session_isolated() -> None:
+            # 干净起点：先清两个键，避免上一用例残留
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            driver.ch.evaluate("localStorage.removeItem('ckb.chat.session'); localStorage.removeItem('ckb.assistant.session')")
+            # ① 整页 → 记 id
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"ws-state\"]')?.textContent === 'open'", timeout=90, interval=0.3)
+            page_sid = str(driver.ch.evaluate(f"({SID_PAGE}).textContent")).strip()
+            # ② 另一页开抽屉 → 记 id（必须是**不同的**会话）
+            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"), READY_WIKI_STATIC, timeout=120)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"current-session\"]')",
+                               timeout=90, interval=0.3)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"ws-state\"]')?.textContent === 'open'",
+                               timeout=90, interval=0.3)
+            dock_sid = str(driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"current-session\"]').textContent")).strip()
+            ok("★ 抽屉与整页是**两个独立会话**（id 不同）", page_sid != dock_sid, f"page={page_sid} dock={dock_sid}")
+            ok("★ 抽屉的会话也是服务端登记的（cnv_）", "cnv_" in dock_sid, dock_sid)
+            ok("★ 抽屉不写页面 URL（仍在 wiki 页）",
+               "session=" not in str(driver.ch.evaluate("location.hash")), str(driver.ch.evaluate("location.hash"))[:80])
+            # ★ 关系判据（Lead）：抽屉点「新会话」**不得影响**主对话页的 id
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"chat-newsession\"]').click()")
+            time.sleep(3)
+            dock2 = str(driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"current-session\"]').textContent")).strip()
+            ok("★ 抽屉点新会话：抽屉 id 变化", dock2 != dock_sid, f"{dock_sid} → {dock2}")
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"ws-state\"]')?.textContent === 'open'", timeout=90, interval=0.3)
+            page2 = str(driver.ch.evaluate(f"({SID_PAGE}).textContent")).strip()
+            ok("★ 抽屉新建会话**不影响**主对话页 id（关系判据）", page2 == page_sid, f"page {page_sid} → {page2}（dock={dock2}）")
+            ok("★ 反向：主页面 id 与抽屉 id 始终不同", page2 != dock2, f"page={page2} dock={dock2}")
+
+        run_view("🔴 抽屉/整页会话隔离", check_dock_session_isolated)
+
+        # ============ 9b-11. PDF 重新解析入口（后端有端点、前端要有入口 + ★ 暂时禁用） ============
+        def check_reparse_entry() -> None:
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            # ⚠️ ROW 必须**在用例开头**定义（第一版放在后面，前面的断言引用它 → UnboundLocalError）
+            ROW = f"document.querySelector('[data-reparse=\"{DOC_PDF}\"]')?.closest('tr')"
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"btn-reparse\"]')", timeout=60, interval=0.3)
+            dom = driver.ch.outer_html()
+            ok("文档页有「重新解析」入口（后端端点有了，前端要能点到）",
+               'data-testid="btn-reparse"' in dom)
+            ok("★ 按钮**暂时禁用**（后端会清空卡片的 bug 修复中）",
+               driver.ch.evaluate("document.querySelector('[data-testid=\"btn-reparse\"]').disabled === true"))
+            gate = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_gate_reason\"]')||{{}}).textContent || ''")
+            ok("★ 禁用理由如实显示（不是静默禁用）", "清空已有卡片" in str(gate), str(gate)[:80])
+            # ⚠️ 按**目标文档**限定（第一行是 video，page_count=0 → "页数未知"；我第一版就读错了行）
+            est = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_estimate\"]')||{{}}).textContent || ''")
+            ok("★ 代价可见：给**区间**（不是假精确的单个数）", "–" in str(est) or "-" in str(est), str(est))
+            ok("★ 代价里写明 OCR 本地、不耗 LLM 额度但占 CPU",
+               "不消耗 LLM 额度" in str(est) and "CPU" in str(est), str(est))
+            # ★★ 判据：**禁用状态下点击不发请求**（不许"看起来禁用了其实能点"）
+            before = api("/api/v1/_fixture/reparse_calls").get("calls")
+            driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"btn-reparse\"]')).click()")
+            time.sleep(1.0)
+            after = api("/api/v1/_fixture/reparse_calls").get("calls")
+            ok("★★ 禁用状态点击**不发请求**（调用数不变）", int(before) == int(after), f"calls {before} → {after}")
+            # 点击后应显示禁用理由（不是"已提交"）
+            st = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_state\"]')||{{}}).textContent || ''")
+            ok("禁用状态点击：只显示理由，不假装已入队",
+               "清空已有卡片" in str(st) or str(st) == "", str(st)[:100])
+
+        run_view("PDF 重新解析 / 入口 + 禁用 + 代价（禁用点击不发请求）", check_reparse_entry)
+
+        # ============ 9b-12. ★ 选择器作用域反例：**抽屉打开时**仍要读到正确那一个 ============
+        def check_scoped_selectors() -> None:
+            api("/api/v1/_fixture/config?conv_fail=0")
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"ws-state\"]')?.textContent === 'open'", timeout=90, interval=0.3)
+            page_sid = str(driver.ch.evaluate(f"({SID_PAGE}).textContent")).strip()
+            ok("反例准备：能读到**页面**会话节点（排除抽屉）", "cnv_" in page_sid, page_sid)
+            # ★ 打开抽屉（抽屉里也有同名 `current-session`）→ 再读一次，必须**还是页面那个**
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"current-session\"]')",
+                               timeout=90, interval=0.3)
+            both = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"current-session\"]').length")
+            page2 = str(driver.ch.evaluate(f"({SID_PAGE}).textContent")).strip()
+            drawer_sid = str(driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"current-session\"]').textContent")).strip()
+            ok("★ 反例：抽屉打开后，页面级选择器仍读到**页面**那个（不是抽屉的）",
+               page2 == page_sid and page2 != drawer_sid, f"page={page_sid}→{page2} drawer={drawer_sid} (同名节点数={both})")
+            ok("★ 反例：两个同名节点确实同时存在（证明这条断言有意义）", int(both) >= 2, f"同名节点数={both}")
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-close\"]').click()")
+
+        run_view("★ 选择器作用域反例 / 抽屉打开时仍读对", check_scoped_selectors)
+
+        # ============ 9b-13. 会话显示名兜底（契约 SESSION_NAMING §4.3：不再一排"新问答"） ============
+        def check_session_label_fallback() -> None:
+            # 干净起点（本地派生表会持久化，先清掉）
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            driver.ch.evaluate("localStorage.removeItem('ckb.chat.firstq'); localStorage.removeItem('ckb.chat.session')")
+            api("/api/v1/_fixture/config?conv_fail=0")
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"session-item\"]').length >= 2", timeout=60, interval=0.3)
+            # ① 默认名会话**不再显示 '新问答'**（而是派生名或明确"未命名"）
+            rows = driver.ch.evaluate(
+                "JSON.stringify(Array.from(document.querySelectorAll('[data-testid=\"session-title\"]')).map(e => ({"
+                " t: e.textContent.trim(), src: e.dataset.titleSource, api: e.dataset.apiTitle })))")
+            items = json.loads(rows)
+            default_row = [x for x in items if x["api"] == "新问答"]
+            ok("契约 §4.3：默认名会话**不显示 '新问答'**",
+               bool(default_row) and default_row[0]["t"] != "新问答", rows)
+            ok("契约 §4.3：派生名标注来源（derived / server 可核验）",
+               bool(default_row) and default_row[0]["src"] == "derived" and any(x["src"] == "server" for x in items), rows)
+            # ② ★ 分清"DOM 显示"与"接口 title"：接口 title 仍是 '新问答'（派生**不写库**）
+            api_list = api("/api/v1/conversations").get("conversations") or []
+            api_title = next((c.get("title") for c in api_list if c.get("id") == "cnv_mock0001"), None)
+            ok("★ 派生只是**显示层**：接口 title 仍是 '新问答'（不写库）", str(api_title) == "新问答", f"api title={api_title}")
+            # ③ 发一条 → 该会话的派生名变成**首条提问前 20 字**
+            q = "这是一个很长的问题用来验证前二十个字的截断行为是否生效以及省略号"
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               f" t.value={q!r}; t.dispatchEvent(new Event('input',{{bubbles:true}}));"
+                               " setTimeout(()=>document.querySelector('[data-testid=\"chat-send\"]').click(),150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"chat-send\"]')", timeout=90, interval=0.3)
+            time.sleep(0.8)
+            sid = str(driver.ch.evaluate(f"({SID_PAGE}).textContent")).strip()
+            # 当前会话（服务端新登记的）不在列表里也没关系 —— 断言本地派生表已写入
+            stored = driver.ch.evaluate("localStorage.getItem('ckb.chat.firstq') || ''")
+            ok("★ 首条提问被本地记住（用于派生显示名）", q[:10] in str(stored), str(stored)[:120])
+            # ④ 边界：超长 → 截断 + 省略号；HTML 特殊字符 → 不注入、不崩
+            driver.ch.evaluate("localStorage.setItem('ckb.chat.firstq', JSON.stringify({'cnv_mock0001': "
+                               "'<img src=x onerror=alert(1)> 这是一段超长文本用来验证截断以及注入安全边界是否成立'}))")
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"session-item\"]').length >= 2", timeout=60, interval=0.3)
+            b = driver.ch.evaluate(
+                "(() => { const e=document.querySelector('[data-testid=\"session-title\"][data-api-title=\"新问答\"]');"
+                " return JSON.stringify({ text: e.textContent.trim(), len: e.textContent.trim().length,"
+                " injected: document.querySelectorAll('[data-testid=\"session-list\"] img, [data-testid=\"session-list\"] script').length }) })()")
+            bj = json.loads(b)
+            ok("★ 边界：超长 → 截断到 20 字 + 省略号", int(bj["len"]) <= 22 and bj["text"].endswith("…"), b)
+            ok("★ 边界：HTML 特殊字符**不注入**（列表内无 img/script 节点）", int(bj["injected"]) == 0, b)
+            ok("★ 边界：文本按原样显示（`<img …>` 作为纯文本）", "<img" in str(bj["text"]), b)
+
+        run_view("会话显示名兜底 / 不再一排新问答 + 边界", check_session_label_fallback)
+
+        # ============ 9b-14. 视频目录（collections）：教师建目录/上传；学生选目录→播放→AI 解析 ============
+        def check_video_collections() -> None:
+            api("/api/v1/_fixture/config?role=teacher&collections_missing=0")
+            dump_dom(driver, url(normal, "video"), "!!document.getElementById('video-report')", timeout=120)
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"collection-item\"]').length >= 1", timeout=60, interval=0.3)
+            dom = driver.ch.outer_html()
+            ok("视频目录：列出服务端目录（不是前端编的）", 'data-testid="collection-item"' in dom and "第 5 讲 索引与执行计划" in dom)
+            ok("视频目录：展示服务端算的 can_manage / published（不自己推断权限）",
+               'data-can-manage="1"' in dom and 'data-published="1"' in dom)
+            # ① 教师：建目录（表单可见）→ 创建后列表增加
+            ok("★ 教师：有建目录入口 + 上传入口",
+               'data-testid="collection-teacher-ops"' in dom and 'data-testid="collection-name"' in dom
+               and 'data-testid="collection-upload"' in dom)
+            before = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"collection-item\"]').length")
+            driver.ch.evaluate("(() => { const i=document.querySelector('[data-testid=\"collection-name\"]');"
+                               " i.value='第 7 讲 备份与恢复'; i.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " document.querySelector('[data-testid=\"collection-create\"]').click(); return 1 })()")
+            time.sleep(1.5)
+            after = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"collection-item\"]').length")
+            ok("★ 教师：新建目录后列表增加", int(after) > int(before), f"{before} → {after}")
+            # ② 选目录 → 视频列表 + 解析状态
+            driver.ch.evaluate("document.querySelector('[data-testid=\"collection-item\"]').click()")
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"collection-video\"]').length >= 1", timeout=60, interval=0.3)
+            vdom = driver.ch.outer_html()
+            ok("目录内视频：显示解析状态（parse_state，服务端给的）",
+               'data-testid="parse-state"' in vdom and 'data-parse-state="done"' in vdom)
+            ok("目录内视频：显示解析原因（parse_reason）", 'data-testid="parse-reason"' in vdom)
+            # ③ ★ AI 解析：可用 → **先展示代价**（次数 + cost_note）；不可用 → 禁用 + 逐字 reason
+            costs = driver.ch.evaluate(
+                "JSON.stringify(Array.from(document.querySelectorAll('[data-testid=\"ai-parse-cost\"]')).map(e => e.textContent.trim()))")
+            ok("★ AI 解析：**先展示代价**（含次数 + 说明）",
+               "42" in str(costs) and "消耗 LLM 额度" in str(costs), str(costs)[:160])
+            gate = driver.ch.evaluate(
+                "(() => { const b=Array.from(document.querySelectorAll('[data-testid=\"btn-ai-parse\"]'));"
+                " return JSON.stringify(b.map(x => ({ disabled: x.disabled, reason: x.dataset.gateReason }))) })()")
+            gj = json.loads(gate)
+            ok("★ AI 解析不可用时：按钮**禁用** + 逐字显示后端 reason",
+               any(x["disabled"] and "faster-whisper" in str(x["reason"]) for x in gj), gate)
+            # ④ ★★ 禁用状态点击**不发请求**
+            before_calls = api("/api/v1/_fixture/ai_parse_calls").get("calls")
+            driver.ch.evaluate("Array.from(document.querySelectorAll('[data-testid=\"btn-ai-parse\"]')).filter(b=>b.disabled)[0]?.click()")
+            time.sleep(1.0)
+            after_calls = api("/api/v1/_fixture/ai_parse_calls").get("calls")
+            ok("★★ 不可用时点击**不发请求**（调用数不变）", int(before_calls) == int(after_calls), f"{before_calls} → {after_calls}")
+            # ⑤ 可用时点击 → 真的提交（计数 +1）
+            driver.ch.evaluate("Array.from(document.querySelectorAll('[data-testid=\"btn-ai-parse\"]')).filter(b=>!b.disabled)[0].click()")
+            time.sleep(1.5)
+            calls2 = api("/api/v1/_fixture/ai_parse_calls").get("calls")
+            ok("★ AI 解析可用时点击 → 真的提交（调用数 +1）", int(calls2) > int(after_calls), f"{after_calls} → {calls2}")
+            note = driver.ch.evaluate("(document.querySelector('[data-testid=\"ai-parse-note\"]')||{}).textContent || ''")
+            ok("提交后如实说明（含会消耗 LLM 额度）", "消耗 LLM 额度" in str(note) or "已提交" in str(note), str(note)[:100])
+
+        run_view("视频目录 / 教师建目录+上传 + AI 解析代价", check_video_collections)
+
+        # ============ 9b-15. 视频目录：**学生视图** + **后端未实现时如实说明** ============
+        def check_video_collections_student_and_missing() -> None:
+            # ① 学生：无教师操作，且有明确说明
+            api("/api/v1/_fixture/config?role=student&collections_missing=0")
+            dump_dom(driver, url(normal, "video"), "!!document.getElementById('video-report')", timeout=120)
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"collection-item\"]').length >= 1", timeout=60, interval=0.3)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"collection-item\"]').click()")
+            time.sleep(1.0)
+            sdom = driver.ch.outer_html()
+            ok("★ 学生：**看不到**教师操作（建目录/上传）",
+               'data-testid="collection-teacher-ops"' not in sdom)
+            ok("★ 学生：有明确说明（为什么不能建/传）",
+               'data-testid="collection-student-note"' in sdom)
+            ok("★ 学生：仍能选目录 + 播放 + 看到 AI 解析",
+               'data-testid="collection-videos"' in sdom and 'data-testid="btn-play"' in sdom
+               and 'data-testid="btn-ai-parse"' in sdom)
+            # ② 后端未实现 → 如实说明，且**不渲染假目录**
+            api("/api/v1/_fixture/config?role=teacher&collections_missing=1")
+            dump_dom(driver, url(normal, "video"), "!!document.getElementById('video-report')", timeout=120)
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"collections-note\"]')", timeout=60, interval=0.3)
+            note = driver.ch.evaluate("document.querySelector('[data-testid=\"collections-note\"]').textContent")
+            n_items = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"collection-item\"]').length")
+            ok("★ 后端未实现：如实说明（含尚未实现）", "尚未实现" in str(note), str(note)[:120])
+            ok("★ 后端未实现：**不渲染假目录**（目录项数 = 0）", int(n_items) == 0, f"items={n_items}")
+            api("/api/v1/_fixture/config?role=teacher&collections_missing=0")
+
+        run_view("视频目录 / 学生视图 + 未实现如实说明", check_video_collections_student_and_missing)
 
         # ============ 9c. 模式选择器（chat / agent）—— 用户需求，两个正交控件 ============
         def check_mode_switch() -> None:

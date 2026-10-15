@@ -633,6 +633,108 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
    * 重跑视频解析（可指定 asr_model）。
    * worker 不具备 asr 能力时**如实 503 `E_ASR_LOAD`**，而不是排一个跑不起来的任务。
    */
+  /**
+   * ★★ **重新解析**（`POST /api/v1/documents/:id/reparse`）—— 用户**唯一能用上 OCR 修复**的入口。
+   *
+   * ## 为什么需要（真实阻塞）
+   * `wiki-architect` 修好了扫描件的文字层判定 + 本地 OCR（实测：同一份 434 页扫描件
+   * **0 字符 → 31,133 字符**），但**没有任何接口能让它重跑** —— 用户手上的旧文档
+   * 只能一直"解析成功但正文为空"（`text_gate='empty_body'`）。
+   * ⟹ **"修好了但用户用不上"** 与没修一样。
+   *
+   * ## 六条约束（Lead 指定）
+   * 1. 复用 `queue.enqueue({kind:'parse'})`（与 `video/reparse` 同构）
+   * 2. **权限**：可见 + 能抽取（owner/teacher/admin）—— 服务端权威判定，**不读客户端帧**
+   * 3. **幂等**：已有 parse 在跑 → **409**（如实说明"正在跑"，**不造第二条**）
+   * 4. 状态回写复用已修好的队列终态回写（`parse` → ready/failed）
+   * 5. ★ **代价可见**：图片型/正文为空的文档要重跑 OCR（**~9–12 秒/页**）→ **先告诉用户要多久**
+   * 6. ★ **判据**：重跑后 `units` 正文**真的变了**（空 → OCR 文本），不是"接口返回 200"
+   */
+  app.post('/api/v1/documents/:id/reparse', async (req, reply) => {
+    try {
+      const { id } = req.params as { id: string };
+      // RBAC：可见性 + 动作权限（与 /extract 同一套判据，避免"新接口绕过后门"）
+      authorizeDoc(req, deps, id, 'read');
+      const caller = requireUser(req);
+      const row = repo.getDocumentRow(id);
+      if (!row) throw new ApiError('E_NOTFOUND', `文档不存在：${id}`, { detail: `document_id=${id}` });
+      // ⚠️ `can()` 需要 **ownerId/courseId** 才能判"是否本人/课程成员" ——
+      //    第一版只传 `{kind:'document',docId}` → 连**自己的**文档都被判 403（实测）
+      const decision = can(caller, 'extract', {
+        kind: 'document',
+        docId: id,
+        ownerId: row.owner_id ?? undefined,
+        courseId: row.course_id ?? undefined,
+      } as never);
+      if (!decision.ok) throw new ApiError('E_FORBIDDEN', reasonOf(decision), { detail: 'action=reparse' });
+
+      // ③ 幂等：已有 parse 在排队/在跑 → 409（不造第二条；重复解析既费时又会产生两套单元）
+      // ⚠️ `repo.listTasks()` 返回的是 **Map**（不是数组）—— 第一版按数组写，tsc 拦下
+      const taskMap = repo.listTasks?.({ docId: id, kind: 'parse' } as never) as unknown as
+        | Map<number, { status?: string }>
+        | undefined;
+      const running = taskMap
+        ? [...taskMap.values()].some((t) => t.status === 'running' || t.status === 'queued')
+        : false;
+      if (running) {
+        throw new ApiError('E_BUSY', '该文档的解析任务正在运行，未重复入队', {
+          detail: `document_id=${id}`,
+          hint: '用 /api/v1/tasks?doc_id= 查看进度；完成后可再次调用本接口',
+        });
+      }
+
+      // ⑤ 代价可见：图片型/正文为空 → 要跑 OCR（~9–12 秒/页），**先让用户知道要等多久**
+      let meta: Record<string, unknown> = {};
+      try {
+        meta = JSON.parse(String((row as { meta_json?: string }).meta_json ?? '{}')) as Record<string, unknown>;
+      } catch {
+        meta = {};
+      }
+      const pages = Number(row.page_count ?? 0) || 0;
+      const needsOcr = meta.text_mode === 'image' || meta.text_gate === 'empty_body';
+      const ocrSecondsPerPage = 11; // 实测 ~9–12 秒/页（CPU ONNX，无 GPU）
+      const cost = needsOcr
+        ? {
+            needs_ocr: true,
+            est_minutes: [
+              Math.max(1, Math.round((pages * 9) / 60)),
+              Math.max(1, Math.round((pages * 12) / 60)),
+            ] as [number, number],
+            cost_note:
+              pages > 0
+                ? `该文档正文为空（图片型）→ 重跑会走**本地 OCR**（~9–12 秒/页，约 ${pages} 页）` +
+                  `，预计 ${Math.max(1, Math.round((pages * 9) / 60))}–${Math.max(1, Math.round((pages * 12) / 60))} 分钟；` +
+                  'OCR 不消耗 LLM 额度，但会占用 CPU（并发=1）。解析完成后会自动抽取（那一步会消耗 LLM）。'
+                : '该文档正文为空（图片型）→ 重跑会走本地 OCR（~9–12 秒/页）。页数未知，耗时会随页数增长。',
+          }
+        : { needs_ocr: false, cost_note: '重跑会重新解析并在完成后自动抽取（抽取会消耗 LLM 额度）。' };
+
+      const taskId = queue.enqueue({
+        docId: id,
+        kind: 'parse',
+        priority: taskPriority(caller),
+        userId: caller.id,
+        params: {},
+      });
+      repo.rbac.audit({
+        userId: caller.id,
+        action: 'reparse',
+        target: id,
+        detail: { task_id: taskId, needs_ocr: cost.needs_ocr },
+      });
+      return reply.code(202).send({
+        document_id: id,
+        task_id: taskId,
+        status: 'queued',
+        events_url: `/api/v1/tasks/${taskId}/events`,
+        // ★ 代价可见（前端应在确认前展示给用户）
+        ...cost,
+      });
+    } catch (err) {
+      return sendError(reply, err);
+    }
+  });
+
   app.post('/api/v1/documents/:id/video/reparse', async (req, reply) => {
     try {
       const { id } = req.params as { id: string };

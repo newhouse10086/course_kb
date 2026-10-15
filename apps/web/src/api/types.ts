@@ -17,6 +17,45 @@ export interface Span {
   end: number
 }
 
+/**
+ * ★ 视频目录（契约：**独立表** `collections`，不是靠 documents 字段分组）。
+ *   `published` 是**派生**字段、`can_manage` 是**服务端计算**的 ——
+ *   前端只用它们做展示/门控，**不自己推断权限**。
+ */
+export interface CollectionInfo {
+  id: string
+  name: string
+  description?: string
+  owner_id?: string
+  visibility?: string
+  review_status?: string
+  sort_order?: number
+  created_at?: number
+  updated_at?: number
+  published?: boolean
+  can_manage?: boolean
+  video_count?: number
+}
+
+/** 视频列表项：解析状态 + AI 解析可用性与**代价**（都由服务端给，前端不编数字） */
+export interface VideoListItem {
+  id: string
+  title?: string
+  kind?: string
+  collection_id?: string | null
+  duration_ms?: number
+  size_bytes?: number
+  parse_state?: 'none' | 'running' | 'done' | 'failed' | string
+  parse_reason?: string
+  ai_parse?: {
+    available?: boolean
+    reason?: string
+    llm_model?: string
+    cost_note?: string
+    estimated_llm_calls?: number
+  }
+}
+
 export interface DocumentInfo {
   id: string
   title: string

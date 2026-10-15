@@ -121,7 +121,25 @@ test('★ 抽取请求真的带 maxTokens（= EXTRACT_MAX_TOKENS），而不是�
   const docId = upBody.document_id as string;
   const taskId = built!.deps.queue.enqueue({ docId, kind: 'extract', userId: adminId, params: {} });
   const done = await wait(taskId);
-  assert.ok(seen.length > 0, `抽取必须真的调用 completeJson（任务状态 ${done?.status}）`);
+  // ★ 失败时把**任务 error 原文 + 文档状态 + meta 的 text_gate** 一起报出来（零额度诊断）
+  const docRow = built!.deps.repo.getDocumentRow(docId) as { status?: string; meta_json?: string } | undefined;
+  let meta: Record<string, unknown> = {};
+  try {
+    meta = JSON.parse(String(docRow?.meta_json ?? '{}')) as Record<string, unknown>;
+  } catch {
+    /* meta 非 JSON → 空 */
+  }
+  const diag =
+    `status=${done?.status} error=${JSON.stringify(done?.error ?? null)} ` +
+    `doc.status=${docRow?.status} text_gate=${JSON.stringify(meta.text_gate ?? null)} ` +
+    `text_mode=${JSON.stringify(meta.text_mode ?? null)} units=${built!.deps.repo.counts(docId).units}`;
+  assert.ok(
+    seen.length > 0,
+    `抽取必须真的调用 completeJson（${diag}）；parse 状态=${parsed?.status} parse.error=${JSON.stringify(parsed?.error ?? null)}`,
+  );
+  // ★ 抽取结束后**不许**停在 `extracting`（用户撞到的"假进行中"）；成功 → ready
+  assert.notEqual(docRow?.status, 'extracting', `★ 抽取结束后 documents.status 不许停在 extracting（实际 ${docRow?.status}）`);
+  assert.equal(docRow?.status, 'ready', `抽取成功后应回到 ready，实际 ${docRow?.status}`);
   for (const req of seen) {
     assert.equal(
       req.maxTokens,

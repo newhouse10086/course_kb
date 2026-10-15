@@ -346,6 +346,56 @@ Windows 编辑器与 `Set-Content -Encoding Unicode` 常写 BOM。
 
 ## 6. job 详情
 
+#### ★ 证据逐字校验（`evidence_quote` / `evidence_text` 必须能在正文里找到）
+
+**改前的事实**：本项目**没有**任何逐字校验 —— "必须逐字摘录"只是提示词里的一句话，
+模型不照做没人知道（wiki-architect 的协调请求基于"已有校验"的假设，实际并不存在）。
+现在它是**可断言的事实**：
+
+| 判据 | 含义 | 是否可回溯 |
+|---|---|---|
+| `exact` | 引用是正文的**连续子串** | ✅ |
+| `normalized` | 只在**空白/换行**上不同（PDF 抽文本会插换行） | ✅ |
+| `rewritten` | 找不到，但与正文某段**高度重合**（≥0.6）→ 疑似**改写/润色** | ❌ |
+| `fabricated` | 找不到，且无明显重合 → 疑似**编造** | ❌ |
+| `missing` | `evidence_quote` 为空 | ❌ |
+
+* **只归一空白，不动任何字符** —— 这是与"OCR/抽文本"有关的**唯一**假失败来源，已消除。
+* 改写/编造用 `difflib` 的**全部匹配块之和**判定（只看最长块会把改写误判成编造）。
+* **只告警，不丢卡片**：卡片内容可能仍然正确，丢掉 = 信息永久消失。调用方拿到的是
+  `stats.quoteAudit[]`（逐条 `cardId/kind/similarity/textOrigin`）+ `warnings[]`
+  （`W_EVIDENCE_NOT_VERBATIM`）+ `stats.cards_evidence_ok/bad`。
+  若将来要求"证据不可回溯就不入库"，改 `record_quote_audit` 一行即可（但必须同时改统计口径）。
+
+**★ 关于 OCR 的关键澄清**（与请求方的假设相反）：
+校验对象是**我们喂给模型的那段正文**（`unit.text`）—— OCR 单元的 `unit.text` **就是** OCR 结果。
+所以 **OCR 的错字不会造成"引用找不到"**：模型照着含错字的正文逐字抄，照样匹配（`exact`）。
+真正会不匹配的是**模型自己改写了**（如"顺手修正"错字、翻译、压缩）——
+而那正是提示词禁止的行为。实测（`worker/tests/test_pipeline.py`）：
+
+```
+OCR 正文 "索引是加速查绚的数据结构"（绚 = OCR 错字）
+  模型照抄 "索引是加速查绚的数据结构"  → ok=True, kind=exact     ← OCR 不造成假失败
+  模型"修正" "索引是加速查询的数据结构" → ok=False, kind=rewritten, sim=0.92  ← 被抓到
+```
+
+#### `text_origin`（来源标记）：**Node 只需转发 meta，worker 自己推导**
+
+```jsonc
+// 输入（可选，两者都可省）：extract / extract.plan / extract.convert
+{"text_origin_pages": {"30": "ocr", "1": "native"},   // = documents.meta.text_origin_pages，原样转发
+ "text_origin": "ocr"}                                 // 文档级兜底（整份扫描件）
+
+// 输出：
+//  · plan items[] 每项带 "text_origin": "ocr" | "native" | "mixed" | ""
+//  · stats.quoteAudit[] 每条带 "textOrigin"
+//  · 警告文案里会写明"该单元正文来自 OCR（更应逐字抄，不要修正）"
+```
+worker 按 **unit span 覆盖的页** 与逐页表求交：全 ocr → `ocr`，全 native → `native`，
+混合 → `mixed`，拿不到 → `""`（**不猜、不编造**）。
+**提示词用的是"一条通用约束"**（不按资料类型分身）→ `text_origin` **不是提示词开关**，
+它是**诊断与前端标注**用的。
+
 ### 6.1 `parse`
 
 ```jsonc

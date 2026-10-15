@@ -120,6 +120,19 @@ export interface ServerConfig {
   sseKeepaliveMs: number;
   /** 任务队列并发（契约 C1：LLM 并发=1；worker 串行执行）。 */
   taskConcurrency: number;
+  /**
+   * ★ 运行日志落盘（用户明确要求；缺口：原来 `index.ts` 里 `logger: false`，日志只进终端）。
+   *
+   * - `dir`：日志目录（`COURSE_KB_LOG_DIR`，默认 `<root>/data/logs`）
+   * - `level`：级别（`COURSE_KB_LOG_LEVEL`，默认 `info`；非法值回落 info 并告警）
+   * - 轮转：按天命名 + 单文件上限 + 保留天数
+   */
+  logging: {
+    dir: string;
+    level: string;
+    maxBytes: number;
+    retentionDays: number;
+  };
   /** RBAC：认证与登录限流（docs/RBAC.md §7） */
   auth: AuthConfig;
   llm: LlmCredentials | null;
@@ -472,6 +485,13 @@ export function loadConfig(opts: { root?: string; env?: Record<string, string | 
     workerTimeoutMs: envInt(env, 'WORKER_TIMEOUT_MS', 4 * 60 * 60 * 1000),
     sseKeepaliveMs: envInt(env, 'SSE_KEEPALIVE_MS', 15_000),
     taskConcurrency: envInt(env, 'TASK_CONCURRENCY', 1),
+    // ★ 日志：**env 必须真的被读**（坑 24：别做死旋钮）—— 判据是"设了 debug 就真有 debug 行"
+    logging: {
+      dir: env.COURSE_KB_LOG_DIR ? path.resolve(env.COURSE_KB_LOG_DIR) : path.join(dataDir, 'logs'),
+      level: (env.COURSE_KB_LOG_LEVEL || 'info').trim().toLowerCase(),
+      maxBytes: envInt(env, 'COURSE_KB_LOG_MAX_BYTES', 50 * 1024 * 1024),
+      retentionDays: envInt(env, 'COURSE_KB_LOG_RETENTION_DAYS', 14),
+    },
     auth: {
       sessionTtlMs: envInt(env, 'SESSION_TTL_MS', 7 * 24 * 60 * 60 * 1000),
       // 默认 false：本机 HTTP 下开 Secure 会让 cookie 发不出去（表现为"登录成功但立刻又是未登录"）

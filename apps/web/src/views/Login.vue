@@ -92,8 +92,7 @@ onMounted(async () => {
 
     <form v-else class="panel" @submit.prevent="submit">
       <div class="note info">
-        真后端的登录态是 **httpOnly cookie**（`ckb_session`）：JS 读不到，所以前端**不存 token**；
-        未登录访问任何受保护接口都会拿到 401 并被送到这里。
+        请登录后继续使用。
       </div>
 
       <label class="fld">用户名

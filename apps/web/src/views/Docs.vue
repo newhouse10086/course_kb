@@ -93,6 +93,153 @@ function onDrop(ev: DragEvent) {
   if (f) void doUpload(f)
 }
 
+/**
+ * ★ 抽取状态（Lead 裁定）：把"阶段"与"产出"分开显示 ——
+ *   `documents.status` = ready/failed/extracting（阶段）
+ *   `meta.extract_status` = done/partial/**done_empty**（产出）
+ * ★★ `done_empty` 是"跑完了但**零卡片**"，**绝不能显示成"成功"**。
+ */
+interface ExtractInfo {
+  status: string
+  label: string
+  tone: 'ok' | 'warn' | 'bad' | 'faint'
+  needsConfirm: boolean
+  estimate: string
+  progress: string
+  failedReason: string
+  note: string
+}
+function extractInfo(d: DocumentInfo): ExtractInfo {
+  const m = (d.meta || {}) as Record<string, unknown>
+  const raw = String(m.extract_status || '')
+  const est = (m.extract_estimate || {}) as Record<string, unknown>
+  const prog = (m.extract_progress || {}) as Record<string, unknown>
+  const calls = Number(est.llm_calls)
+  const dur = String(est.duration_human || '')
+  const done = Number(prog.done)
+  const total = Number(prog.total)
+  const failed = String(m.task_failed_error || '')
+  const needsConfirm = m.needs_confirm === true
+  // 代价文案：**次数 + 时长都要有**（用户真正感受到的痛是"要等几小时"）
+  const estimate = [
+    Number.isFinite(calls) && calls > 0 ? `预计 ${calls} 次调用` : '',
+    dur ? `约 ${dur}` : '',
+  ].filter(Boolean).join(' / ') || '（后端未给估算 —— 不编数字）'
+  const progress = (Number.isFinite(done) && Number.isFinite(total) && total > 0) ? `已抽取 ${done}/${total} 单元` : ''
+  if (raw === 'done_empty') {
+    return { status: raw, label: '已抽取但**零卡片**', tone: 'warn', needsConfirm, estimate, progress, failedReason: failed,
+      note: '抽取跑完了，但**没有产出任何卡片**（不是成功）—— 检查正文是否为空 / 抽取提示词是否匹配该文档类型。' }
+  }
+  const table: Record<string, { label: string; tone: ExtractInfo['tone'] }> = {
+    done: { label: '已抽取', tone: 'ok' },
+    partial: { label: '部分抽取', tone: 'warn' },
+  }
+  if (table[raw]) return { status: raw, label: table[raw].label, tone: table[raw].tone, needsConfirm, estimate, progress, failedReason: failed, note: '' }
+  if (!raw) {
+    return { status: '', label: '未抽取', tone: 'faint', needsConfirm, estimate, progress, failedReason: failed,
+      note: m.extract_status === undefined ? '（后端尚未提供 meta.extract_status —— 如实说明，不假装有状态）' : '' }
+  }
+  return { status: raw, label: raw, tone: 'faint', needsConfirm, estimate, progress, failedReason: failed, note: '' }
+}
+
+const extractBusy = ref('')
+
+/**
+ * ★★ 重新解析**暂时禁用**（Lead 裁定）：
+ *   后端正在修一个**破坏性** bug —— 抽取产出 0 卡片时无条件全量替换 + reparse 后单元 id 变化
+ *   触发 FK 级联删卡 ⟹ **连成功的 reparse 都会清掉旧卡片**（实测 cards 1 → 0）。
+ *   → UI 结构/代价/进度/错误处理**全部做全**，但**按钮禁用并写明理由**；
+ *     后端修好（Lead 会通知）后把这里改成 `true` 即可开放。
+ *   ★ 判据："看起来能用、一点就毁数据"比"暂时不可用"危险得多。
+ */
+const REPARSE_ENABLED = false
+const REPARSE_GATE_REASON = '⚠️ 重新解析当前会**清空已有卡片**（后端修复中）—— 修复后开放'
+
+/** 每份文档的重新解析状态（进度/错误；与视频页 taskState 同模式） */
+const reparseState = ref<Record<string, { text: string; progress: number | null; done: string; transport: string }>>({})
+
+/** 点击前的**代价预估**：`needs_ocr` 由后端判定，但页数已知 → 我们能给区间（不编数字） */
+function reparseEstimate(d: DocumentInfo): string {
+  const pages = Number(d.page_count || 0)
+  if (!pages) return '（页数未知 → 无法预估时长；是否走 OCR 由后端判定）'
+  // OCR 走本地：**不消耗 LLM 额度但占 CPU**（实测约 9–12 秒/页）
+  const lo = Math.round((pages * 9) / 60)
+  const hi = Math.round((pages * 12) / 60)
+  return `若需 OCR：约 ${lo}–${hi} 分钟（${pages} 页 × 9–12 秒/页；OCR 走本地，**不消耗 LLM 额度但占 CPU**）`
+}
+
+async function reparseDoc(d: DocumentInfo) {
+  if (!REPARSE_ENABLED) {
+    // ★ 禁用状态下**绝不发请求**（断言会检查这一点）
+    reparseState.value = { ...reparseState.value, [d.id]: { text: REPARSE_GATE_REASON, progress: null, done: 'false', transport: 'none' } }
+    return
+  }
+  const id = d.id
+  reparseState.value = { ...reparseState.value, [id]: { text: '已提交重新解析…', progress: null, done: '', transport: '' } }
+  try {
+    const r = await api.reparseDocument(id)
+    const range = Array.isArray(r.est_minutes) && r.est_minutes.length === 2
+      ? `${r.est_minutes[0]}–${r.est_minutes[1]} 分钟` : ''
+    reparseState.value = {
+      ...reparseState.value,
+      [id]: {
+        text: `已入队（${r.task_id || '无 task_id'}）${r.needs_ocr ? ' · 需 OCR' : ''}${range ? ` · 预计 ${range}` : ''}${r.cost_note ? ` · ${r.cost_note}` : ''}`,
+        progress: null, done: '', transport: '',
+      },
+    }
+    const taskId = String(r.task_id || '')
+    if (!taskId) return
+    const stream = new TaskStream(taskId, { sseTimeoutMs: 3000, pollIntervalMs: 1500 })
+    stream.start({
+      onProgress: (e) => {
+        reparseState.value = {
+          ...reparseState.value,
+          [id]: {
+            text: `任务 ${taskId}：${e.progress != null ? `${Math.round(Number(e.progress) * 100)}%` : '进行中'}${e.stage ? ` · ${e.stage}` : ''}`,
+            progress: e.progress != null ? Math.round(Number(e.progress) * 100) : null,
+            done: '', transport: stream.transport,
+          },
+        }
+      },
+      onDone: () => {
+        reparseState.value = { ...reparseState.value, [id]: { text: `任务 ${taskId} 完成，正在刷新列表…`, progress: 100, done: 'true', transport: stream.transport } }
+        void docsApi.load()
+      },
+      onFailed: (e) => {
+        reparseState.value = { ...reparseState.value, [id]: { text: `任务 ${taskId} 失败：${e.error || '未知原因'}`, progress: null, done: 'true', transport: stream.transport } }
+      },
+    })
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    // ★ 409 = 正在运行（未重复入队）；403/404 也如实显示 —— 不许静默
+    const why = err.status === 409 || err.code === 'E_BUSY'
+      ? '正在运行，未重复入队（409 E_BUSY）'
+      : err.status === 403 ? '无权操作该文档（403）'
+        : err.status === 404 ? '文档不存在（404）'
+          : `重新解析失败：${err.message || e}`
+    reparseState.value = { ...reparseState.value, [id]: { text: why, progress: null, done: 'true', transport: '' } }
+  }
+}
+async function startExtract(d: DocumentInfo) {
+  extractBusy.value = d.id
+  try {
+    const r = await api.extractDocument(d.id)
+    note.value = r.queued === false
+      ? `未入队：${r.reason || '后端闸门拒绝（原因未给）'}`
+      : `已提交抽取任务${r.taskId ? `（${r.taskId}）` : ''} —— 抽取会消耗 LLM 额度，进度见列表。`
+    noteKind.value = r.queued === false ? 'warn' : 'ok'
+    await docsApi.load()
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    note.value = (err.status === 404 || err.code === 'E_NOTFOUND')
+      ? '抽取接口尚未实现（POST /documents/:id/extract）—— 如实说明，不假装已入队'
+      : `抽取失败：${err.message || e}`
+    noteKind.value = 'bad'
+  } finally {
+    extractBusy.value = ''
+  }
+}
+
 async function remove(d: DocumentInfo) {
   if (!confirm(`删除《${d.title}》？会级联删除该文档的单元/卡片/图谱（不可撤销）。`)) return
   try {
@@ -158,13 +305,29 @@ onMounted(async () => {
       <div v-if="docsApi.error.value" class="note bad">{{ docsApi.error.value }}</div>
       <table class="table" data-testid="doc-table">
         <thead>
-          <tr><th>标题</th><th>类型</th><th>状态</th><th>大小</th><th>页数</th><th>操作</th></tr>
+          <tr><th>标题</th><th>类型</th><th>状态</th><th>抽取</th><th>大小</th><th>页数</th><th>操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="d in rows" :key="d.id" :data-doc="d.id" :data-kind="d.kind" :data-status="d.status">
             <td><b>{{ d.title }}</b><div class="faint tiny mono">{{ d.id }}</div></td>
             <td><span class="pill" :class="{ blue: d.kind === 'video' }">{{ d.kind }}</span></td>
             <td><span class="pill" :class="d.status === 'ready' ? 'ok' : d.status === 'failed' ? 'bad' : 'orange'">{{ d.status }}</span></td>
+            <!-- ★ 抽取状态**按文档**显示（Lead 裁定：done_empty 不是成功；needs_confirm 报次数+时长） -->
+            <td class="extract-cell" data-testid="extract-cell" :data-doc-extract="d.id">
+              <span class="pill" :class="extractInfo(d).tone" data-testid="extract-status"
+                    :data-status="extractInfo(d).status">{{ extractInfo(d).label }}</span>
+              <div class="faint tiny" data-testid="extract-estimate">{{ extractInfo(d).estimate }}</div>
+              <div v-if="extractInfo(d).progress" class="faint tiny" data-testid="extract-progress">
+                {{ extractInfo(d).progress }}
+              </div>
+              <button v-if="extractInfo(d).needsConfirm" type="button" class="small primary"
+                      data-testid="extract-start" :data-extract-doc="d.id" :disabled="extractBusy === d.id"
+                      @click="startExtract(d)">开始抽取</button>
+              <div v-if="extractInfo(d).failedReason" class="warn-text tiny" data-testid="extract-failed">
+                失败：{{ extractInfo(d).failedReason }}
+              </div>
+              <div v-if="extractInfo(d).note" class="warn-text tiny" data-testid="extract-note">{{ extractInfo(d).note }}</div>
+            </td>
             <td class="mono small">{{ fmtBytes(d.size_bytes) }}</td>
             <td class="mono small">{{ d.page_count || '—' }}</td>
             <td class="ops">
@@ -172,6 +335,19 @@ onMounted(async () => {
               <button type="button" :data-open-graph="d.id" @click="openDoc(d, 'graph')">图谱</button>
               <button v-if="d.kind === 'video'" type="button" :data-open-video="d.id" @click="openDoc(d, 'video')">视频</button>
               <button type="button" :data-delete="d.id" @click="remove(d)">删除</button>
+              <!-- ★ 重新解析（Lead：后端有端点但前端没入口；**暂时禁用**并写明理由） -->
+              <button type="button" :data-reparse="d.id" data-testid="btn-reparse"
+                      :disabled="!REPARSE_ENABLED" :title="REPARSE_ENABLED ? '' : REPARSE_GATE_REASON"
+                      :data-reparse-enabled="REPARSE_ENABLED ? '1' : '0'"
+                      @click="reparseDoc(d)">重新解析</button>
+              <div v-if="!REPARSE_ENABLED" class="warn-text tiny" data-testid="reparse_gate_reason"
+                   :data-doc-gate="d.id">{{ REPARSE_GATE_REASON }}</div>
+              <!-- ★ 代价可见（先展示再执行）：页数 → 区间；OCR 本地、不耗额度但占 CPU -->
+              <div class="faint tiny" data-testid="reparse_estimate" :data-doc-est="d.id">{{ reparseEstimate(d) }}</div>
+              <div v-if="reparseState[d.id]" class="tiny" data-testid="reparse_state" :data-doc-state="d.id"
+                   :data-progress="reparseState[d.id].progress ?? ''" :data-done="reparseState[d.id].done">
+                {{ reparseState[d.id].text }}
+              </div>
             </td>
           </tr>
         </tbody>

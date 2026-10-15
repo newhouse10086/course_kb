@@ -578,8 +578,13 @@ def test_extract_units_status_and_no_cards_warning() -> None:
     # ③ 有产出 → done，且没有警告
     out3 = core.extract_units(doc_id="doc_x", units=_units3(),
                               llm=LLMClient(config=cfg(), transport=lambda p: stub_payload()))
-    assert out3.to_dict()["status"] == "done" and out3.cards
-    assert out3.to_dict()["warnings"] == []
+    d3 = out3.to_dict()
+    assert d3["status"] == "done" and out3.cards
+    # ★ stub 的 evidence_quote（英文）不在中文正文里 → **证据校验会如实告警**
+    #   （这条以前断言"没有警告"，是因为当时**根本没有校验**；现在校验到位了）
+    assert {w["code"] for w in d3["warnings"]} == {"W_EVIDENCE_NOT_VERBATIM"}
+    assert d3["stats"]["cards_evidence_bad"] == len(out3.cards)
+    assert d3["stats"]["cards_evidence_ok"] == 0
 
 
 def test_llm_empty_content_is_not_success() -> None:
@@ -707,6 +712,20 @@ def test_llm_empty_content_wording_is_not_overclaiming() -> None:
     assert "很可能" in exc.value.msg or "推理" not in exc.value.msg
 
 
+
+def test_prompt_requires_cards_key_present() -> None:
+    """★ 提示词必须**明确要求 `cards` 键存在**（坑 22：空 ≠ 缺失）。
+
+    现场证据（真库 `doc_ec5a4ce88038`）：模型返回合法 JSON 但**只有 `section`** →
+    `cards_key: "missing"`。下游**无法区分**"本节没有知识点"与"输出被截断"。
+    提示词加一句"必须给空数组"就能把 `missing` 变成 `empty`（可区分）。
+    """
+    prompt = core.build_system_prompt("课程资料")
+    assert "`cards` 键必须存在" in prompt, "提示词必须要求 cards 键存在"
+    assert "空数组" in prompt and "不许省略" in prompt
+    # 诚实原则段也要在（既有判据不许退化）
+    assert "绝不编造" in prompt
+
 def test_ancestor_paths() -> None:
     units = [
         mk_unit("unt_ch", 1, "Chapter 7 MySQL Server Administration", 1, 1, 30),
@@ -816,3 +835,109 @@ def test_rollup_convert_validates_and_reports() -> None:
         "key": "unt_y#node", "title": "标题", "intro": "a", "why_important": "b",
         "objectives": ["o"], "key_takeaways": ["k"]}}])
     assert out4["ok"] is True and out4["rollups"]["unt_y"]["intro"] == "a"
+
+# ═══════════════════════════════════════════════════════════════════════
+# ★ 证据逐字校验（wiki-architect 协调请求 ②）
+#
+# 改前本项目**没有**任何 evidence_quote 逐字校验 —— 提示词要求"逐字摘录"，
+# 模型不照做没人知道。现在它变成可断言的事实，并且**区分原因**：
+#   exact / normalized（可回溯）· rewritten（疑似改写）· fabricated（疑似编造）· missing（没给引用）
+# ═══════════════════════════════════════════════════════════════════════
+def test_evidence_quote_audit_classifies_five_ways() -> None:
+    """五分类判据（含"仅空白不同"不算失败 —— 这是 OCR/抽文本唯一的假失败来源）。"""
+    from worker.pipeline.extract_core import check_quote
+
+    body = "索引是加速查询的数据结构，很重要。"
+    assert check_quote("索引是加速查询的数据结构", body).kind == "exact"
+    # PDF 抽文本会插换行 → 空白差异必须容忍（否则全是假失败）
+    assert check_quote("索引 是加速\n查询的数据结构", body).kind == "normalized"
+    # 模型改写/润色（如"顺手修正"错字）→ rewritten（与正文高度重合但不是原文）
+    rw = check_quote("索引是加速检索的数据结构。", body)
+    assert rw.kind == "rewritten" and rw.similarity >= 0.6 and rw.ok is False
+    # 正文里完全没有的东西 → fabricated
+    fab = check_quote("B+ 树在磁盘上按页组织", body)
+    assert fab.kind == "fabricated" and fab.similarity == 0.0
+    assert check_quote("", body).kind == "missing"
+
+
+def test_ocr_unit_typo_is_not_a_false_failure() -> None:
+    """★ OCR 的关键事实：校验对象是**喂给模型的那段正文**（就是 OCR 结果）。
+
+    → 模型**照抄**含错字的正文：**通过**（OCR 不会造成假失败）
+    → 模型"顺手修正"错字：**被抓到**，且归类为 rewritten（不是 fabricated）
+    这正是提示词那条 OCR 约束要防的行为，现在**可机器验证**。
+    """
+    from worker.pipeline.extract_core import check_quote
+
+    ocr_body = "索引是加速查绚的数据结构"          # 「绚」是 OCR 错字
+    copied = check_quote("索引是加速查绚的数据结构", ocr_body, origin="ocr")
+    assert copied.ok is True and copied.kind == "exact"
+    assert copied.to_dict()["textOrigin"] == "ocr"
+    fixed = check_quote("索引是加速查询的数据结构", ocr_body, origin="ocr")
+    assert fixed.ok is False and fixed.kind == "rewritten"
+    assert fixed.similarity > 0.8
+
+
+def test_quote_audit_warns_but_keeps_cards() -> None:
+    """审计**只告警不丢卡片**（卡片内容可能仍正确；丢掉=信息永久消失）。
+
+    同时 stats 必须给出可统计口径，warnings 必须能区分原因。
+    """
+    units = [mk_unit("unt_1", 1, "索引", 1, 1, 1, text="索引是加速查询的数据结构。")]
+    data = {"section": {"section_role": "concept_intro", "section_summary": "讲索引",
+                        "learning_objectives": ["能解释索引"]},
+            "cards": [
+                {"name": "索引", "kind": "concept", "one_line": "加速查询",
+                 "purpose": "减少扫描", "usage_mode": "server_automatic",
+                 "operational_role": "performance",
+                 "evidence_quote": "索引是加速查询的数据结构"},          # 逐字 ✓
+                {"name": "B+树", "kind": "concept", "one_line": "磁盘页组织",
+                 "purpose": "减少 IO", "usage_mode": "internal",
+                 "operational_role": "storage",
+                 "evidence_quote": "B+ 树在磁盘上按页组织"},              # 编造 ✗
+            ], "entities": [], "edges": []}
+    out = core.convert_payloads(doc_id="doc_x", units=units,
+                                payloads=[{"key": "unt_1#page:1-1", "data": data}])
+    d = out.to_dict()
+    assert len(d["cards"]) == 2, "不许丢卡片"
+    assert d["stats"]["cards_evidence_ok"] == 1
+    assert d["stats"]["cards_evidence_bad"] == 1
+    assert d["stats"]["quote_exact"] == 1 and d["stats"]["quote_fabricated"] == 1
+    w = [x for x in d["warnings"] if x["code"] == "W_EVIDENCE_NOT_VERBATIM"]
+    assert len(w) == 1 and w[0]["quote_kind"] == "fabricated"
+    assert w[0]["name"] == "B+树" and w[0]["unit_id"] == "unt_1"
+    assert "编造" in w[0]["msg"]
+    # 审计明细也随结果给出（供 Node 落库/UI 标记）
+    audit = d["stats"]["quoteAudit"]
+    assert {a["kind"] for a in audit} == {"exact", "fabricated"}
+    assert all("cardId" in a for a in audit)
+
+
+def test_text_origin_derived_from_page_map() -> None:
+    """③ `text_origin_pages`（documents.meta）→ worker 按 unit span 推导每单元来源。"""
+    units = [mk_unit("unt_1", 1, "扫描页", 1, 1, 3, text="OCR 正文"),
+             mk_unit("unt_2", 2, "原生页", 2, 4, 4, text="原生正文")]
+    data = {"section": {"section_role": "reference", "section_summary": "s",
+                        "learning_objectives": ["o"]},
+            "cards": [{"name": "n", "kind": "concept", "one_line": "x", "purpose": "y",
+                       "usage_mode": "internal", "operational_role": "feature",
+                       "evidence_quote": "OCR 正文"}],
+            "entities": [], "edges": []}
+    pages = {"1": "ocr", "2": "ocr", "3": "ocr", "4": "native"}
+    # ① plan：每个 item 自带来源（Node 可落库/前端标注）
+    plan = core.plan_prompts(units=units, text_origin_pages=pages)
+    by_title = {it["title"]: it["text_origin"] for it in plan["items"]}
+    assert by_title["扫描页"] == "ocr" and by_title["原生页"] == "native"
+    # ② convert：审计条目带上来源，便于区分"编造"与"OCR 噪声"
+    key = [it["key"] for it in plan["items"] if it["title"] == "扫描页"][0]
+    out = core.convert_payloads(doc_id="doc_x", units=units, text_origin_pages=pages,
+                                payloads=[{"key": key, "data": data}])
+    d = out.to_dict()
+    audit = [a for a in d["stats"]["quoteAudit"] if a.get("cardId")]
+    assert audit and audit[0]["textOrigin"] == "ocr", audit
+    assert d["stats"]["cards_evidence_ok"] == 1        # "OCR 正文"逐字命中
+    # ③ 没有来源信息时不编造（textOrigin 字段直接不出现）
+    out2 = core.convert_payloads(doc_id="doc_x", units=units,
+                                 payloads=[{"key": key, "data": data}])
+    audit2 = [a for a in out2.to_dict()["stats"]["quoteAudit"] if a.get("cardId")]
+    assert audit2 and "textOrigin" not in audit2[0], audit2

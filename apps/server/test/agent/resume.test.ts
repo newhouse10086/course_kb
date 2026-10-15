@@ -97,7 +97,9 @@ test('★ 会话文件损坏 → resumed:false + 可读 reason，且**不抛**',
     const manager = new AgentSessionManager({ sessionDir, tools: [] });
     let session;
     await assert.doesNotReject(async () => {
-      session = await manager.getOrCreate(key);
+      // ★ 归属登记（跨用户读取防护）要求：**有历史文件但未登记**的会话默认拒开。
+      //   本用例测的是"损坏文件的降级"，所以要显式走**迁移/认领**路径（真实运维场景）。
+      session = await manager.getOrCreate(key, { userId: 'u_resume_test', allowUnclaimed: true });
     });
     const ready = session!.readyFrame();
     assert.equal(ready.resumed, false, '★ 读不了就必须报 false，不许假装恢复成功');
@@ -134,7 +136,8 @@ test(
     try {
       // ---- 第一次：全新会话，跑一轮（让 pi 真的把 session 写盘）----
       const manager1 = new AgentSessionManager({ sessionDir, agentDir, tools: [] });
-      const session1 = await manager1.getOrCreate(key);
+      // ★ 归属登记（跨用户读取防护）：真实路径由路由传 req.user.id —— 这里模拟同一用户重连
+      const session1 = await manager1.getOrCreate(key, { userId: 'u_resume_test' });
       const ready1 = session1.readyFrame();
       assert.equal(ready1.persistence, 'native');
       assert.equal(ready1.resumed, false, '首次应当是新建');
@@ -153,7 +156,7 @@ test(
 
       // ---- 第二次：**新的 manager 实例**（等价于进程重启）从磁盘恢复 ----
       const manager2 = new AgentSessionManager({ sessionDir, agentDir, tools: [] });
-      const session2 = await manager2.getOrCreate(key);
+      const session2 = await manager2.getOrCreate(key, { userId: 'u_resume_test' });
       const ready2 = session2.readyFrame();
 
       assert.equal(ready2.resumed, true, '★ 必须从磁盘恢复了历史');
@@ -185,7 +188,7 @@ test(
     const key = 'resume-real-2';
     try {
       const m1 = new AgentSessionManager({ sessionDir, agentDir, tools: [] });
-      const s1 = await m1.getOrCreate(key);
+      const s1 = await m1.getOrCreate(key, { userId: 'u_resume_test' });
       await s1.prompt('只回复 ok。');
       const file = s1.currentSessionFile() as string;
       m1.close(key);
@@ -193,7 +196,7 @@ test(
       // 恢复两次，每次都应当仍然是 resumed:true 且文件还在
       for (const round of [1, 2]) {
         const m = new AgentSessionManager({ sessionDir, agentDir, tools: [] });
-        const s = await m.getOrCreate(key);
+        const s = await m.getOrCreate(key, { userId: 'u_resume_test' });
         assert.equal(s.readyFrame().resumed, true, `第 ${round} 次恢复应当是 resumed:true`);
         m.close(key);
         assert.equal(existsSync(file), true, `第 ${round} 次释放后文件必须还在`);

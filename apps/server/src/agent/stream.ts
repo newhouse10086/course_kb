@@ -25,6 +25,7 @@
 
 import { AGENT_ERROR_CODES, agentError, classifyFailure, sdkUnavailableError, type AgentErrorCode, type AgentErrorFrame } from './errors.ts';
 import { KB_TOOL_NAMES, resolvePageContext, type KbProvider } from './kb_tools.ts';
+import { historyLeaksSystemPrompt, type HistoryPayload } from './history.ts';
 import {
   describeCitationMode,
   extractCitations,
@@ -54,6 +55,21 @@ import {
  */
 export type ToolsSource = 'disabled-by-role' | 'explicit' | 'dangerous-opt-in' | 'kb-readonly' | 'kb-unavailable';
 
+/**
+ * ★ `ready` 帧**为什么被重发**（lead 裁定：别让 `restarted` 一个字段承担两种含义）。
+ *
+ * 前端"该不该清空消息列表"必须有明确依据，而不是靠猜：
+ * - `connect`     = 连接建立 → **不清空**
+ * - `new_session` = 客户端要了新会话 → **唯一该清空**的时点
+ * - `mode_change` = chat↔agent 切换（换了上下文）→ **清空**
+ * - `set_model`   = 切模型 → **不清空**
+ * - `get_state`   = 状态刷新（页面聚焦/重连复查）→ **不清空**
+ *
+ * 真事故（用户反馈"聊了几轮只剩最新一条"）：若前端"见 ready 就清空"，
+ * `get_state`/`set_model` 都会把列表清掉 —— 表现像"没做历史"，真因是**历史被清了**。
+ */
+export type ReadyReason = 'connect' | 'new_session' | 'mode_change' | 'set_model' | 'get_state';
+
 export interface ReadyFrame {
   type: 'ready';
   /** 浏览器会话 id（URL 里那个） */
@@ -63,6 +79,8 @@ export interface ReadyFrame {
   /** 扩展（§7.3.1 ⚠️9） */
   /** ★ 工具策略（三态；**永远与实际 `tools` 一致**，见 `ToolsSource`） */
   tools_source: ToolsSource;
+  /** ★ 本帧为什么被发（`connect`/`new_session`/`mode_change`/`set_model`/`get_state`） */
+  reason?: ReadyReason;
   /**
    * ★ `tools_source='dangerous-opt-in'` 时的**刺眼警告**（in-band，不让它只活在枚举值里）。
    *
@@ -193,6 +211,22 @@ export interface ContextFrame {
   note: string;
 }
 
+/**
+ * `history` 帧（契约 §7.2 第 12 种）—— 连接建立时**恢复当前会话的历史消息**。
+ *
+ * ★ 为什么走 WS 而不是只靠 HTTP：**恢复是"会话建立"的一部分**，
+ * 同一条通道才能保证顺序确定（`ready → history → …`）；只靠 HTTP 会让前端并发拉取再自己对时序 → **又一个竞态**。
+ *
+ * ⚠️ **只含 user/assistant 文本**（`system` 与 `sections`/`systemPrompt` 一律不下发）。
+ * 映射函数与 HTTP 历史接口**共用** `agent/history.ts::entriesToHistory`（只许一份实现）。
+ */
+export interface HistoryFrame {
+  type: 'history';
+  messages: { role: 'user' | 'assistant'; text: string; ts: number }[];
+  /** 是否截断过（如实标注，不静默） */
+  truncated: boolean;
+}
+
 export interface SettledFrame {
   type: 'settled';
   aborted: boolean;
@@ -205,6 +239,7 @@ export interface SettledFrame {
 
 export type AgentFrame =
   | ReadyFrame
+  | HistoryFrame
   | ContextFrame
   | RetrievalFrame
   | TextDeltaFrame
@@ -216,9 +251,10 @@ export type AgentFrame =
   | SettledFrame
   | AgentErrorFrame;
 
-/** 契约 §7.2 允许的帧类型（测试断言用；11 种 = 原 9 + `retrieval` + `context`） */
+/** 契约 §7.2 允许的帧类型（测试断言用；12 种 = 原 9 + `retrieval` + `context` + `history`） */
 export const AGENT_FRAME_TYPES = [
   'ready',
+  'history',
   'context',
   'retrieval',
   'text_delta',
@@ -605,7 +641,12 @@ export function makeRetrievalFrame(opts: {
  * `tools` 字段保持会话的**真实值**（`getActiveToolNames()`），只把 `tools_source` 标成
  * 三态策略之一 —— 两者必须一致：`disabled-by-role` 时 `tools` 必然是 `[]`。
  */
-export function withToolsPolicy(frame: ReadyFrame, policy: ToolsSource, agentMode?: AgentMode): ReadyFrame {
+export function withToolsPolicy(
+  frame: ReadyFrame,
+  policy: ToolsSource,
+  agentMode?: AgentMode,
+  reason?: ReadyReason,
+): ReadyFrame {
   const kbWarning = frame.kb_tools_warning;
   const activeTools = Array.isArray(frame.tools) ? frame.tools : [];
   const hasKbTool = activeTools.some((t) => (KB_TOOL_NAMES as readonly string[]).includes(t));
@@ -630,6 +671,8 @@ export function withToolsPolicy(frame: ReadyFrame, policy: ToolsSource, agentMod
     ...frame,
     tools_source: effectivePolicy,
     ...(agentMode ? { agent_mode: agentMode } : {}),
+    // ★ 本帧为什么被发（前端据此决定"该不该清空消息列表"；见 `ReadyReason`）
+    ...(reason ? { reason } : {}),
     // 危险状态**必须在帧里说出来**（不只是枚举值）—— 独立验收建议
     ...(effectivePolicy === 'dangerous-opt-in'
       ? {
@@ -733,6 +776,8 @@ export interface ChatSessionLike {
   abort(): Promise<void>;
   setModel?(ref: string): Promise<{ ok: boolean; reason?: string }>;
   reset(): Promise<ReadyFrame>;
+  /** ★ 可选：本会话的历史消息（恢复用；由 gent/history.ts 的共享映射产出） */
+  history?(): { messages: { role: 'user' | 'assistant'; text: string; ts: number }[]; truncated: boolean } | null;
   readyFrame(): ReadyFrame;
 }
 
@@ -740,8 +785,14 @@ export interface ChatSessionManagerLike {
   /**
    * 取/建会话。`init.tools` 是**按连接/角色**给的工具白名单：
    * 只在会话**首次创建**时生效（已存在的会话不会被改写 —— 避免半个会话换工具集）。
+   *
+   * ★ `init.userId` 是**服务端权威身份**（`req.user.id`）——会话归属登记用它做
+   * **跨用户读取防护**（可选的 `allowUnclaimed` 仅用于旧会话迁移）。
    */
-  getOrCreate(sessionId: string, init?: { tools?: string[]; kbUserId?: string }): Promise<ChatSessionLike>;
+  getOrCreate(
+    sessionId: string,
+    init?: { tools?: string[]; kbUserId?: string; userId?: string; allowUnclaimed?: boolean },
+  ): Promise<ChatSessionLike>;
   release(sessionId: string): void;
   /**
    * 管理器**当前配置**的工具白名单（`null` = pi 默认全集）。
@@ -965,16 +1016,28 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
     //   而且**不要**说成"pi 不可用"（SDK 好好的，是部署配置的形状问题）。
     const isAuthShape = (err as Error)?.name === 'PiAuthShapeInvalid';
     const isSdkMissing = classified.kind === 'unknown' && String(err).includes('pi SDK');
+    // ★ 会话归属被拒：**授权**问题，不是模型问题。
+    //   ⚠️ 原实现落到 classifyFailure 兜底 → 报 `E_LLM`（"模型侧失败"）→ **把排障方向带偏**
+    //   （用户会去查模型/凭据，真实原因是"这个会话不属于你"）。
+    //   契约里没有专门的授权码 → 用 `E_PI_SESSION_ID`（会话 id 不可接受）并给明确 hint。
+    const isOwnership = (err as Error)?.name === 'SessionOwnershipError';
     const frame = isAuthShape
       ? agentError(AGENT_ERROR_CODES.E_PI_CMD, String((err as Error).message), {
           hint: '这是**部署配置**问题（不是模型、也不是学生的操作）：按消息里的形状修正 pi 凭据文件后重试',
           detail: 'PiAuthShapeInvalid（形状错的凭据会让 pi 静默挂死 → 所以在建会话前就拦下）',
         })
-      : isSdkMissing
-        ? sdkUnavailableError(String((err as Error)?.message ?? err))
-        : agentError(classified.code, classified.msg, { hint: classified.hint, detail: classified.detail });
+      : isOwnership
+        ? agentError(AGENT_ERROR_CODES.E_PI_SESSION_ID, String((err as Error).message), {
+            hint: '会话不属于当前账号（跨用户读取防护）。请新建会话；若确是你自己的旧会话，需由运维认领归属。',
+            detail: 'SessionOwnershipError（agent 层兜底；根因是会话 key 由客户端自选、与用户无关）',
+          })
+        : isSdkMissing
+          ? sdkUnavailableError(String((err as Error)?.message ?? err))
+          : agentError(classified.code, classified.msg, { hint: classified.hint, detail: classified.detail });
     await safeSend(send, frame);
     if (frame.code === AGENT_ERROR_CODES.E_PI_UNAVAILABLE) onClose?.(1013, 'pi unavailable');
+    // 归属被拒 → 1013（不可用/策略）：不要用 1013 的理由文案，只借关闭码让前端停止重连尝试
+    if (isOwnership) onClose?.(1008, 'session ownership denied');
     return dummyConnection(sessionId, frame);
   }
 
@@ -1070,7 +1133,32 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
   };
   bindSession(session);
 
-  await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode));
+  /**
+   * ★ 发 `history` 帧（**仅当会话是从磁盘恢复的**）——紧跟该会话的 `ready` 之后。
+   *
+   * - 顺序确定：`ready → history → …`（同一条 WS；只靠 HTTP 会让前端并发拉取后自己对时序 = 竞态）
+   * - 安全：内容由 `agent/history.ts::entriesToHistory` 产出（**只含 user/assistant 文本**）；
+   *   这里再加一道出口自检：万一混进 `systemPrompt`/`sections` 痕迹就**丢掉并记诊断**（绝不下发）
+   */
+  const sendHistoryIfRestored = async (s: ChatSessionLike): Promise<void> => {
+    try {
+      if (s.readyFrame().resumed !== true) return; // 新建会话没有历史
+      if (typeof s.history !== 'function') return;
+      const payload = s.history();
+      if (!payload || payload.messages.length === 0) return;
+      if (historyLeaksSystemPrompt(payload as HistoryPayload)) {
+        process.stderr.write(`[agent][history] 会话 ${sessionId} 的历史帧疑似含系统提示词痕迹 → 已丢弃\n`);
+        return;
+      }
+      await safeSend(send, { type: 'history', messages: payload.messages, truncated: payload.truncated });
+    } catch (err) {
+      // 历史取不到不影响会话使用（如实记诊断，不假装有历史）
+      process.stderr.write(`[agent][history] 取历史失败（忽略）：${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  };
+
+  await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode, 'connect'));
+  await sendHistoryIfRestored(session);
   readySent = true;
   await flush(); // 把 ready 之前缓冲的事件按原顺序补发
 
@@ -1143,7 +1231,8 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                 currentMode = mode;
                 bindSession(session); // ★ 新会话必须重新订阅，否则它的帧全丢
                 // 切换/首次建立该模式的会话 → 重发 ready（前端据此更新模式徽标与工具集）
-                await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, mode));
+                await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, mode, 'mode_change'));
+                await sendHistoryIfRestored(session);
                 currentContextValidIds = [];
                 currentRoundText = '';
                 currentRound += 1;
@@ -1294,16 +1383,16 @@ export async function createChatConnection(opts: CreateChatConnectionOptions): P
                 hint: '模型必须已在 pi 的 models.json/目录里且凭据可用',
               }));
             }
-            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode));
+            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode, 'set_model'));
             break;
           }
           case 'new_session': {
             const ready = await session.reset();
-            await safeSend(send, withToolsPolicy(ready, toolsPolicy, currentMode));
+            await safeSend(send, withToolsPolicy(ready, toolsPolicy, currentMode, 'new_session'));
             break;
           }
           case 'get_state': {
-            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode));
+            await safeSend(send, withToolsPolicy(session.readyFrame(), toolsPolicy, currentMode, 'get_state'));
             break;
           }
           default: {

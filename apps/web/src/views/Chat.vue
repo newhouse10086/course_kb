@@ -10,8 +10,9 @@
  *   · 失败**显式呈现**（error 事件 → 红条），绝不留"空回复"
  *   · pi / 模型任一不可用 → 禁用输入并写明 reason（不允许点了才报错）
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { api } from '../api/client'
 import { ChatSocket, type ChatServerEvent } from '../api/chat'
 import { useCaps } from '../composables/useCaps'
 import { esc } from '../utils/text'
@@ -19,7 +20,7 @@ import RichText from '../components/RichText.vue'
 import { queryFlag, testBarrier, testBarrierDone, writeReport } from '../utils/report'
 
 interface ToolCall { id: string; tool: string; args?: unknown; partial?: string; ok?: boolean; duration_ms?: number; done: boolean; result_text?: string }
-interface Msg { role: 'user' | 'assistant' | 'system'; text: string; thinking: string; tools: ToolCall[]; error?: { code?: string; msg?: string } }
+interface Msg { role: 'user' | 'assistant' | 'system'; text: string; thinking: string; tools: ToolCall[]; error?: { code?: string; msg?: string }; ts?: number }
 
 /**
  * ★ 本组件是**共用的对话组件**（Lead 要求：整页与全局小助手**不写两套**）：
@@ -43,9 +44,110 @@ const props = withDefaults(defineProps<{
 }>(), { embedded: false, context: () => ({}), title: 'pi AI 助教', assistant: 'chat' })
 
 const route = useRoute()
+const router = useRouter()
 const { caps, error: capsError } = useCaps()
-const sessionId = `web-${Math.random().toString(36).slice(2, 10)}`
+/**
+ * ⚠️ 原错误写法：`web-${Math.random().toString(36).slice(2, 10)}`
+ *   `Math.random()` **不是密码学安全**（PRNG 状态可推断）+ 只有 ~41bit →
+ *   服务端 `sessionId` 来自 URL 且**曾经没有归属校验** → id 可猜 = 抬高"连上别人的会话读历史"的可利用性。
+ * ★ 修法：`crypto.randomUUID()`（CSPRNG；localhost 属安全上下文）。
+ * ★ 但**这不是漏洞的防线** —— 唯一防线是服务端的**归属校验**（backend-api 在做）。
+ *   服务端 `SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/` → `web-<uuid>` 合法。
+ */
+/**
+ * 当前会话 id。
+ * ★ 流程按服务端 hint：**先 `POST /conversations` 登记 → 用服务端签发的 id 连接**；
+ *   登记失败 → **如实显示原因** + 退回本地 CSPRNG id（不静默假装登记成功）。
+ */
+/**
+ * ★ 会话 id 的来源优先级（这是"切走再回来消息还在"的关键）：
+ *   ① URL `?session=cnv_…`（可分享/可刷新/前进后退）
+ *   ② **localStorage**（用户点导航回 `/chat` 时 URL 上**没有** session —— 只靠 URL 会又新建一个）
+ *   ③ 都没有 → 才 `POST /conversations` 新建
+ * ⚠️ **unmount 时绝不清 localStorage**（清了就等于每次回来都是新会话）。
+ */
+/**
+ * ★ 持久化键**按实例分**（polysemy-prober 真后端复验抓出的 bug）：
+ *   抽屉（小助手）与整页 `/chat` 是**两个独立会话**，共用一个 key 会导致：
+ *     · 抽屉与整页共享同一段历史（互相能看见）
+ *     · 抽屉点「新会话」会**改掉主页面的会话**（反之亦然）
+ *   ⚠️ 原来的写法是单个 `ckb.chat.session` + 两者都读 `route.query.session` → 抽屉直接复用了页面会话。
+ */
+const SESSION_KEY = props.embedded ? 'ckb.assistant.session' : 'ckb.chat.session'
+function readStoredSession(): string {
+  try { return String(localStorage.getItem(SESSION_KEY) || '') } catch { return '' }
+}
+/** ⚠️ `route.query.session` **只作用于整页实例** —— 抽屉不该从页面 URL 认领会话 */
+const chatSessionId = ref(String((props.embedded ? '' : route.query.session) || readStoredSession() || ''))
+/**
+ * 把会话 id 写回 URL（`?session=cnv_…`）——**这是"切走再回来消息还在"的关键**：
+ * 组件 unmount 会丢掉内存状态，但 URL 不会丢；重挂载时用它**重连同一个会话**，
+ * 后端随后发 `history` 帧把消息铺回来（刷新/前进后退/分享链接同样有效）。
+ * ⚠️ 用 `replace` 而不是 `push`：不把每次切会话都塞进浏览器历史。
+ */
+function persistSessionId(id: string, toUrl = true) {
+  // ★ 两条都写：URL 便于分享/刷新；localStorage 保证"点导航回来"也复用同一个会话
+  try { localStorage.setItem(SESSION_KEY, id) } catch { /* 隐私模式等：不致命 */ }
+  if (!toUrl) return
+  const q = { ...route.query, session: id }
+  void router.replace({ query: q })
+}
+
+/** 会话登记状态（`server` = 服务端签发；`local` = 本地兜底，附原因） */
+const sessionOrigin = ref<'server' | 'local' | 'pending'>('pending')
+const sessionOriginNote = ref('')
+/**
+ * ★ 会话不可用（登记失败 + 后端要求先登记，或归属被拒）→ **禁用输入**。
+ *   理由（polysemy-prober 建议）：本地兜底 id 在方案 A 下**必然连不上**，
+ *   不该让用户先点一次注定失败的操作（"登记失败 → 本地新建 → 连不上"两步）。
+ */
+const sessionBlocked = ref('')
+/** ★ 第 12 种帧 `history`：历史内容（pi-bridge：连接恢复时紧跟 ready 发一帧） */
+const historyTruncated = ref(false)
+const historyCount = ref(0)
+/** `ready.reason`（清空判据的依据；也是排障线索） */
+const readyReason = ref('')
 const input = ref('')
+/**
+ * ★ 会话显示名兜底（契约 `docs/SESSION_NAMING.md` §4.3）：
+ *   库里 title 全是默认值 '新问答' → 列表一排一样，用户找不到。
+ *   → **无名字时显示"首条用户提问的前 20 字"**（**本地派生、零成本、不写库**）。
+ *   ⚠️ 这是**显示层派生**，不是 title 的值 —— 断言要分清"DOM 显示"与"接口 title"。
+ */
+const FIRST_Q_KEY = 'ckb.chat.firstq'
+const DEFAULT_TITLES = ['新问答', '新会话', '未命名']
+function readFirstQ(): Record<string, string> {
+  try { return JSON.parse(localStorage.getItem(FIRST_Q_KEY) || '{}') as Record<string, string> } catch { return {} }
+}
+const firstQ = ref<Record<string, string>>(readFirstQ())
+function rememberFirstQ(sid: string, text: string) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!sid || !clean || firstQ.value[sid]) return
+  firstQ.value = { ...firstQ.value, [sid]: clean }
+  try { localStorage.setItem(FIRST_Q_KEY, JSON.stringify(firstQ.value)) } catch { /* 隐私模式：不致命 */ }
+}
+/** 显示名：有真名用真名；默认名 → 首条提问前 20 字（超长加省略号）；都没有 → 明确标注未命名 */
+function sessionLabel(s: { id: string; title?: string }): string {
+  const t = String(s.title || '').trim()
+  if (t && !DEFAULT_TITLES.includes(t)) return t
+  const q = String(firstQ.value[s.id] || '').replace(/\s+/g, ' ').trim()
+  if (!q) return '（未命名会话）'
+  return q.length > 20 ? `${q.slice(0, 20)}…` : q
+}
+/** 名字来源（可核验：`server` = 服务端 title；`derived` = 本地派生显示） */
+function sessionLabelSource(s: { id: string; title?: string }): 'server' | 'derived' {
+  const t = String(s.title || '').trim()
+  return t && !DEFAULT_TITLES.includes(t) ? 'server' : 'derived'
+}
+
+/** 左侧**平铺**会话列表（后端权威；后端没实现时如实说"暂不可用"） */
+const sessions = ref<Array<{ id: string; title?: string; updated_at?: number; message_count?: number }>>([])
+const sessionsNote = ref('')
+const sessionsLoading = ref(false)
+/** 输入区左侧的"上下文指示"（可点掉）—— 用户要能一眼看出"它知道我在看什么" */
+const ctxChipDismissed = ref(false)
+const logEl = ref<HTMLElement | null>(null)
+const boxEl = ref<HTMLTextAreaElement | null>(null)
 const msgs = ref<Msg[]>([])
 const state = ref<'connecting' | 'open' | 'closed'>('connecting')
 const stateNote = ref('')
@@ -82,6 +184,34 @@ export interface RetrievalState {
  *    因为 chat/答疑会话的 `tools: []` → 工具调用退化成文本。后端**不过滤**（怕误伤正常文本）→
  *    前端兜底：折叠成可读提示，别把标记当 Markdown 渲染成乱码。
  */
+/** 工具名 → 人话（用户要看得懂"它在翻知识库"，不是看 `kb_search`） */
+function toolLabel(tool: string): string {
+  const m: Record<string, string> = {
+    kb_search: '检索知识库', kb_get: '读知识库原文',
+    read: '读文件', bash: '执行命令', edit: '改文件', write: '写文件',
+  }
+  return m[tool] || tool
+}
+
+/** 上下文 chip 文案（本地：我这一页在看什么；服务端 resolved 到达后由 context-used 显示权威标题） */
+const ctxLabel = computed(() => {
+  const d = String((pageContext.value as any).doc_id || '')
+  const u = String((pageContext.value as any).unit_id || '')
+  const s = String((pageContext.value as any).session_id || '')
+  const parts = [d ? `文档 ${d}` : '', u ? `章节 ${u}` : '', s ? `沙箱会话 ${s.slice(0, 16)}…` : ''].filter(Boolean)
+  return parts.join(' · ')
+})
+
+/** 时间显示（会话列表） */
+function fmtWhen(ts?: number): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const today = new Date()
+  const sameDay = d.toDateString() === today.toDateString()
+  const hh = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return sameDay ? `今天 ${hh}` : `${d.getMonth() + 1}/${d.getDate()} ${hh}`
+}
+
 const TOOL_MARKER = /<\uFF5C[^>]*\uFF5C[^>]*>|<\uFF5C[\s\S]{0,80}?\uFF5C>/g
 function foldToolMarkers(text: string): { text: string; folded: number } {
   let folded = 0
@@ -266,7 +396,8 @@ const modelReason = computed(() => caps.value?.reasonFor('llm') || 'LLM 能力�
  */
 const capsPending = computed(() => !caps.value && !capsError.value)
 /** 门控：只有 caps **已到达且确实不可用**时才禁用（探测中不禁用） */
-const gated = computed(() => !capsPending.value && (!piOk.value || !modelOk.value || !piModelStatus.value.modelAvailable))
+const gated = computed(() => !!sessionBlocked.value
+  || (!capsPending.value && (!piOk.value || !modelOk.value || !piModelStatus.value.modelAvailable)))
 const canSend = computed(() => !gated.value && state.value === 'open' && !busy.value && input.value.trim().length > 0)
 
 /**
@@ -329,6 +460,27 @@ function onEvent(e: ChatServerEvent) {
       restoredMessages.value = Number.isFinite((e as any).restoredMessages) ? Number((e as any).restoredMessages) : null
       resumeReason.value = String((e as any).resumeReason || '')
       restarted.value = (e as any).restarted === true
+      /**
+       * ★ 只在**真正的"新会话"**清空消息（pi-bridge：`ready` 有 5 个时点：
+       *   连接 / new_session / 切 mode / set_model / get_state）。
+       *   只有 `new_session` 会带 `restarted:true`；`get_state`（页面聚焦/重连复查）
+       *   与 `set_model` 的 ready **绝不能清空** —— 否则表现就是"聊了几轮，切一下后台回来只剩最新一条"（用户实测反馈）。
+       */
+      /**
+       * ★ `ready.reason`（pi-bridge 契约，替代"猜 restarted"）：
+       *   `connect` / `set_model` / `get_state` → **绝不清空**（`get_state` 是页面聚焦/重连复查，
+       *   清它就是用户看到的"聊了几轮只剩最新一条"）；`new_session` / `mode_change` → 清。
+       *   ⚠️ 无 `reason` 的旧后端 → 退回 `restarted === true` 判据（保持兼容）。
+       */
+      const reason = String((e as any).reason || '')
+      readyReason.value = reason
+      const shouldClear = reason
+        ? (reason === 'new_session' || reason === 'mode_change')
+        : (e as any).restarted === true
+      if (shouldClear && !props.embedded) {
+        msgs.value = []
+        modeSwitchNotice.value = ''
+      }
       // ★ kb 工具装不上（`tools_source='kb-unavailable'`）：用**后端给的原因原文**
       kbToolsWarning.value = String((e as any).kb_tools_warning || '')
       const w = String((e as any).tools_warning || '')
@@ -364,6 +516,41 @@ function onEvent(e: ChatServerEvent) {
             : '（本轮没有产出内容）' }
         }
       })
+      break
+    }
+    /**
+     * ★ 第 12 种帧 `history`（pi-bridge 2026-10-15）：连接建立且**会话从磁盘恢复**时，
+     *   紧跟 `ready` 发一帧 → **用它铺消息列表**（assistant 文本已是权威全文，不再拼接）。
+     *   内容安全：只含 user/assistant 的**文本块**（系统提示词已被出口自检剥离）。
+     *   `truncated: true` → 只保留最近部分，**如实标注**（别让人以为历史就这么短）。
+     */
+    case 'history': {
+      const list = Array.isArray((e as any).messages) ? (e as any).messages : []
+      historyTruncated.value = (e as any).truncated === true
+      historyCount.value = list.length
+      const restored = list
+        .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string')
+        .map((m: any) => ({
+          role: m.role as 'user' | 'assistant',
+          text: String(m.text),
+          thinking: '',
+          tools: [] as ToolCall[],
+          ts: Number(m.ts) || 0,
+        }))
+      /**
+       * ★ 不要覆盖**已经发生的**内容：
+       *   `history` 紧跟 `ready` 到达；若用户已经发了一轮（或本地已有消息），
+       *   直接 `msgs = history` 会把新内容抹掉（实测：富文本用例读到的是历史那条，断言全红）。
+       *   → 空列表时才用它铺；否则**只追加缺失的**（按 role+text 去重）。
+       */
+      if (!msgs.value.length) {
+        msgs.value = restored
+      } else {
+        const seen = new Set(msgs.value.map((m: Msg) => `${m.role}\u0000${m.text}`))
+        const add = restored.filter((m: Msg) => !seen.has(`${m.role}\u0000${m.text}`))
+        if (add.length) msgs.value = [...add, ...msgs.value]
+      }
+      void nextTick(scrollToBottom)
       break
     }
     case 'text_delta':
@@ -436,6 +623,19 @@ function onEvent(e: ChatServerEvent) {
       updateLast((m) => { m.error = { code, msg: [(e as any).msg, (e as any).detail].filter(Boolean).join(' —— ') } })
       // ③ 结束运行态（否则错误后按钮**一直停在"运行中"**，用户只能刷新）
       busy.value = false
+      /**
+       * ★ 会话归属校验失败（IDOR 修复后的 fail-closed）：
+       *   `E_FORBIDDEN` = "会话不存在**或**无权访问" —— 服务端**故意不区分**（安全要求），
+       *   前端也**不许**区分。引导用户重新开始（旧会话没有归属行 → 修好后一律失效）。
+       *   **不自动重连**（重连同一个 id 必然同样被拒）。
+       */
+      if (code === 'E_FORBIDDEN') {
+        canReconnect.value = false
+        sessionBlocked.value = `会话不可用（${(e as any).msg || '会话不存在或无权访问'}）`
+        stateNote.value = `会话不可用（${(e as any).msg || '会话不存在或无权访问'}）—— 旧会话在安全修复后需要重新开始`
+        sessionOriginNote.value = '这个会话连不上：修复前的旧会话没有归属记录，需要**新建会话**重新开始（这是有意的 fail-closed，不是网络问题）。'
+        return
+      }
       if (code === 'E_PI_UNAVAILABLE' || code === 'E_PI_EXIT') {
         stateNote.value = `连接异常：${code}${(e as any).msg ? ` —— ${(e as any).msg}` : ''}`
         canReconnect.value = false
@@ -466,6 +666,8 @@ function onEvent(e: ChatServerEvent) {
 
 function send() {
   if (!canSend.value) return
+  // ★ 记住"本会话的首条用户提问"（本地派生显示名用；**不写库**）
+  if (!msgs.value.some((m) => m.role === 'user')) rememberFirstQ(chatSessionId.value, input.value.trim())
   const text = input.value.trim()
   input.value = ''
   msgs.value = [...msgs.value, { role: 'user', text, thinking: '', tools: [] }]
@@ -509,9 +711,10 @@ function setMode(m: 'chat' | 'agent') {
 }
 
 /** 用当前模式重连（保留 chatSessionId；上下文按后端语义重新开始） */
-function reconnect() {
+function reconnect(clearMessages = true) {
   try { socket?.close() } catch { /* ignore */ }
-  msgs.value = []
+  if (clearMessages) msgs.value = []      // 切模式/切入口才清；断线重连保留
+  else msgs.value = [...msgs.value, { role: 'system', text: '连接已恢复（本地已保留前面的对话）', thinking: '', tools: [] }]
   retrieval.value = null
   roundTools.value = []
   contextResolved.value = {}
@@ -520,8 +723,127 @@ function reconnect() {
   startSocket()
 }
 
-function newSession() {
+/**
+ * 拉会话列表（**后端权威**）。404/未实现 → 如实显示"暂不可用"，**不在前端存第二套**（Lead 明确要求）。
+ */
+/**
+ * 登记会话（服务端 hint 的第一步）。**对 IDOR 方案 A/B 都成立**：
+ *   · 成功 → 用服务端签发的 id（方案 A 下这是唯一能连上的路径）
+ *   · 失败 → 如实显示原因 + 本地 id 兜底（当前行为；方案 A 下会连不上，但**用户能看到真因**）
+ */
+async function ensureSession(persistToUrl = true) {
+  // ★ 已经有会话 id（URL 或本地带来的）→ **绝不新建**（这正是"切走再回来变新会话"的根因）
+  if (chatSessionId.value) {
+    sessionOrigin.value = chatSessionId.value.startsWith('cnv_') ? 'server' : 'local'
+    sessionOriginNote.value = ''
+    return
+  }
+  try {
+    const c = await api.createConversation({ title: '新问答' })
+    chatSessionId.value = c.id
+    sessionOrigin.value = 'server'
+    sessionOriginNote.value = ''
+    persistSessionId(c.id, persistToUrl)   // ★ 写回 URL + 本地（重挂载/刷新都靠它）
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    sessionOrigin.value = 'local'
+    sessionOriginNote.value = (err.status === 404 || err.code === 'E_NOTFOUND')
+      ? '后端没有会话登记接口（POST /conversations）→ 暂用本地 id；若后端要求"先登记再连接"，这个会话将连不上'
+      : `会话登记失败（${err.message || e}）→ 暂用本地 id`
+    /**
+     * ★ Lead 判据：**登记失败 → 输入区禁用 + 可读提示**，不要"先给一个注定失败的会话"。
+     *   （我第一版只在收到 `E_FORBIDDEN`/1008 后才禁用 —— 后端若没有闸门就永远等不到那一刻，
+     *    用户会先白走一步。）
+     */
+    sessionBlocked.value = `会话登记失败：${sessionOriginNote.value}`
+    // 兜底也用 URL 持久化（同一个 id 至少能被复用；后端有闸门时它会如实拒绝）
+    if (chatSessionId.value) persistSessionId(chatSessionId.value)
+  }
+}
+
+/** 重试登记（登记成功后清掉 blocked 并重连） */
+async function retrySession() {
+  sessionBlocked.value = ''
+  canReconnect.value = true
+  await ensureSession()
+  if (sessionOrigin.value === 'server') {
+    startSocket()
+    void loadSessions()
+  } else {
+    sessionBlocked.value = '仍然登记失败：' + (sessionOriginNote.value || '后端 /conversations 不可用')
+  }
+}
+
+async function loadSessions() {
+  sessionsLoading.value = true
+  try {
+    // ★ 真实接口是 `GET /conversations`（Lead 实测：`/chat/sessions` 不存在 → 404）→ **它优先**
+    let list: Array<{ id: string; title?: string; updated_at?: number; message_count?: number }> = []
+    try {
+      const r = await api.conversations()
+      list = r.sessions
+    } catch (e) {
+      const err = e as { status?: number; code?: string }
+      if (err.status === 404 || err.code === 'E_NOTFOUND') {
+        const r2 = await api.chatSessions()   // 将来若加了别名也能用
+        list = r2.sessions || []
+      } else throw e
+    }
+    sessions.value = list
+    sessionsNote.value = sessions.value.length ? '' : '还没有历史会话（问一轮就会出现在这里）'
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    sessionsNote.value = (err.status === 404 || err.code === 'E_NOTFOUND')
+      ? '会话列表暂不可用（后端接口尚未实现）—— 不做本地假历史，免得你换设备后对不上'
+      : `会话列表读取失败：${err.message || e}`
+    sessions.value = []
+  } finally {
+    sessionsLoading.value = false
+  }
+}
+
+/** 切会话 = 用新 sessionId 重连（pi-bridge：会话 id 是连接级的；切会话后历史内容看不到，只有计数） */
+function switchSession(id: string) {
+  if (id === chatSessionId.value) return
+  chatSessionId.value = id
+  persistSessionId(id, !props.embedded)
+  msgs.value = []
+  retrieval.value = null
+  roundTools.value = []
+  contextResolved.value = {}
+  contextDropped.value = []
+  state.value = 'connecting'
+  startSocket()
+  void loadSessions()
+}
+
+/** 消息变化 / 流式中 → 自动滚到底（用户："可滚动，新消息自动滚到底"） */
+function scrollToBottom() {
+  const el = logEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+/** 输入框随内容自增高（不是"光秃秃的固定三行"） */
+function autoGrow() {
+  const el = boxEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+}
+
+async function newSession() {
+  // ★ 新建 = **再登记一个会话**（服务端签发新 id）→ 切过去（不是本地随便造一个 id）
   socket?.newSession()
+  try {
+    const c = await api.createConversation({ title: '新问答' })
+    sessionOrigin.value = 'server'
+    sessionOriginNote.value = ''
+    switchSession(c.id)      // switchSession 内部会写 URL
+    return
+  } catch (e) {
+    sessionOrigin.value = 'local'
+    sessionOriginNote.value = `新建会话时登记失败（${(e as Error).message}）→ 已本地新建`
+  }
   msgs.value = []
   modeSwitchNotice.value = ''
   msgs.value.push({ role: 'system', text: '已请求新建会话', thinking: '', tools: [] })
@@ -532,7 +854,12 @@ onMounted(async () => {
   if (props.embedded) {
     const { reload } = useCaps()
     void reload()
-    startSocket()
+    /**
+     * ★ 抽屉（小助手）**也要登记会话**：方案 A 下服务端只接受已登记且属于你的 id，
+     *   否则小助手在真后端上根本连不上（只在 mock 里看起来正常）。
+     *   但**不写 URL**（抽屉不该改页面 URL）。
+     */
+    void (async () => { await ensureSession(false); startSocket() })()
     return
   }
   testBarrier()
@@ -548,15 +875,28 @@ onMounted(async () => {
   const { reload } = useCaps()
   void reload()                       // 后台预热（命中 15s 缓存后后续毫秒级）
   startSocket()
+  // ★ 会话列表走**后端权威**（Lead：别在前端存第二套真相源）；后端未实现时如实显示"暂不可用"
+  if (!props.embedded) {
+    /**
+     * ★ 顺序很重要：**先登记拿服务端 id → 再建唯一一条连接**。
+     * ⚠️ 原写法在 onMounted 里先 `startSocket()`，登记完又补一次 → **两条连接**，
+     *    第二轮帧发给被丢弃的旧 socket（表现为"回答不完整"，实测踩到）。
+     */
+    void (async () => {
+      await ensureSession()
+      startSocket()
+      void loadSessions()
+    })()
+  }
   writeReport('chat-report', {
-    ok: true, gated: false, caps_pending: capsPending.value, session: sessionId, url: socket?.url || '',
+    ok: true, gated: false, caps_pending: capsPending.value, session: chatSessionId.value, url: socket?.url || '',
     mode: chatMode.value, pi_available: piOk.value, model_available: modelOk.value,
   })
   // caps 到达后**重写报告**（连 WS 不等 caps，但报告必须反映"能力到达后的真值"）
   watch(caps, () => {
     if (!socket) return
     writeReport('chat-report', {
-      ok: true, gated: gated.value, caps_pending: capsPending.value, session: sessionId, url: socket?.url || '', mode: chatMode.value,
+      ok: true, gated: gated.value, caps_pending: capsPending.value, session: chatSessionId.value, url: socket?.url || '', mode: chatMode.value,
       pi_available: piOk.value, model_available: modelOk.value,
       pi_reason: piReason.value, model_reason: modelReason.value || piModelNote.value,
     })
@@ -567,10 +907,18 @@ onMounted(async () => {
 
 /** 建连（模式走 URL 查询参数） */
 function startSocket() {
-  socket = new ChatSocket(sessionId, undefined, chatMode.value, props.assistant)
+  socket = new ChatSocket(chatSessionId.value, undefined, chatMode.value, props.assistant)
   socket.onState((s, info) => {
     state.value = s
     if (info) stateNote.value = info
+    /**
+     * ★ 连上就把**上一次的**关闭提示清掉 —— 否则"连接关闭（code=1008…）"会一直挂在页面上，
+     *   让用户以为**当前**连接有问题（实测：用服务端签发的 id 连上后，仍显示上一次的 1008）。
+     */
+    if (s === 'open') {
+      closeCode.value = 0
+      if (/连接关闭|断线/.test(stateNote.value)) stateNote.value = ''
+    }
     if (s === 'closed') onClosed()
   })
   socket.on('*', onEvent)
@@ -585,6 +933,12 @@ function startSocket() {
 function onClosed() {
   const code = socket?.lastCloseCode || 0
   closeCode.value = code
+  // 登记失败 + 1008 关闭 → 后端要求"先登记"，本地兜底 id 必然连不上 → 明确禁用（别让用户白试）
+  if (code === 1008 && sessionOrigin.value === 'local') {
+    sessionBlocked.value = '会话登记失败，而后端要求"先登记再连接" → 当前无法对话。请检查后端 /conversations 接口是否可用，然后点「新建会话」重试。'
+    canReconnect.value = false
+    return
+  }
   if (code === 1013) {
     canReconnect.value = false
     stateNote.value = 'pi 不可用（后端主动关闭 1013）—— 不自动重连；请先看能力横幅里的原因'
@@ -603,8 +957,15 @@ function onClosed() {
   reconnectCount.value++
   const delay = Math.min(500 * 2 ** (reconnectCount.value - 1), 8000)
   stateNote.value = `断线，${delay}ms 后第 ${reconnectCount.value}/6 次重连…`
-  setTimeout(() => { if (canReconnect.value) reconnect() }, delay)
+  // ⚠️ 断线自动重连**不清空消息**（第一版调用 reconnect() 会清 —— 用户看到"只剩最新一条"的另一个来源）
+  setTimeout(() => { if (canReconnect.value) reconnect(false) }, delay)
 }
+
+// ★ 消息变化 / 流式中 → 自动滚到底（用户："新消息自动滚到底"）
+watch(msgs, () => { void nextTick(scrollToBottom) }, { deep: true })
+watch(busy, (b) => { if (b) void nextTick(scrollToBottom) })
+// 输入框自增高
+watch(input, () => { void nextTick(autoGrow) })
 
 onBeforeUnmount(() => socket?.close())
 
@@ -683,239 +1044,307 @@ void _esc
 </script>
 
 <template>
-  <div class="chat-layout">
-    <div class="panel chat-head">
-      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
-        <b>{{ props.title }}</b>
-        <span class="pill" :class="state === 'open' ? 'ok' : 'bad'" data-testid="ws-state">{{ state }}</span>
-        <span v-if="model" class="pill blue">{{ model }}</span>
-        <!-- ★ 助手入口（backend-api 接线）：video = 视频助手提示词（含渲染契约）；可核验 -->
-        <span class="pill" :class="props.assistant === 'video' ? 'orange' : ''" data-testid="assistant-entry"
-              :data-entry="props.assistant">{{ props.assistant === 'video' ? '视频助手提示词' : '通用助手提示词' }}</span>
-        <span v-if="stateNote" class="small faint" data-testid="ws-note">{{ stateNote }}</span>
-        <span v-if="closeCode" class="small faint mono" data-testid="ws-close-code">code={{ closeCode }}</span>
-        <span class="small" :class="toolsSource === 'dangerous-opt-in' ? 'tools-danger' : 'faint'"
-              data-testid="session-tools" :data-tools="sessionTools.join(',')" :data-source="toolsSource">
-          工具：{{ sessionTools.length ? sessionTools.join(', ') : '无' }}
-          <span v-if="toolsSource">（{{ toolsSourceLabel }}）</span>
-        </span>
-        <!-- ★ dangerous-opt-in = 异常状态，用最刺眼的样式（不是"管理员正常状态"） -->
-        <span v-if="toolsSource === 'dangerous-opt-in'" class="pill bad" data-testid="tools-danger">
-          ⚠️ 本会话已开启主机工具（{{ sessionTools.join(', ') || '见 tools' }}）
-        </span>
+  <div class="chat-layout" :class="{ embedded: props.embedded }">
+    <!-- ═══ 左：会话列表（**平铺**，不做工作区分组 —— 用户："学生只有一个基本的问答"） ═══ -->
+    <aside class="chat-side" data-testid="session-list" :data-count="sessions.length">
+      <div class="side-head">
+        <b>问答</b>
         <span class="right" />
-        <button type="button" data-testid="chat-newsession" @click="newSession">新会话</button>
+        <button type="button" class="small" data-testid="chat-newsession" @click="newSession">新会话</button>
       </div>
+      <div v-if="sessionsLoading" class="small faint side-note">读取会话列表…</div>
+      <div v-else-if="sessionsNote" class="small faint side-note" data-testid="session-list-unavailable">{{ sessionsNote }}</div>
+      <ul class="side-list">
+        <li v-for="s in sessions" :key="s.id">
+          <button type="button" class="side-item" :class="{ on: s.id === chatSessionId }"
+                  data-testid="session-item" :data-id="s.id" @click="switchSession(s.id)">
+            <span class="t" data-testid="session-title" :data-title-source="sessionLabelSource(s)"
+                  :data-api-title="s.title || ''">{{ sessionLabel(s) }}</span>
+            <span class="small faint">
+              {{ fmtWhen(s.updated_at) }}<template v-if="s.message_count"> · {{ s.message_count }} 条</template>
+            </span>
+          </button>
+        </li>
+      </ul>
+      <div class="small faint mono side-note" data-testid="current-session">当前：{{ chatSessionId.slice(0, 20) }}…</div>
+      <!-- ★ 会话登记来源：服务端签发 / 本地兜底（失败时**如实说原因**，不假装登记成功） -->
+      <div class="small faint side-note" data-testid="session-origin" :data-origin="sessionOrigin"
+           :title="sessionOriginNote">{{ sessionOrigin === 'server' ? '会话由服务端登记' : sessionOrigin === 'local' ? '会话为本地 id（见提示）' : '登记中…' }}</div>
+      <div v-if="sessionOriginNote" class="note warn side-note" data-testid="session-origin-note">{{ sessionOriginNote }}</div>
+    </aside>
 
-      <!-- ★ 两个**正交**控件（Lead 要求别混成一个下拉）：
-           ① 模式：能不能读原文（chat 只用摘要 / agent 可调 kb_search+kb_get）
-           ② 检索：查不查、怎么查（none/wiki/kg/rag） -->
-      <div class="mode-row" data-testid="mode-row">
-        <div class="seg" data-testid="mode-select" :data-mode="chatMode">
-          <button type="button" :class="{ on: chatMode === 'chat' }" data-testid="mode-chat" @click="setMode('chat')">chat</button>
-          <button type="button" :class="{ on: chatMode === 'agent' }" data-testid="mode-agent"
-                  :disabled="!agentAllowed" :title="agentAllowed ? '' : agentBlockReason"
-                  @click="setMode('agent')">agent</button>
+    <!-- ═══ 中：消息流 + 输入区 ═══ -->
+    <section class="chat-main">
+      <div class="panel chat-head">
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
+          <b>{{ props.title }}</b>
+          <span class="pill" :class="state === 'open' ? 'ok' : 'bad'" data-testid="ws-state">{{ state }}</span>
+          <span v-if="model" class="pill blue">{{ model }}</span>
+          <span class="pill" :class="props.assistant === 'video' ? 'orange' : ''" data-testid="assistant-entry"
+                :data-entry="props.assistant">{{ props.assistant === 'video' ? '视频助手提示词' : '通用助手提示词' }}</span>
+          <span v-if="stateNote" class="small faint" data-testid="ws-note">{{ stateNote }}</span>
+          <span v-if="closeCode" class="small faint mono" data-testid="ws-close-code">code={{ closeCode }}</span>
+          <span class="small" :class="toolsSource === 'dangerous-opt-in' ? 'tools-danger' : 'faint'"
+                data-testid="session-tools" :data-tools="sessionTools.join(',')" :data-source="toolsSource">
+            工具：{{ sessionTools.length ? sessionTools.join(', ') : '无' }}
+            <span v-if="toolsSource">（{{ toolsSourceLabel }}）</span>
+          </span>
+          <span v-if="toolsSource === 'dangerous-opt-in'" class="pill bad" data-testid="tools-danger">
+            ⚠️ 本会话已开启主机工具（{{ sessionTools.join(', ') || '见 tools' }}）
+          </span>
+          <span class="right" />
+          <button type="button" class="small" data-testid="mode-reset" title="重连（保留会话 id）" @click="reconnect(false)">重连</button>
         </div>
-        <span class="small faint" data-testid="mode-explain">
-          chat：快，只用检索摘要 ｜ agent：能翻知识库原文（kb_search/kb_get），慢一些
-        </span>
-        <label class="small" data-testid="retrieval-select-label">检索
-          <select v-model="retrievalChoice" data-testid="retrieval-select">
-            <option value="none">none（不检索）</option>
-            <option value="wiki">wiki（词法/bigram）</option>
-            <option value="kg">kg（图谱遍历）</option>
-            <option value="rag">rag（向量）</option>
-          </select>
-        </label>
-        <!-- 后端实际给的模式（不信自己选的） -->
-        <span class="pill" :class="backendMode === chatMode ? 'ok' : 'warn'" data-testid="backend-mode"
-              :data-backend-mode="backendMode">
-          后端：{{ backendMode || '未上报' }}
-        </span>
-      </div>
-      <div v-if="modeNote" class="note warn" style="margin-top: 6px" data-testid="mode-note">{{ modeNote }}</div>
-      <!-- ★ 持久提示：重连后仍解释"对话为什么清空了" -->
-      <div v-if="modeSwitchNotice" class="small faint" style="margin-top: 4px" data-testid="mode-switch-notice">
-        {{ modeSwitchNotice }}
-      </div>
-      <!-- ★ pi-bridge 新字段：模型来源回落 / 会话恢复 / 自动重启 / kb 工具装不上 —— 都如实说 -->
-      <div v-if="modelWarning || (modelSource && modelSource !== 'explicit')" class="small faint" style="margin-top: 4px"
-           data-testid="model-source" :data-model-source="modelSource">
-        模型来源：{{ modelSource || '未上报' }}{{ modelWarning ? ` —— ${modelWarning}` : '' }}
-      </div>
-      <div v-if="resumed === false" class="small faint" style="margin-top: 4px" data-testid="resume-note">
-        本会话**没有恢复历史**（resumed=false{{ resumeReason ? ` · ${resumeReason}` : '' }}）—— 刷新后对话会重新开始。
-      </div>
-      <div v-else-if="resumed === true" class="small faint" style="margin-top: 4px" data-testid="resume-note">
-        已恢复历史消息 {{ restoredMessages ?? '?' }} 条。
-      </div>
-      <div v-if="restarted" class="note warn" style="margin-top: 4px" data-testid="restarted">
-        pi 进程曾自动重启 —— 连接已恢复，但**上一轮可能被截断**。
-      </div>
-      <div v-if="kbToolsWarning" class="note warn" style="margin-top: 4px" data-testid="kb-tools-warning">
-        知识库工具不可用：{{ kbToolsWarning }}
-      </div>
-      <!-- ④ 诚实降级：本轮**不落盘** → 刷新就没了（事前说清，别等学生发现对话丢了） -->
-      <div v-if="persistence && persistence !== 'native'" class="small faint" style="margin-top: 4px"
-           data-testid="persistence-note" :data-persistence="persistence">
-        本轮对话**不落盘**（persistence={{ persistence }}{{ persistenceReason ? ` · ${persistenceReason}` : '' }}）—— 刷新页面后这段对话不会保留。
-      </div>
-      <div v-if="!agentAllowed" class="small faint" style="margin-top: 4px" data-testid="agent-blocked">{{ agentBlockReason }}</div>
-      <!-- ★ 知识库为空：agent 必然 0 命中 → 如实提示"先上传并抽取"，别让它看起来像检索坏了 -->
-      <div v-if="kbEmpty" class="note warn" style="margin-top: 6px" data-testid="kb-empty">
-        <b>知识库为空</b>：{{ kbEmptyHint }}
-      </div>
 
-      <!-- ★ 正在参考什么（服务端解析出的**真实标题**，不是客户端传来的 id） -->
-      <div v-if="contextResolved.doc_title || contextResolved.unit_title || contextDropped.length"
-           class="small ctx-bar" data-testid="context-used"
-           :data-doc="contextResolved.doc_title || ''" :data-unit="contextResolved.unit_title || ''">
-        <b>服务端声明参考：</b>
-        <span>{{ contextResolved.doc_title || '（未解析到文档）' }}</span>
-        <span v-if="contextResolved.unit_title"> › {{ contextResolved.unit_title }}</span>
-        <!-- ★ 自述字段必须有证据（坑 21）：有检索/工具证据才算"真的用上了" -->
-        <span v-if="contextEvidence.has" class="pill ok" data-testid="context-evidence">
-          有证据：检索命中 {{ contextEvidence.hits }} 条{{ contextEvidence.kbTools ? ` / kb 工具 ${contextEvidence.kbTools} 次` : '' }}
-        </span>
-        <span v-else class="pill warn" data-testid="context-unverified">
-          未验证：本轮没有检索/工具证据（声明与实际可能不一致，以回答为准）
-        </span>
-        <span v-if="contextDropped.length" class="bad-text" data-testid="context-dropped">
-          ｜已忽略：{{ contextDropped.map((d) => `${d.field}（${d.reason || '未找到或无权访问'}）`).join('、') }}
-        </span>
+        <div v-if="modeNote" class="note warn" style="margin-top: 6px" data-testid="mode-note">{{ modeNote }}</div>
+        <div v-if="modeSwitchNotice" class="small faint" style="margin-top: 4px" data-testid="mode-switch-notice">
+          {{ modeSwitchNotice }}
+        </div>
+        <div v-if="modelWarning || (modelSource && modelSource !== 'explicit')" class="small faint" style="margin-top: 4px"
+             data-testid="model-source" :data-model-source="modelSource">
+          模型来源：{{ modelSource || '未上报' }}{{ modelWarning ? ` —— ${modelWarning}` : '' }}
+        </div>
+        <div v-if="historyCount" class="small faint" style="margin-top: 4px" data-testid="history-note"
+             :data-history-count="historyCount" :data-truncated="historyTruncated ? '1' : '0'">
+          已从服务端恢复 {{ historyCount }} 条历史消息{{ historyTruncated ? '（**只保留最近部分**，更早的已截断）' : '' }}。
+        </div>
+        <div v-if="resumed === false" class="small faint" style="margin-top: 4px" data-testid="resume-note">
+          本会话**没有恢复历史**（resumed=false{{ resumeReason ? ` · ${resumeReason}` : '' }}）—— 刷新后对话会重新开始。
+        </div>
+        <div v-else-if="resumed === true" class="small faint" style="margin-top: 4px" data-testid="resume-note">
+          已恢复历史消息 {{ restoredMessages ?? '?' }} 条（**内容不在本会话里** —— 只有计数，前端不编造）。
+        </div>
+        <div v-if="restarted" class="note warn" style="margin-top: 4px" data-testid="restarted">
+          pi 进程曾自动重启 —— 连接已恢复，但**上一轮可能被截断**。
+        </div>
+        <div v-if="kbToolsWarning" class="note warn" style="margin-top: 4px" data-testid="kb-tools-warning">
+          知识库工具不可用：{{ kbToolsWarning }}
+        </div>
+        <div v-if="persistence && persistence !== 'native'" class="small faint" style="margin-top: 4px"
+             data-testid="persistence-note" :data-persistence="persistence">
+          本轮对话**不落盘**（persistence={{ persistence }}{{ persistenceReason ? ` · ${persistenceReason}` : '' }}）—— 刷新页面后这段对话不会保留。
+        </div>
+        <div v-if="!agentAllowed" class="small faint" style="margin-top: 4px" data-testid="agent-blocked">{{ agentBlockReason }}</div>
+        <div v-if="kbEmpty" class="note warn" style="margin-top: 6px" data-testid="kb-empty">
+          <b>知识库为空</b>：{{ kbEmptyHint }}
+        </div>
+
+        <!-- ★ 上下文条：服务端解析出的**真实标题**；没有就说"未使用页面上下文"（不假装 —— 坑 21） -->
+        <div v-if="contextResolved.doc_title || contextResolved.unit_title || contextDropped.length"
+             class="small ctx-bar" data-testid="context-used"
+             :data-doc="contextResolved.doc_title || ''" :data-unit="contextResolved.unit_title || ''">
+          <b>服务端声明参考：</b>
+          <span>{{ contextResolved.doc_title || '（未解析到文档）' }}</span>
+          <span v-if="contextResolved.unit_title"> › {{ contextResolved.unit_title }}</span>
+          <span v-if="contextEvidence.has" class="pill ok" data-testid="context-evidence">
+            有证据：检索命中 {{ contextEvidence.hits }} 条{{ contextEvidence.kbTools ? ` / kb 工具 ${contextEvidence.kbTools} 次` : '' }}
+          </span>
+          <span v-else class="pill warn" data-testid="context-unverified">
+            未验证：本轮没有检索/工具证据（声明与实际可能不一致，以回答为准）
+          </span>
+          <span v-if="contextDropped.length" class="bad-text" data-testid="context-dropped">
+            ｜已忽略：{{ contextDropped.map((d) => `${d.field}（${d.reason || '未找到或无权访问'}）`).join('、') }}
+          </span>
+        </div>
+        <div v-else class="small faint" style="margin-top: 6px" data-testid="context-none">
+          未使用页面上下文（本页没有可带的文档/章节/沙箱会话）
+        </div>
+
+        <div v-if="toolsWarning" class="note bad" style="margin-top: 8px" data-testid="tools-warning">
+          <b>⚠️ 本会话已开启主机工具</b>：{{ toolsWarning }}
+          <div class="small" style="margin-top: 4px">这意味着会话可能拿到 pi 的默认工具集（含命令执行）—— 请让后端确认策略，前端不自行拦截。</div>
+        </div>
+        <!-- ★ 会话不可用：禁用输入 + 明确出路（不重连、不假装能用） -->
+      <div v-if="sessionBlocked" class="note bad" style="margin-top: 8px" data-testid="session-blocked">
+        <b>无法对话</b>：{{ sessionBlocked }}
+        <div class="small" style="margin-top: 4px">
+          这不是网络问题 —— 安全修复后，会话必须由服务端登记（`POST /conversations`）。
+        </div>
+        <div class="row" style="margin-top: 6px">
+          <button type="button" class="small" data-testid="session-retry" @click="retrySession()">重试登记</button>
+          <button type="button" class="small" data-testid="session-new" @click="newSession()">新建会话</button>
+        </div>
       </div>
-      <!-- ★ 工具回落警告：非 null 表示会话工具回落到 pi 默认全集（**能执行命令**） -->
-      <div v-if="toolsWarning" class="note bad" style="margin-top: 8px" data-testid="tools-warning">
-        <b>⚠️ 本会话已开启主机工具</b>：{{ toolsWarning }}
-        <div class="small" style="margin-top: 4px">这意味着会话可能拿到 pi 的默认工具集（含命令执行）—— 请让后端确认策略，前端不自行拦截。</div>
-      </div>
-      <!-- 探测中：如实说"还在探测"，但**允许先试**（不阻塞可用功能） -->
       <div v-if="capsPending" class="note warn" style="margin-top: 8px" data-testid="caps-pending">
-        <b>能力探测中（真探测较慢）</b>：现在就可以发消息 —— 若后端确实不可用，会在这一轮如实报错；
-        检索模式徽标来自后端帧，不依赖能力接口。
-      </div>
-      <div v-else-if="!piOk || !modelOk || !piModelStatus.modelAvailable" class="note bad" style="margin-top: 8px" data-testid="chat-gate">
-        <b>对话入口已禁用</b>
-        <ul style="margin: 4px 0 0; padding-left: 18px">
-          <li v-if="!piOk">pi 不可用：{{ piReason }}</li>
-          <li v-if="!modelOk">模型不可用：{{ modelReason }}</li>
-        </ul>
-        <div class="small" style="margin-top: 4px">按 PROVIDERS §7：能力不可用时禁用入口并显示原因，不允许点了才报错。</div>
-      </div>
-
-      <!-- ★ 检索模式徽标：本次用了哪种检索 / 命中几条 / 耗时；none 与"查了没命中"必须一眼可分 -->
-      <div
-        v-if="retrieval"
-        class="retr-bar"
-        data-testid="retrieval-badge"
-        :data-mode="retrieval.mode"
-        :data-status="retrieval.status"
-        :data-searched="retrieval.status !== 'none' && retrieval.available ? '1' : '0'"
-        :data-available="retrieval.available ? '1' : '0'"
-        :data-hits="retrieval.hits"
-      >
-        <span class="retr-badge" :data-status="retrieval.status">{{ retrievalLabel }}</span>
-        <span v-if="retrievalTime" class="small faint">耗时 {{ retrievalTime }}</span>
-        <span v-if="(retrieval.status === 'unavailable' || retrieval.status === 'error') && retrieval.reason"
-              class="small" data-testid="retrieval-reason">原因：{{ retrieval.reason }}</span>
-        <span v-else-if="retrieval.status === 'none'" class="small faint" data-testid="retrieval-none-note">
-          （没查知识库 → 与「查了但没命中」不是一回事）
-        </span>
-        <span v-else-if="retrieval.status === 'empty'" class="small" data-testid="retrieval-empty-note">
-          （查了、可用，但没命中 → 不是「没查库」）
-        </span>
-        <!-- 同轮工具调用：wiki 那次真的去查了 sqlite —— 不显示用户就不知道它做了额外工作 -->
-        <span v-for="t in roundTools" :key="t.id" class="pill" :class="{ ok: t.done && t.ok !== false, bad: t.done && t.ok === false }"
-              data-testid="retrieval-tool" :data-tool="t.tool">
-          tool: {{ t.tool }}{{ t.done ? (t.ok === false ? ' ✗' : ' ✓') : ' …' }}
-        </span>
-        <button v-if="retrieval.why.length || retrieval.sources.length" type="button" class="small"
-                data-testid="retrieval-why-toggle" @click="whyOpen = !whyOpen">
-          {{ whyOpen ? '收起依据 ▾' : `看依据（${retrieval.sources.length || retrieval.why.length}） ▸` }}
-        </button>
-        <div v-if="whyOpen" class="retr-why" data-testid="retrieval-why">
-          <div v-for="(w, i) in retrieval.why" :key="`w${i}`" class="small" data-testid="retrieval-why-line">· {{ w }}</div>
-          <div v-for="(s, i) in retrieval.sources" :key="`s${i}`" class="retr-item">
-            <span class="pill" :class="{ blue: s.kind === 'card' }">{{ s.kind || 'unit' }}</span>
-            <b>{{ s.title || s.ref_id }}</b>
-            <span v-if="s.score != null" class="faint mono tiny">score {{ s.score }}</span>
-            <span v-if="s.ref_id" class="faint mono tiny">{{ s.ref_id }}</span>
-          </div>
-          <div v-if="!retrieval.sources.length" class="small faint">（后端只给了 why，没给 sources —— 正文不下发是设计如此）</div>
+          <b>能力探测中（真探测较慢）</b>：现在就可以发消息 —— 若后端确实不可用，会在这一轮如实报错。
         </div>
-      </div>
-    </div>
+        <div v-else-if="!piOk || !modelOk || !piModelStatus.modelAvailable" class="note bad" style="margin-top: 8px" data-testid="chat-gate">
+          <b>对话入口已禁用</b>
+          <ul style="margin: 4px 0 0; padding-left: 18px">
+            <li v-if="!piOk">pi 不可用：{{ piReason }}</li>
+            <li v-if="!modelOk">模型不可用：{{ modelReason }}</li>
+          </ul>
+          <div class="small" style="margin-top: 4px">按 PROVIDERS §7：能力不可用时禁用入口并显示原因，不允许点了才报错。</div>
+        </div>
 
-    <div class="chat-log panel" data-testid="chat-log">
-      <div v-for="(m, i) in msgs" :key="i" class="msg" :class="m.role">
-        <div class="role">{{ m.role === 'user' ? '我' : m.role === 'assistant' ? 'pi' : '系统' }}</div>
-        <div class="body">
-          <div v-if="m.thinking" class="thinking small faint" data-testid="thinking">
-            <details><summary>思考过程</summary><pre>{{ m.thinking }}</pre></details>
-          </div>
-          <div v-for="t in m.tools" :key="t.id" class="tool" :data-tool="t.tool" data-testid="tool-call">
-            <span class="tool-name">{{ t.tool }}</span>
-            <span class="faint tiny mono">{{ JSON.stringify(t.args || {}).slice(0, 120) }}</span>
-            <span v-if="!t.done" class="pill">运行中…</span>
-            <span v-else class="pill" :class="t.ok ? 'ok' : 'bad'">{{ t.ok ? '成功' : '失败' }} {{ t.duration_ms ?? '—' }}ms</span>
-            <div v-if="t.partial" class="evidence">{{ t.partial.slice(0, 160) }}</div>
-          </div>
-          <!-- ★ 富文本：公式（KaTeX）/ 代码块（语言 + 复制 + 未闭合容错）/ 普通文本（已转义）
-               ⚠️ 外层 div 才带 `assistant-text`：直接把同名 testid 传给组件会**覆盖组件内部的
-               `rich-text` testid**（Vue 属性透传会合并/覆盖根元素属性）→ e2e 就找不到 rich-text 了。 -->
-          <div v-if="m.text" class="text" :data-testid="m.role === 'assistant' ? 'assistant-text' : ''">
-            <RichText :text="foldToolMarkers(m.text).text" :stats="queryFlag('selftest')" />
-          </div>
-          <!-- ⚠️ 模型把原始 tool 标记写进正文（pi-bridge 实测：tools:[] 时工具调用退化成文本）→ 折叠并如实告知 -->
-          <div v-if="m.role === 'assistant' && foldToolMarkers(m.text).folded > 0" class="small faint"
-               data-testid="tool-marker-folded" :data-count="foldToolMarkers(m.text).folded">
-            （已折叠 {{ foldToolMarkers(m.text).folded }} 处模型输出的原始工具调用标记 —— 本轮会话未启用工具，后端未过滤，前端按原样告知）
-          </div>
-          <div v-if="m.error" class="note bad" :data-error-code="m.error.code" data-testid="chat-error">
-            <b>错误</b> <span class="mono">{{ m.error.code }}</span>：{{ m.error.msg }}
+        <!-- ★ 检索模式徽标（本轮用了哪种检索 / 命中几条 / 耗时） -->
+        <div v-if="retrieval" class="retr-bar" data-testid="retrieval-badge"
+             :data-mode="retrieval.mode" :data-status="retrieval.status"
+             :data-searched="retrieval.status !== 'none' && retrieval.available ? '1' : '0'"
+             :data-available="retrieval.available ? '1' : '0'" :data-hits="retrieval.hits">
+          <span class="retr-badge" :data-status="retrieval.status">{{ retrievalLabel }}</span>
+          <span v-if="retrievalTime" class="small faint">耗时 {{ retrievalTime }}</span>
+          <span v-if="(retrieval.status === 'unavailable' || retrieval.status === 'error') && retrieval.reason"
+                class="small" data-testid="retrieval-reason">原因：{{ retrieval.reason }}</span>
+          <span v-else-if="retrieval.status === 'none'" class="small faint" data-testid="retrieval-none-note">
+            （没查知识库 → 与「查了但没命中」不是一回事）
+          </span>
+          <span v-else-if="retrieval.status === 'empty'" class="small" data-testid="retrieval-empty-note">
+            （查了、可用，但没命中 → 不是「没查库」）
+          </span>
+          <span v-for="t in roundTools" :key="t.id" class="pill"
+                :class="{ ok: t.done && t.ok !== false, bad: t.done && t.ok === false }"
+                data-testid="retrieval-tool" :data-tool="t.tool">
+            {{ toolLabel(t.tool) }}{{ t.done ? (t.ok === false ? ' ✗' : ' ✓') : ' …' }}
+          </span>
+          <button v-if="retrieval.why.length || retrieval.sources.length" type="button" class="small"
+                  data-testid="retrieval-why-toggle" @click="whyOpen = !whyOpen">
+            {{ whyOpen ? '收起依据 ▾' : `看依据（${retrieval.sources.length || retrieval.why.length}） ▸` }}
+          </button>
+          <div v-if="whyOpen" class="retr-why" data-testid="retrieval-why">
+            <div v-for="(w, i) in retrieval.why" :key="`w${i}`" class="small" data-testid="retrieval-why-line">· {{ w }}</div>
+            <div v-for="(s, i) in retrieval.sources" :key="`s${i}`" class="retr-item">
+              <span class="pill" :class="{ blue: s.kind === 'card' }">{{ s.kind || 'unit' }}</span>
+              <b>{{ s.title || s.ref_id }}</b>
+              <span v-if="s.score != null" class="faint mono tiny">score {{ s.score }}</span>
+              <span v-if="s.ref_id" class="faint mono tiny">{{ s.ref_id }}</span>
+            </div>
+            <div v-if="!retrieval.sources.length" class="small faint">（后端只给了 why，没给 sources —— 正文不下发是设计如此）</div>
           </div>
         </div>
       </div>
-      <div v-if="!msgs.length" class="faint small">还没有对话。问点什么，比如"聚簇索引和二级索引的区别"。</div>
-    </div>
 
-    <div class="chat-input panel">
-      <textarea
-        ref="box"
-        v-model="input"
-        data-testid="chat-input"
-        :disabled="gated"
-        rows="3"
-        placeholder="问知识点 / 让 pi 读某节原文（Enter 发送，Shift+Enter 换行）"
-        @keydown.enter.exact.prevent="send"
-      />
-      <div class="row">
-        <button type="button" class="primary" data-testid="chat-send" :disabled="!canSend" @click="send">发送</button>
-        <button type="button" data-testid="chat-steer" :disabled="!busy" @click="steer">插话（steer）</button>
-        <button type="button" data-testid="chat-abort" :disabled="!busy" @click="abort">停止（abort）</button>
-        <span class="small faint">busy={{ busy }} · settled={{ settledCount }}</span>
+      <!-- ═══ 消息流：用户/AI **视觉分明**（头像 + 气泡），可滚动，新消息自动到底 ═══ -->
+      <div ref="logEl" class="chat-log" data-testid="chat-log" :data-count="msgs.length">
+        <div v-for="(m, i) in msgs" :key="i" class="msg" :class="m.role" :data-role="m.role">
+          <div class="avatar" aria-hidden="true">{{ m.role === 'user' ? '我' : m.role === 'assistant' ? 'pi' : '·' }}</div>
+          <div class="body">
+            <div v-if="m.thinking" class="thinking small faint" data-testid="thinking">
+              <details><summary>思考过程</summary><pre>{{ m.thinking }}</pre></details>
+            </div>
+            <!-- ★ 工具调用 = **可折叠的一步**（DSH 的体验感很大程度来自这个） -->
+            <details v-for="t in m.tools" :key="t.id" class="tool-step" :data-tool="t.tool"
+                     data-testid="tool-call" :open="!t.done">
+              <summary>
+                <span class="tool-name">{{ toolLabel(t.tool) }}</span>
+                <span v-if="!t.done" class="pill">运行中…</span>
+                <span v-else class="pill" :class="t.ok ? 'ok' : 'bad'">{{ t.ok ? '完成' : '失败' }}</span>
+                <span v-if="t.duration_ms != null" class="faint tiny mono">{{ t.duration_ms }}ms</span>
+                <span v-if="t.args" class="faint tiny mono tool-args">{{ JSON.stringify(t.args).slice(0, 80) }}</span>
+              </summary>
+              <div class="tool-detail">
+                <div v-if="t.args" class="tiny mono">参数：{{ JSON.stringify(t.args).slice(0, 300) }}</div>
+                <div v-if="t.partial" class="evidence">{{ t.partial.slice(0, 200) }}</div>
+                <div v-if="t.result_text" class="evidence">{{ t.result_text.slice(0, 200) }}</div>
+              </div>
+            </details>
+            <div v-if="m.text" class="text" :data-testid="m.role === 'assistant' ? 'assistant-text' : ''">
+              <RichText :text="foldToolMarkers(m.text).text" :stats="queryFlag('selftest')" />
+            </div>
+            <!-- ★ 流式光标：正在生成时的可见反馈（打字机效果由 text_delta 天然提供） -->
+            <span v-if="busy && m.role === 'assistant' && i === msgs.length - 1" class="cursor"
+                  data-testid="stream-cursor">▍</span>
+            <div v-if="m.role === 'assistant' && foldToolMarkers(m.text).folded > 0" class="small faint"
+                 data-testid="tool-marker-folded" :data-count="foldToolMarkers(m.text).folded">
+              （已折叠 {{ foldToolMarkers(m.text).folded }} 处模型输出的原始工具调用标记 —— 本轮会话未启用工具，后端未过滤，前端按原样告知）
+            </div>
+            <div v-if="m.error" class="note bad" :data-error-code="m.error.code" data-testid="chat-error">
+              <b>错误</b> <span class="mono">{{ m.error.code }}</span>：{{ m.error.msg }}
+            </div>
+          </div>
+        </div>
+        <div v-if="!msgs.length" class="empty-hint faint small" data-testid="chat-empty">
+          还没有对话。问点什么，比如"聚簇索引和二级索引的区别" ——
+          这一页会带上你**正在看的页面**作为上下文（文档 / 章节 / 沙箱会话）。
+        </div>
       </div>
-    </div>
+
+      <!-- ═══ 输入区（不是"光秃秃一个文本框"）：上下文指示 + 控件 + 发送/停止 ═══ -->
+      <div class="chat-input">
+        <div class="ctx-row">
+          <span v-if="ctxLabel && !ctxChipDismissed" class="chip" data-testid="input-context"
+                :data-keys="Object.keys(pageContext).join(',')">
+            正在参考：{{ ctxLabel }}
+            <button type="button" class="chip-x" data-testid="input-context-clear" title="本次不带上下文"
+                    @click="ctxChipDismissed = true">✕</button>
+          </span>
+          <span v-else class="small faint" data-testid="input-context-none">
+            未使用页面上下文{{ ctxChipDismissed ? '（你已点掉）' : '' }}
+          </span>
+        </div>
+        <textarea
+          ref="boxEl"
+          v-model="input"
+          data-testid="chat-input"
+          :disabled="gated"
+          rows="1"
+          placeholder="问知识点 / 让 pi 读某节原文（Enter 发送，Shift+Enter 换行）"
+          @input="autoGrow"
+          @keydown.enter.exact.prevent="send"
+        />
+        <div class="row">
+          <div class="seg" data-testid="mode-select" :data-mode="chatMode">
+            <button type="button" :class="{ on: chatMode === 'chat' }" data-testid="mode-chat" @click="setMode('chat')">chat</button>
+            <button type="button" :class="{ on: chatMode === 'agent' }" data-testid="mode-agent"
+                    :disabled="!agentAllowed" :title="agentAllowed ? '' : agentBlockReason"
+                    @click="setMode('agent')">agent</button>
+          </div>
+          <span class="small faint" data-testid="mode-explain">
+            chat：快，只用检索摘要 ｜ agent：能翻知识库原文（kb_search/kb_get），慢一些
+          </span>
+          <label class="small" data-testid="retrieval-select-label">检索
+            <select v-model="retrievalChoice" data-testid="retrieval-select">
+              <option value="none">none（不检索）</option>
+              <option value="wiki">wiki（词法/bigram）</option>
+              <option value="kg">kg（图谱遍历）</option>
+              <option value="rag">rag（向量）</option>
+            </select>
+          </label>
+          <span class="pill" :class="backendMode === chatMode ? 'ok' : 'warn'" data-testid="backend-mode"
+                :data-backend-mode="backendMode">后端：{{ backendMode || '未上报' }}</span>
+          <span class="right" />
+          <span class="small faint" data-testid="busy-state">busy={{ busy }} · settled={{ settledCount }}</span>
+          <button type="button" data-testid="chat-steer" :disabled="!busy" @click="steer">插话</button>
+          <!-- ★ busy 时按钮变"停止"（DSH 的体验：正在生成时给的是停止，不是再发一条） -->
+          <button v-if="busy" type="button" class="bad" data-testid="chat-abort" @click="abort">停止</button>
+          <button v-else type="button" class="primary" data-testid="chat-send" :disabled="!canSend" @click="send">发送</button>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
 <style scoped>
+/* ═══ 布局：左会话列表 ｜ 中消息流 + 输入区（DSH 式布局，**配色仍用我们的纸白+朱红**） ═══ */
+.chat-layout { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: 12px;
+  padding: 14px 22px 40px; max-width: 1180px; margin: 0 auto; align-items: start; }
+.chat-layout.embedded { grid-template-columns: minmax(0, 1fr); padding: 0; max-width: none; }
+.chat-layout.embedded .chat-side { display: none; }
+.chat-side { border: var(--hair) solid var(--rule); border-top: 2px solid var(--rule-strong);
+  background: var(--panel); padding: 8px; position: sticky; top: 12px; max-height: 70vh; overflow: auto; }
+.side-head { display: flex; align-items: center; gap: 6px; padding-bottom: 6px; border-bottom: var(--hair) solid var(--rule); }
+.side-note { padding: 6px 2px; }
+.side-list { list-style: none; margin: 6px 0 0; padding: 0; }
+.side-item { display: block; width: 100%; text-align: left; border: 0; background: transparent;
+  padding: 6px 6px; cursor: pointer; border-left: 3px solid transparent; color: var(--ink); }
+.side-item:hover { background: var(--paper-2); }
+.side-item.on { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.side-item .t { display: block; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-main { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
 .mode-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .seg { display: inline-flex; border: var(--hair) solid var(--rule-strong); border-radius: var(--r-sm); overflow: hidden; }
 .seg button { border: 0; background: transparent; padding: 2px 10px; font-size: 12px; cursor: pointer; color: var(--ink-2); }
 .seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
 .ctx-bar { margin-top: 6px; padding-top: 5px; border-top: var(--hair) dotted var(--rule); }
 .bad-text { color: var(--warn); }
-
 .tools-danger { color: var(--bad); font-weight: 700; }
 
-/* 检索徽标：四种模式颜色不同；none（没查库）=灰虚线，empty（查了没命中）=橙，hit=绿，unavailable=灰 */
+/* 检索徽标：status 判色（none 灰虚线 / ok 绿 / empty 橙 / unavailable+error 红） */
 .retr-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px;
   padding-top: 7px; border-top: var(--hair) dashed var(--rule); }
 .retr-badge { display: inline-block; padding: 1px 8px; font-size: 12px; font-weight: 600;
   border: var(--hair) solid currentColor; border-radius: var(--r-sm); }
-/* ★ 判色以 status 为准（pi-bridge 契约）：none 灰虚线 / ok 绿 / empty 橙 / unavailable+error 红 */
 .retr-badge[data-status="none"] { color: var(--muted); border-style: dashed; background: transparent; }
 .retr-badge[data-status="empty"] { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .retr-badge[data-status="ok"] { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
@@ -923,37 +1352,47 @@ void _esc
 .retr-why { flex-basis: 100%; margin-top: 5px; border-left: 3px solid var(--rule-strong); padding-left: 8px; }
 .retr-item { padding: 3px 0; border-bottom: var(--hair) dotted var(--rule); }
 
-/* 对话 = 誊抄稿（transcript）：mono 角色栏 + 细线分隔 + 工具调用当"旁注" */
-.chat-layout { display: flex; flex-direction: column; gap: 12px; padding: 14px 22px 40px; max-width: 1020px; margin: 0 auto; }
-.chat-log { min-height: 300px; max-height: 56vh; overflow: auto; border: var(--hair) solid var(--rule); border-top: 2px solid var(--rule-strong); border-radius: var(--r-sm); background: var(--panel); padding: 4px 14px; }
-.msg { display: flex; gap: 12px; padding: 8px 0; border-bottom: var(--hair) solid var(--rule); }
-.msg:last-child { border-bottom: none; }
-.msg .role {
-  flex: 0 0 52px; text-align: right;
-  font-family: var(--font-mono); font-size: var(--fs-meta); letter-spacing: .06em;
-  color: var(--muted); padding-top: 3px; text-transform: uppercase;
-}
-.msg.assistant .role { color: var(--accent); }
-.msg .body { flex: 1; min-width: 0; }
-.msg.user .body .text { font-weight: 600; }
-.msg .text { white-space: pre-wrap; }
-.tool {
-  border: var(--hair) solid var(--rule);
-  border-left: 3px solid var(--ink-2);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
-  background: var(--paper-2);
-  padding: 3px 8px; margin: 4px 0; font-size: 12px;
-  display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
-}
+/* ═══ 消息流：**用户与 AI 视觉分明**（用户右对齐浅底，AI 左对齐整宽） ═══ */
+.chat-log { min-height: 320px; max-height: 62vh; overflow: auto; border: var(--hair) solid var(--rule);
+  border-top: 2px solid var(--rule-strong); background: var(--paper); padding: 10px 12px; scroll-behavior: smooth; }
+.msg { display: flex; gap: 10px; margin: 10px 0; }
+.msg .avatar { flex: 0 0 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; border: var(--hair) solid var(--rule-strong); background: var(--paper-2); color: var(--ink-2); }
+.msg .body { min-width: 0; flex: 1; }
+.msg .text { white-space: normal; }
+/* AI：左对齐、整宽、纸白卡片 */
+.msg.assistant .body { background: var(--panel); border: var(--hair) solid var(--rule); padding: 8px 10px; }
+.msg.assistant .avatar { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+/* 用户：右对齐、朱红浅底、短 */
+.msg.user { flex-direction: row-reverse; }
+.msg.user .body { flex: 0 1 auto; max-width: 76%; background: color-mix(in srgb, var(--accent) 9%, var(--paper));
+  border: var(--hair) solid color-mix(in srgb, var(--accent) 35%, var(--rule)); padding: 7px 10px; font-weight: 600; }
+.msg.system .body { color: var(--ink-3); font-size: 12.5px; }
+.empty-hint { padding: 18px 4px; text-align: center; }
+/* 流式光标 */
+.cursor { display: inline-block; color: var(--accent); animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* 工具调用 = 可折叠的一步 */
+.tool-step { border: var(--hair) solid var(--rule); border-left: 3px solid var(--ink-2);
+  background: var(--paper-2); margin: 5px 0; font-size: 12px; }
+.tool-step > summary { cursor: pointer; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 4px 8px; }
+.tool-step[open] > summary { border-bottom: var(--hair) dotted var(--rule); }
 .tool-name { font-family: var(--font-mono); font-weight: 700; color: var(--ink); }
-.chat-input textarea { width: 100%; font-family: var(--font-body); font-size: 13.5px; border: var(--hair) solid var(--rule-strong); border-radius: var(--r-sm); padding: 8px; background: var(--panel); color: var(--ink); }
+.tool-args { overflow: hidden; text-overflow: ellipsis; max-width: 320px; white-space: nowrap; }
+.tool-detail { padding: 5px 8px; }
+.evidence { color: var(--ink-2); }
+
+/* ═══ 输入区：上下文 chip + 控件 + 发送/停止 ═══ */
+.chat-input { border: var(--hair) solid var(--rule); border-top: 2px solid var(--rule-strong); background: var(--panel); padding: 8px 10px; }
+.ctx-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 1px 8px;
+  border: var(--hair) solid color-mix(in srgb, var(--accent) 40%, var(--rule)); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.chip-x { border: 0; background: transparent; cursor: pointer; color: var(--ink-2); font-size: 12px; }
+.chat-input textarea { width: 100%; font-family: var(--font-body); font-size: 13.5px; line-height: 1.6;
+  border: var(--hair) solid var(--rule-strong); padding: 8px; background: var(--panel); color: var(--ink);
+  resize: none; overflow-y: auto; min-height: 38px; max-height: 200px; }
 .chat-input .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
 .thinking { border-left: 3px solid var(--rule-strong); padding-left: 8px; margin: 4px 0; }
 .thinking pre { white-space: pre-wrap; margin: 4px 0 0; background: transparent; border: none; padding: 0; color: var(--ink-2); }
 </style>
-
-
-
-
-
-

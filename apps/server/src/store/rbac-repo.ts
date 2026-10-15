@@ -417,6 +417,36 @@ export class RbacRepo {
     return id;
   }
 
+  /**
+   * ★ **读取单个会话的归属（不按 userId 过滤）** —— IDOR 修复用。
+   *
+   * ⚠️ 与下方 `getConversation(userId, id)` **语义不同**：那个是"按 user 取自己的"，
+   * 本方法是"取归属行本身"，因为调用方（`checkSessionOwner`）需要区分
+   * "不存在"与"属于别人"，才能对外给出**逐字相同**的拒绝理由（不泄漏存在性）。
+   * **路由不许**直接拿它当可见性判断用。
+   */
+  getConversationUnscoped(id: string): ConversationRow | undefined {
+    return this.db.get<ConversationRow>('SELECT * FROM conversations WHERE id = ?', id);
+  }
+
+  /**
+   * ★ **认领一个会话**（首次连接时建立归属；`id` 由客户端提供，故用 `INSERT OR IGNORE` + 复核）。
+   *
+   * 为什么不用 `createConversation`（它自己生成 id）：聊天会话 id 是前端生成并已在
+   * pi 转录里用过的 key，必须**沿用同一个 id** 才能让历史接得上。
+   * `INSERT OR IGNORE`：并发首连时只有一个能插入；插入后再复核归属（见 `checkSessionOwner`）。
+   */
+  claimConversation(input: { id: string; userId: string; docId?: string | null; title?: string }): void {
+    this.db.run(
+      'INSERT OR IGNORE INTO conversations(id,user_id,doc_id,title,created_at) VALUES(?,?,?,?,?)',
+      input.id,
+      input.userId,
+      input.docId ?? null,
+      input.title ?? '',
+      Date.now(),
+    );
+  }
+
   listConversations(userId: string, opts: { limit?: number; offset?: number } = {}): {
     total: number;
     conversations: ConversationRow[];

@@ -258,6 +258,8 @@ const V2_ADDED_COLUMNS: Record<string, Record<string, string>> = {
     visibility: "TEXT NOT NULL DEFAULT 'private'",
     review_status: "TEXT NOT NULL DEFAULT 'draft'",
     course_id: 'TEXT REFERENCES courses(id)',
+    // ★ v4：视频"目录"归属（**可空** —— 不属于任何目录的视频仍可用，不破坏既有数据）
+    collection_id: 'TEXT',
   },
   tasks: {
     // RBAC §5：任务优先级与归属（LLM 并发=1 是全局的，必须能区分师生）
@@ -292,6 +294,52 @@ CREATE TABLE IF NOT EXISTS embeddings (
   PRIMARY KEY (model, ref_kind, ref_id)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_ref ON embeddings(ref_kind, ref_id);
+`;
+
+/**
+ * 迁移 v4：**视频目录**（`collections`）+ `documents.collection_id`。
+ *
+ * ## 为什么是**独立表**而不是 `documents` 加一列（Lead 征询过裁定）
+ * 1. **目录是实体**：要重命名/排序/独立发布/将来权限 —— 一列**很快不够用**，
+ *    第一次要加"目录级发布"时又得迁移一次。
+ * 2. ★ **目录必须能独立于视频发布**（学生"选某个文件夹"→ 文件夹本身有可见性）—— 一列表达不了。
+ * 3. ★★ **复用既有可见性词汇**：本表刻意带上 `owner_id` / `visibility` / `review_status` / `course_id`
+ *    —— 与 `documents` **完全同构**，于是 `docScopeSql(scope)` 可以**逐字复用**（见 `store/scope.ts`），
+ *    **不引入第二套 RBAC 方言**（新接口因此不可能成为绕过 RBAC 的后门）。
+ *
+ * ⚠️ 原错误写法（若按"加一列"实现）：`documents.collection TEXT` —— 无发布语义、无 owner、
+ *    无法重命名，且学生可见性只能靠"猜字符串前缀"，必然演变成两套权限判断。
+ */
+const DDL_V4_COLLECTIONS = `
+CREATE TABLE IF NOT EXISTS collections (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  owner_id TEXT REFERENCES users(id),
+  visibility TEXT NOT NULL DEFAULT 'private',
+  review_status TEXT NOT NULL DEFAULT 'draft',
+  course_id TEXT REFERENCES courses(id),
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_collection_owner ON collections(owner_id);
+CREATE INDEX IF NOT EXISTS idx_collection_review ON collections(review_status);
+`;
+
+/**
+ * 迁移 v4 的**索引**，必须**在 `addMissingColumns()` 之后**执行。
+ *
+ * ⚠️ **原错误写法**：`idx_doc_collection` 原先写在 `DDL_V4_COLLECTIONS` 里（与建表同批），
+ *    而 `documents.collection_id` 是 `addMissingColumns()` **之后**才补上的列 ——
+ *    ⟹ 全新库/旧库启动时 `CREATE INDEX ... ON documents(collection_id)` **必然报
+ *      `SqliteError: no such column: collection_id`**，**服务直接起不来**（实测踩到：
+ *      用户正在实测的服务被这条卡死）。
+ *    ★ 教训：**"建表"与"在别表上建索引"不是同一批** ——
+ *      前者依赖表存在，后者还依赖**列已补**。凡是索引涉及"补出来的列"，都必须排在补列之后。
+ */
+const DDL_V4_INDEXES = `
+CREATE INDEX IF NOT EXISTS idx_doc_collection ON documents(collection_id);
 `;
 
 export interface SearchRow {
@@ -366,6 +414,35 @@ export class Db {
       this.db
         .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
         .run(3, 'retrieval_embeddings_table', Date.now());
+    }
+    if (!applied.has(4)) {
+      // ★ 先建表（`documents.collection_id` 的语义依赖它），再补列（幂等机制复用 v2 的）
+      this.db.exec(DDL_V4_COLLECTIONS);
+      this.addMissingColumns();
+      // ★ 索引**必须在补列之后**（它涉及补出来的 `documents.collection_id`）—— 见 DDL_V4_INDEXES 注释
+      this.db.exec(DDL_V4_INDEXES);
+      this.db
+        .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
+        .run(4, 'video_collections', Date.now());
+    }
+    /**
+     * ★ 迁移 v5：**补建 `idx_doc_collection`**（幂等 `CREATE INDEX IF NOT EXISTS`）。
+     *
+     * ## 为什么需要它（真实发生过，且**是并发编辑的产物**）
+     * `idx_doc_collection` 原本写在 `DDL_V4_COLLECTIONS` 里、排在 `addMissingColumns()` **之前** →
+     * `no such column: collection_id` → **服务起不来**。修复（把索引挪到补列之后）**先落地**，
+     * v4 因此**成功并写入了 `schema_migrations`**；随后补上的索引语句**再也不会执行**。
+     * ⟹ 那个库处于"**v4 已记录、但索引不存在**"的状态 —— **只靠改 v4 的代码救不回来**，
+     *    必须**新版本号**才会重跑。这正是"迁移一旦记录就不会重跑"的必然推论。
+     *
+     * ⚠️ 教训（写进提交信息）：**迁移块一旦被别人跑过，就只能靠新版本号前进** ——
+     *    改旧块的代码对已迁移的库**无效**。
+     */
+    if (!applied.has(5)) {
+      this.db.exec(DDL_V4_INDEXES);
+      this.db
+        .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
+        .run(5, 'doc_collection_index_backfill', Date.now());
     }
     return Math.max(1, ...applied);
   }

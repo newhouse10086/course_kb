@@ -10,13 +10,15 @@
  * 模块缺失时 `/capabilities` 如实报 `available:false` + 可读 reason，**不假装可用**。
  */
 
-import Fastify from 'fastify';
-import type { FastifyInstance } from 'fastify';
+import Fastify, { LogController } from 'fastify';
+import type { FastifyInstance, FastifyServerOptions } from 'fastify';
 import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import path from 'node:path';
 
 import { loadConfig, ensureDirs, redact, materializePiModels } from './config.ts';
+// ★ 运行日志落盘（见 src/logging/index.ts 的缺口说明）
+import { createAppLogging, type AppLogging } from './logging/index.ts';
 import type { ServerConfig } from './config.ts';
 import { Db } from './store/db.ts';
 import { Repo } from './store/repo.ts';
@@ -71,12 +73,20 @@ export interface BuildOptions {
   chatFactory?: ChatConnectionFactory | null;
   /** 覆盖 agent 能力上报（同上，测试用） */
   agentCapabilities?: AgentCapabilitiesFn | null;
+  /**
+   * 覆盖日志：undefined = 按配置落盘；
+ull = **完全关掉**（测试里不想写文件时用）；AppLogging = 注入。
+   */
+  logging?: AppLogging | null;
 }
 
 /** 结果容器：测试要拿到 db/repo/queue 做断言，所以不只返回 fastify 实例。 */
 export interface BuiltApp {
   app: FastifyInstance;
   deps: AppDeps;
+  /** ★ 日志句柄（
+ull = 本次未启用落盘） */
+  logging: AppLogging | null;
   close(): Promise<void>;
 }
 
@@ -95,6 +105,21 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   const cfg = opts.cfg ?? loadConfig();
   ensureDirs(cfg);
 
+  // ── 日志（★ 落盘；用户明确要求）────────────────────────────────────
+  // 原状：`logger: false` → 请求/异常/worker stderr **只进终端，关掉终端就没了**；
+  //      落盘的只有"结果"（audit_log / tasks / chat jsonl / sandbox 审计），**过程全丢**。
+  // ★ 必须在 worker/agent 之前创建：worker 的 stderr 也要落盘（onStderr 钩子）。
+  const logging: AppLogging | null =
+    opts.logging === null
+      ? null
+      : (opts.logging ??
+        createAppLogging({
+          dir: cfg.logging.dir,
+          level: cfg.logging.level,
+          maxBytes: cfg.logging.maxBytes,
+          retentionDays: cfg.logging.retentionDays,
+        }));
+
   const db = Db.open(cfg.dbPath);
   const repo = new Repo(db);
   const bus = new TaskEventBus();
@@ -106,6 +131,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     cwd: cfg.root,
     timeoutMs: cfg.workerTimeoutMs,
     ...(opts.workerLauncher ? { launcher: opts.workerLauncher } : {}),
+    // ★ worker stderr 也要落盘（原来只在终端）；内部限速 + 截断，避免刷爆日志
+    ...(logging ? { onStderr: (line: string) => logging.logWorkerStderr(line) } : {}),
   });
   const runner: WorkerRunnerWithRaw = createWorkerRunner(workerClient);
   const runWorkerProbe = async (force: boolean): Promise<AppDeps['workerCapability']> =>
@@ -397,6 +424,15 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     completeJson,
     enums,
     resolveExtractorAvailability,
+    /**
+     * ★ **把"解析后是否自动抽取"接上开关**（原先 `autoExtractOnParse` **声明了却没人传** ——
+     * 与 `timeoutMs`/`maxTokens` 同族的**死旋钮**，坑 24：`autoExtract` 恒为 true）。
+     *
+     * `COURSE_KB_AUTO_EXTRACT=0` → 只解析不抽取（**零 LLM 花费**）；
+     * 缺省（或任何其它值）→ 自动抽取（用户诉求"上传了要能看到东西"）。
+     * 用途：① 运维/测试要"只解析"时不必改代码；② 让测试能**零额度**跑通 reparse/parse 链路。
+     */
+    autoExtractOnParse: cfg.env.COURSE_KB_AUTO_EXTRACT !== '0',
   });
 
   // ── 额外任务处理器（其他 teammate 的工厂，**动态接入**）──────────────
@@ -746,12 +782,49 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   };
 
   // ── Fastify ──────────────────────────────────────────────────────
-  const app = Fastify({
-    logger: false,
+  // ★ 必须**关掉 Fastify 自带的请求日志** —— 两条理由都真机实测过（不是偏好）：
+  //   ① **它会泄漏**：Fastify 默认把整个 `raw`（IncomingMessage）序列化进日志 →
+  //      一次 146 字节的请求变成 **5.7KB 一行**，而且**查询串里的 token 原样落盘**
+  //      （实测：带 `?token=sk-FAKE-…` + `Authorization` 的请求，假密钥在日志里出现 **2 次**）。
+  //      我们自己的 `onResponse` 钩子只记 `path`（**不含查询串**）+ 白名单字段 → 不泄漏。
+  //   ② 否则**每请求两行**（它的 + 我们的），且它那行几 KB，轮转会被它拖着跑。
+  //
+  // ⚠️ 非废弃的关法是 **`logController` + `LogController` 实例**。
+  //    传**普通对象**会让 `npm start` 直接 `FastifyError: must be an instance of LogController`
+  //    （曾因此把用户后端搞断 → 教训：`as never` 按下去的类型错必须用**真启动**验证）。
+  // ⚠️ `logController` 不在 `FastifyServerOptions` 类型里（只存在于运行期/文档）→
+  //    用**显式的交叉类型**声明选项（不是 `as never`：其余字段仍受类型检查），
+  //    并由 `test/logging_http.test.ts` 的**真启动**（buildApp + listen）兜底。
+  const fastifyOptions: FastifyServerOptions & { logController?: unknown } = {
+    ...(logging
+      ? {
+          logger: logging.fastifyOptions,
+          // `logController` 不在 `FastifyServerOptions` 类型里（只存在于运行期/文档）→ 受控窄化，
+          // 由 `test/logging_http.test.ts` 的**真启动**（buildApp + listen）兜底。
+          logController: new LogController({ disableRequestLogging: true }),
+        }
+      : { logger: false }),
     bodyLimit: Math.max(cfg.maxUploadBytes, 64 * 1024 * 1024),
     // 中文/空格路径无关；这里只是让 404 也走我们的 JSON 形状
     ajv: { customOptions: { coerceTypes: true } },
-  });
+  };
+  const app = Fastify(fastifyOptions);
+
+  // ★ 进程级告警（含 fastify 等依赖的 deprecation）**也落盘** —— 原来只打 stderr，关掉终端就没了
+  if (logging) {
+    process.on('warning', (w) => {
+      logging!.warn({ source: 'process.warning', name: w.name, detail: w.message }, 'process warning');
+    });
+    process.on('uncaughtException', (err) => {
+      logging!.error({ err, source: 'uncaughtException' }, 'uncaught exception');
+    });
+    process.on('unhandledRejection', (reason) => {
+      logging!.error(
+        { reason: reason instanceof Error ? { message: reason.message, stack: reason.stack } : String(reason), source: 'unhandledRejection' },
+        'unhandled rejection',
+      );
+    });
+  }
 
   await app.register(multipart, {
     limits: { fileSize: cfg.maxUploadBytes, files: 1, fields: 20 },
@@ -762,7 +835,39 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   }
 
   app.setNotFoundHandler((_req, reply) => reply.code(404).send(NOT_FOUND_JSON));
+
+  // ★ 请求日志（自己打：要带**用户 id**，而 Fastify 默认的请求日志只有 req/res）
+  //   字段：方法 / 路径（**查询串已清洗敏感值**）/ 状态码 / 耗时 ms / 用户 id（有则记，无则 null）
+  if (logging) {
+    app.addHook('onResponse', (req, reply, done) => {
+      const user = (req as { user?: { id?: string } }).user;
+      const line = {
+        method: req.method,
+        path: req.url.split('?')[0] ?? req.url,
+        status: reply.statusCode,
+        ms: Math.round(reply.elapsedTime * 100) / 100,
+        userId: user?.id ?? null,
+      };
+      try {
+        if (reply.statusCode >= 500) req.log.error(line, 'request failed');
+        else if (reply.statusCode >= 400) req.log.warn(line, 'request');
+        else req.log.info(line, 'request');
+      } catch {
+        /* 日志失败不影响请求 */
+      }
+      done();
+    });
+  }
+
   app.setErrorHandler((err, _req, reply) => {
+    // ★ 异常**带堆栈**落盘（用户最缺的就是这个：原来只有 500 响应，没有过程）
+    if (logging) {
+      try {
+        _req.log.error({ err, path: _req.url.split('?')[0] ?? _req.url, method: _req.method }, 'unhandled error');
+      } catch {
+        /* 日志失败不影响响应 */
+      }
+    }
     if (err instanceof ApiError) return reply.code(err.httpStatus).send(err.toBody());
     // Fastify 的参数校验错误（我们主要用 zod/手写校验，这里兜底）
     const status = (err as { statusCode?: number }).statusCode ?? 500;
@@ -818,6 +923,7 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   return {
     app,
     deps,
+    logging,
     async close() {
       // 顺序很重要：先中止在跑的 worker，再**等任务收尾写完 tasks 行**，最后关 DB。
       // 原错误写法：stop() 后立刻 db.close() → 任务收尾写入撞上已关闭连接，
@@ -834,6 +940,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
         /* 忽略 */
       }
       db.close();
+      // ★ 关日志（同步写，close 只是接口一致性）
+      logging?.close();
     },
   };
 }
@@ -852,6 +960,30 @@ export async function main(): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
+  // ★ 启动信息**落盘**（运维第一件要知道的事：日志文件在哪）
+  if (built.logging) {
+    // ★ debug 级也写一条：这样 `COURSE_KB_LOG_LEVEL=debug` 在**真机上可观测**
+    //   （否则"级别可配"只是个说法 —— 坑 24 的死旋钮判据：设了极小值/更细级别要能看到变化）
+    built.logging.debug(
+      { event: 'log-config', dir: built.logging.dir, file: built.logging.file, level: built.logging.level, retentionDays: cfg.logging.retentionDays, maxBytes: cfg.logging.maxBytes },
+      'logging configured',
+    );
+    built.logging.writeLine(
+      {
+        event: 'startup',
+        version: SERVER_VERSION,
+        host: cfg.host,
+        port: cfg.port,
+        root: cfg.root,
+        db: cfg.dbPath,
+        logFile: built.logging.file,
+        logLevel: built.logging.level,
+        node: process.version,
+      },
+      'server starting',
+    );
+  }
+
   await app.listen({ host: cfg.host, port: cfg.port });
   const base = `http://${cfg.host}:${cfg.port}`;
   process.stdout.write(
@@ -862,6 +994,9 @@ export async function main(): Promise<void> {
       `  docs         ${base}/api/v1/documents`,
       `  root         ${cfg.root}`,
       `  db           ${cfg.dbPath}`,
+      `  logs         ${
+        built.logging ? `${built.logging.dir}（文件 ${built.logging.file}，级别 ${built.logging.level}）` : '未启用'
+      }`,
       `  worker       ${deps.workerCapability.available ? '可用' : `不可用（${deps.workerCapability.reason}）`}`,
       `  providers    ${deps.providers ? '已组装' : `不可用（${deps.providersError ?? 'unknown'}）`}`,
       `  agent(pi)    ${deps.agentCapabilities ? '已组装' : `不可用（${deps.agentError ?? 'unknown'}）`}`,

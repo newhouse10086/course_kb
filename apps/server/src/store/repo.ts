@@ -607,17 +607,58 @@ export class Repo {
    *
    * `parent_ord` → `parent_id` 映射在这里做（契约 §4：draft 用 ord 表达父子，入库映射为 id）。
    * 先按 ord 建好 id，再回填 parent_id，避免顺序依赖。
+   *
+   * ## ★★ 为什么不是"先全量 DELETE 再 INSERT"（机制 2 修复，Lead 授权 2026-10-15）
+   *
+   * 原实现的第一行是 `DELETE FROM units WHERE doc_id = ?`。而
+   * `cards.unit_id REFERENCES units(id) **ON DELETE CASCADE**` —— 于是**每次解析都会清空该文档的全部卡片**，
+   * 包括 **reparse 成功** 的情况（实测：重跑前 cards=1 → 重跑后 cards=0，单元 id 全变）。
+   * 更关键的是：**级联发生在 DELETE 那一刻** —— 三步实验证明
+   * ```
+   * ① 建好：cards = 1
+   * ② DELETE FROM units 之后：cards = 0   ← 级联已发生
+   * ③ 用**同一个 id** 重新 INSERT 之后：cards = 0   ← 救不回来
+   * ```
+   * ⟹ **稳定 id 单独不够**：必须让"仍在的单元"**不被删除**。
+   *
+   * ## 两条边界（Lead 明确要求）
+   * 1. ★ **`drafts` 为空 → 一个都不删**：解析产不出单元 = **失败**，
+   *    **失败不清库**（与 extract 侧"零卡片+有失败 → 不覆盖旧产物"同一原则）。
+   *    否则 `stale = 现有全部` → 删光 → 卡片级联删光（本 bug 的另一条触发路径）。
+   * 2. 单元**正文变了 → id 会变**（调用方 `planUnitIds` 只在结构+正文相同时复用旧 id）
+   *    → 旧 id 不在 keep 里 → 删除 → **它的卡片级联删掉**：**这是对的**
+   *    （正文变了，旧卡片的 `evidence_quote` 已经对不上原文，必须重抽）。
    */
   replaceUnits(docId: string, drafts: UnitDraft[]): string[] {
     return this.db.tx(() => {
-      this.db.run('DELETE FROM units WHERE doc_id = ?', docId);
-      const ids = drafts.map((d, i) => d.id ?? newUnitId());
+      const ids = drafts.map((d) => d.id ?? newUnitId());
+      // ★ 解析产不出单元 = 失败 → **不清库**（否则 stale=全部 → 卡片级联删光）
+      if (drafts.length === 0) {
+        return [];
+      }
+      // ★ 只删"本次不再存在"的单元（保留仍在的 → 其卡片不被级联删除）
+      const keep = new Set(ids);
+      const stale = this.allUnitRows(docId)
+        .map((u) => u.id)
+        .filter((id) => !keep.has(id));
+      if (stale.length > 0) {
+        this.db.run(
+          `DELETE FROM units WHERE doc_id = ? AND id IN (${stale.map(() => '?').join(',')})`,
+          docId,
+          ...stale,
+        );
+      }
       const ordToId = new Map<number, string>();
       drafts.forEach((d, i) => ordToId.set(d.ord, ids[i] as string));
 
       const stmt = this.db.stmt(
         `INSERT INTO units(id,doc_id,ord,title,level,parent_id,span_kind,span_start,span_end,text,text_len)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           ord=excluded.ord, title=excluded.title, level=excluded.level,
+           parent_id=excluded.parent_id, span_kind=excluded.span_kind,
+           span_start=excluded.span_start, span_end=excluded.span_end,
+           text=excluded.text, text_len=excluded.text_len`,
       );
       drafts.forEach((d, i) => {
         const text = d.text ?? '';

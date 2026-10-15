@@ -70,6 +70,66 @@ export function redact(text: string, secrets: (string | undefined)[]): string {
 // Provider 实现
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * ★ 幂等 strictify：递归补 `required`（= 全部属性）+ `additionalProperties:false`。
+ *
+ * 为什么需要：`strict: true` **必须配一份"真 strict 的 schema"**才有意义 ——
+ * 只有 `strict:true` 而 schema 缺 `required`/`additionalProperties:false` 时，
+ * **`strict:true` 只是一句没有兑现的承诺**（坑 21 家族：自述与生效不同源）。
+ *
+ * ⚠️ **幂等**：已经 strict 的 schema 再跑一遍结果不变（`required` 取并集、`additionalProperties` 已是 false）。
+ * ⚠️ 不改语义：只加"约束"字段，不动 `type`/`properties`/`enum`/`items` 的内容。
+ */
+export function strictifySchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (!node || typeof node !== 'object') return node;
+    const obj = node as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) out[k] = walk(v);
+    const isObject = out.type === 'object' || (out.properties !== undefined && out.type === undefined);
+    if (isObject && out.properties && typeof out.properties === 'object') {
+      const props = out.properties as Record<string, unknown>;
+      const keys = Object.keys(props);
+      const existing = Array.isArray(out.required) ? (out.required as unknown[]).map(String) : [];
+      const merged = [...existing];
+      for (const k of keys) if (!merged.includes(k)) merged.push(k);
+      out.required = merged;
+      out.additionalProperties = false;
+    }
+    return out;
+  };
+  return walk(schema) as Record<string, unknown>;
+}
+
+/**
+ * 这个错误是不是"端点不支持/拒绝严格 schema"（**只有这种情况才回落**）？
+ *
+ * 现场证据（本轮实测，同一端点）：
+ * ```
+ * 裸 schema + strict:true      → 200（strict 被忽略，模型可省略键）
+ * 真 strict schema（required + additionalProperties:false） → 400
+ *   {"error":{"type":"invalid_request_error","code":400,
+ *     "message":"Upstream request failed: [invalid_request_error]
+ *                 This response_format type is unavailable now"}}
+ * ```
+ * ★ 若直接 strictify 而不回落 → **每一次抽取都会 400（全量打挂）**。
+ * ⚠️ **只对 400 + 结构化输出相关文案回落**：401/402/429/超时**不回落**（那些是配置/额度问题，回落只会浪费额度）。
+ */
+export function isStrictSchemaRejected(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!/HTTP\s*400/.test(msg)) return false;
+  return /response_format|json_schema|strict|unavailable|invalid_request_error/i.test(msg);
+}
+
+/**
+ * 未验证时的如实说明（★ 不许无条件声称支持结构化输出 —— 坑 10/24）。
+ * 实测：该端点对"裸 schema + strict:true"返回 200 但**不强制**，对真 strict schema 返回 400。
+ */
+export const STRUCTURED_UNVERIFIED_REASON =
+  '尚未验证：该端点实测**可能忽略 strict**（裸 schema 200 但不强制）或**对严格 schema 返回 400**；' +
+  'provider 会先试 strict、被拒则回落裸 schema，并把实测结果写回本字段';
+
 export interface OpenAiCompatibleOptions {
   id?: string;
   label?: string;
@@ -154,6 +214,9 @@ export class OpenAiCompatibleLlm implements Provider {
   private readonly timeoutMs: number;
   /** ★ 超时重试总预算 */
   private readonly retryBudgetMs: number;
+  /** ★ 结构化输出**实测**模式（unknown = 还没调过）—— 供 `capabilities` 同源上报 */
+  private structuredMode: 'unknown' | 'strict' | 'lenient' = 'unknown';
+  private structuredReason = '';
 
   constructor(o: OpenAiCompatibleOptions) {
     this.baseUrl = o.baseUrl.replace(/\/+$/, '');
@@ -173,8 +236,18 @@ export class OpenAiCompatibleLlm implements Provider {
       available: false,
       reason: undefined,
       capabilities: {
-        structuredOutput: true,       // json_schema + strict
-        jsonSchemaStrict: true,
+        /**
+         * ★★ **不许无条件 true**（坑 10 + 坑 24：能力不可用假装可用 / 声明 ≠ 生效）。
+         *
+         * 实测（同一端点，时间相邻的 3 次调用）：
+         *   · 裸 schema + `strict:true` → **200**（strict 被忽略）
+         *   · 真 strict schema        → **400** `This response_format type is unavailable now`
+         * ⟹ 初始值必须是 **false（未验证）**，之后由**真实调用结果**更新
+         *   （见 `setStructuredMode`）——**同源**，不是猜的。
+         */
+        structuredOutput: false,
+        jsonSchemaStrict: false,
+        structuredOutputReason: STRUCTURED_UNVERIFIED_REASON,
         streaming: true,
         maxContextTokens: o.extra?.maxContextTokens ?? 128_000,
       },
@@ -307,19 +380,54 @@ export class OpenAiCompatibleLlm implements Provider {
        * 否则"重试一次"会让单次任务实际耗时变成 `120s × 2` —— 用户看到的是任务卡住更久。
        * 规则：`已用 + 单次超时 <= retryBudgetMs` 才允许重试，且**第二次的超时收窄到剩余预算**。
        */
-      const startedAt = Date.now();
+      /**
+       * ★★ **降级链**（Lead 裁定：不 strictify、也不等网关修好）：
+       * ```
+       * ① 先试**严格 schema**（strictify 后的）→ 200 就用，记 `structured_output_mode='strict'`
+       * ② 400 / "This response_format type is unavailable now" → **自动回落裸 schema**
+       *    （= 线上一直在用的形状），记 `'lenient'` + **原始 reason**
+       * ③ 两次都失败 → 如实报错，**两个 reason 都带上**
+       * ```
+       * ⚠️ 回落**只在同一 `LLM_QUEUE.run` 槽内**（并发仍=1，不会多占槽/死锁）。
+       * ⚠️ **多一次调用要如实计入**（400 那次也是真调用，别藏）。
+       */
+      const strictSchema = strictifySchema(req.schema.schema);
+      const strictBody = {
+        ...body,
+        response_format: {
+          type: 'json_schema' as const,
+          json_schema: { name: req.schema.name, strict: true, schema: strictSchema },
+        },
+      };
       let resp: {
         choices?: { message?: { content?: string } }[];
         usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
+      let strictRejectReason = '';
       try {
-        resp = (await this.post(body, req.signal)) as typeof resp;
+        resp = (await this.postJson(strictBody, req.signal)) as typeof resp;
+        this.setStructuredMode('strict');
       } catch (e) {
-        const isTimeout = e instanceof ProviderError && e.code === 'E_TIMEOUT';
-        const elapsed = Date.now() - startedAt;
-        const remaining = this.retryBudgetMs - elapsed;
-        if (!isTimeout || remaining < this.timeoutMs) throw e;
-        resp = (await this.post(body, req.signal, remaining)) as typeof resp;
+        if (!isStrictSchemaRejected(e)) throw e; // 401/402/429/超时 → 不回落
+        strictRejectReason = e instanceof Error ? e.message : String(e);
+        // ★ 回落：**原始 schema**（不 strictify）——端点至少能 200
+        try {
+          resp = (await this.postJson(body, req.signal)) as typeof resp;
+        } catch (e2) {
+          /**
+           * ★ **两种模式都失败 → 两个 reason 都带上**（Lead 要求）。
+           * 现场教训：只报一句"amr 返回非 JSON"时，**根本不知道是哪种模式、为什么失败**
+           * （是端点拒绝 schema？是额度？是模型？）——排查只能靠猜。
+           */
+          const lenientReason = e2 instanceof Error ? e2.message : String(e2);
+          throw new ProviderError(
+            'E_LLM',
+            `结构化输出两种模式都失败：strict→${strictRejectReason}；lenient→${lenientReason}`,
+            '严格 schema 被拒后裸 schema 也没成功 —— 可能是配置/额度/模型问题（不是 schema 形状问题）',
+            `provider=${this.info.id} model=${this.model}`,
+          );
+        }
+        this.setStructuredMode('lenient', strictRejectReason);
       }
       const raw = resp.choices?.[0]?.message?.content ?? '';
       if (!raw) {
@@ -340,6 +448,8 @@ export class OpenAiCompatibleLlm implements Provider {
         data,
         raw,
         usedProvider: this.info.id,
+        // ★ 供上游写进 meta：这一份产物是用哪种模式拿到的（strict / lenient）
+        structuredOutputMode: this.structuredMode === 'unknown' ? undefined : this.structuredMode,
         usage: resp.usage
           ? { promptTokens: resp.usage.prompt_tokens ?? 0, completionTokens: resp.usage.completion_tokens ?? 0 }
           : undefined,
@@ -350,6 +460,35 @@ export class OpenAiCompatibleLlm implements Provider {
   // ─────────────────────────────────────────────
   // HTTP
   // ─────────────────────────────────────────────
+
+  /**
+   * 发一次请求（**保留原有超时重试语义**：只对 `E_TIMEOUT` 重试一次，且受总预算约束）。
+   * 从 `completeJson` 里抽出 —— 因为降级链需要发**两次**不同 body 的请求。
+   */
+  private async postJson(body: unknown, signal?: AbortSignal): Promise<unknown> {
+    const startedAt = Date.now();
+    try {
+      return await this.post(body, signal);
+    } catch (e) {
+      const isTimeout = e instanceof ProviderError && e.code === 'E_TIMEOUT';
+      const elapsed = Date.now() - startedAt;
+      const remaining = this.retryBudgetMs - elapsed;
+      if (!isTimeout || remaining < this.timeoutMs) throw e;
+      return await this.post(body, signal, remaining);
+    }
+  }
+
+  /** ★ 把**实测**结果写进 `capabilities`（同源上报；坑 21）。 */
+  private setStructuredMode(mode: 'strict' | 'lenient', rejectReason = ''): void {
+    this.structuredMode = mode;
+    this.structuredReason = rejectReason;
+    this.info.capabilities.structuredOutput = mode === 'strict';
+    this.info.capabilities.jsonSchemaStrict = mode === 'strict';
+    this.info.capabilities.structuredOutputReason =
+      mode === 'strict'
+        ? '严格模式**已验证可用**（端点接受 required + additionalProperties:false 的 schema）'
+        : `端点**拒绝/忽略**严格 schema → 已回落裸 schema（strict 不被强制，键可能被模型省略）：${rejectReason.slice(0, 200)}`;
+  }
 
   private async post(body: unknown, signal?: AbortSignal, timeoutOverrideMs?: number): Promise<unknown> {
     const ctrl = new AbortController();

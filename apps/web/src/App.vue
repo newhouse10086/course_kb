@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * App 外壳：顶栏导航 + 能力横幅 + 路由出口 + 文档选择器
  *
@@ -179,7 +179,7 @@ function toggleTheme() {
 
     <span class="right" />
 
-    <!-- 身份：真后端 auth.required=true 时会显示；未登录给"登录"入口（httpOnly cookie，前端不存 token） -->
+    <!-- 身份：后端要求登录时显示；未登录给"登录"入口（登录态由浏览器自动携带，前端不保存凭据） -->
     <span v-if="authRequired === true" class="authbox" data-testid="auth-box" :data-required="authRequired">
       <template v-if="me?.user">
         <span class="meta">{{ userLabel }}</span>
@@ -207,11 +207,12 @@ function toggleTheme() {
     </span>
   </header>
 
-  <!-- 未登录提示条（不阻塞页面：能力横幅与 /health 是白名单，用户能先看清这是什么平台） -->
+  <!-- 未登录提示条（不阻塞页面：能力横幅与 /health 是白名单，用户能先看清这是什么平台）
+       ⚠️ 文案面向学生/教师：**不写 httpOnly/cookie/token/401 这些给开发者看的词**（用户实测反馈） -->
   <div v-if="showLogin" class="gate-note loginbar" data-testid="login-bar">
-    未登录：受保护接口会返回 401。请先
+    未登录：请先
     <RouterLink :to="{ path: '/login', query: { next: route.fullPath } }">登录</RouterLink>
-    （真后端用 httpOnly cookie，前端不保存 token）。
+    后继续使用。
   </div>
 
   <!--

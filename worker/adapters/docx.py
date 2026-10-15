@@ -27,6 +27,7 @@ from worker.adapters.text import (
     clean_text,
     fixed_windows,
     guess_lang,
+    is_title_like,
     level_from_numbering,
     nodes_to_draft,
 )
@@ -153,11 +154,36 @@ class DocxAdapter(DocumentAdapter):
 
     @staticmethod
     def _heading_level(para, text: str) -> int | None:
+        """段落是否是标题；返回 level 或 None。
+
+        ★★ 编号兜底**必须与 `text.py::_headings` 用同一套护栏** ——
+        这是实测 bug（"双保险失效"的又一个实例）：
+
+        `[实测]` 原错误写法：
+        ```python
+        if text and len(text) <= 90:
+            return level_from_numbering(text)          # ← 只看长度，没有标点护栏
+        ```
+        后果：任何**以"第 N 章/段/步/图"开头、且以句号/冒号结尾的普通段落**
+        都会被判成 level=1 标题。实测：
+        ```
+        '第 5 段：数据库课程讲义正文内容，用于验证无标题时的窗口切分。'
+            → level_from_numbering → 1    → 被当成标题
+        ```
+        一份 60 段的纯文字 Word 文档因此被判成 `mode='headings'`、产出 **60 个假单元**
+        （应走 `windows` 窗口切分）。它与 `text.py` 的同名逻辑**本该一致**，
+        但护栏只加在了 `text.py` 一侧 → **看起来两条路都有编号识别，实际只有一条有护栏**。
+
+        修法：复用 `text.py` 的判据 —— **标题行不得以句末标点结尾**。
+        """
         style = getattr(getattr(para, "style", None), "name", "") or ""
         m = _HEADING_STYLE.match(style.strip())
         if m:
+            # 有权威样式（Heading N）→ 直接采信，不看标点
             return int(m.group(1))
-        # 样式被改乱时用编号兜底（'7.4.2 xxx'）
-        if text and len(text) <= 90:
-            return level_from_numbering(text)
-        return None
+        if not text or len(text) > 90:
+            return None
+        # ⚠️ 与 text.py **共用**同一判据（`is_title_like`）—— 一处实现不会漂移
+        if not is_title_like(text):
+            return None
+        return level_from_numbering(text)

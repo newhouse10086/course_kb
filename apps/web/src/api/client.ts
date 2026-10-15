@@ -8,10 +8,10 @@
  * · 错误统一成 ApiError（携带契约 §8 的 code/hint），UI 直接渲染而不是抛 "Failed to fetch"。
  */
 import type {
-  BusyInfo, Card, CardDetail, DocumentInfo, GraphData, LoginResponse, MeResponse, ModelsResponse, Outline, Paged, SandboxDataset,
+  BusyInfo, Card, CardDetail, CollectionInfo, DocumentInfo, GraphData, LoginResponse, MeResponse, ModelsResponse, Outline, Paged, SandboxDataset,
   SandboxEngine, SandboxHistoryEntry, SandboxResult, SandboxSchema, SandboxSession, SandboxTable, SearchResult,
   SettingsPayload, Span, SwitchResult,
-  TaskInfo, Unit, UploadAccepted, VideoArtifact, VideoSlide, TranscriptChapter, Xref,
+  TaskInfo, Unit, UploadAccepted, VideoArtifact, VideoListItem, VideoSlide, TranscriptChapter, Xref,
 } from './types'
 
 export const API_BASE: string = (() => {
@@ -120,10 +120,12 @@ export const api = {
     req<{ ok?: boolean }>(`/documents/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
 
   /** 上传（§5.2 POST /documents）：用 XHR 以便给出上传进度 */
-  uploadDocument(file: File, onProgress?: (frac: number) => void): Promise<UploadAccepted> {
+  uploadDocument(file: File, onProgress?: (frac: number) => void, opts: { collectionId?: string } = {}): Promise<UploadAccepted> {
     return new Promise((resolve, reject) => {
       const form = new FormData()
       form.append('file', file)
+      // ★ 上传到某个视频目录（契约：`documents.collection_id` 可空 → 不传即"未归类"）
+      if (opts.collectionId) form.append('collection_id', opts.collectionId)
       const xhr = new XMLHttpRequest()
       xhr.open('POST', `${API_BASE}/documents`)
       xhr.upload.onprogress = (e) => {
@@ -143,6 +145,36 @@ export const api = {
       xhr.send(form)
     })
   },
+
+  // ---- ★ 视频目录（collections，backend-api 裁定：**独立表**，不是靠 documents 字段分组） ----
+  /**
+   * `GET /collections` —— 返回项带**派生** `published` 与**服务端计算**的 `can_manage`。
+   * ⚠️ 前端**不自己算权限**（服务端才是权威）；未实现时调用方要**如实显示"尚未实现"**。
+   */
+  collections: () => req<{ collections?: CollectionInfo[]; total?: number }>('/collections'),
+  /** `POST /collections`（教师建目录） */
+  createCollection: (body: { name: string; description?: string; visibility?: string }) =>
+    req<{ collection?: CollectionInfo }>('/collections', undefined,
+      { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }),
+  /** `PATCH /collections/:id` */
+  patchCollection: (id: string, body: Record<string, unknown>) =>
+    req<{ collection?: CollectionInfo }>(`/collections/${encodeURIComponent(id)}`, undefined,
+      { method: 'PATCH', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } }),
+  /** `DELETE /collections/:id` */
+  deleteCollection: (id: string) =>
+    req<{ ok?: boolean }>(`/collections/${encodeURIComponent(id)}`, undefined, { method: 'DELETE' }),
+  /** `GET /collections/:id/videos` —— 视频项带 `parse_state` / `parse_reason` / `ai_parse` */
+  collectionVideos: (id: string) =>
+    req<{ videos?: VideoListItem[]; documents?: VideoListItem[]; total?: number }>(
+      `/collections/${encodeURIComponent(id)}/videos`),
+  /**
+   * ★ 触发视频 AI 解析（`POST /tasks {kind:'video_parse', doc_id}`）。
+   *   契约要求：**先展示代价再执行** —— `ai_parse.cost_note` + `estimated_llm_calls` 由列表项给出。
+   */
+  startVideoParse: (docId: string) =>
+    req<{ task_id?: string; id?: string; status?: string; queued?: boolean; reason?: string }>(
+      '/tasks', undefined,
+      { method: 'POST', body: JSON.stringify({ kind: 'video_parse', doc_id: docId }), headers: { 'Content-Type': 'application/json' } }),
 
   // ---- §5.3 卡片与交叉引用 ----
   card: (id: string) => req<CardDetail>(`/cards/${encodeURIComponent(id)}`),
@@ -264,6 +296,59 @@ export const api = {
    *   · `?assistant=chat|video` —— **系统提示词**（video 带视频助手提示词 + 渲染契约）
    * 非法值 → 后端 `E_BADREQUEST` + close(1008)，**不静默降级**。
    */
+  /**
+   * ★ **登记会话**（服务端 hint 要求的第一步：「先 POST /api/v1/conversations 取得 id，再用该 id 连接」）。
+   *   `POST /conversations {doc_id?, title?}` → 201 `{conversation:{id,…}}`
+   *   ⚠️ 若后端将来改成"只接受已登记 id"（方案 A），前端**必须先调这个**，否则谁都连不上。
+   */
+  createConversation: async (opts: { doc_id?: string; title?: string } = {}):
+  Promise<{ id: string; title?: string; created_at?: number }> => {
+    const r = await req<{ conversation?: { id?: string; title?: string; created_at?: number } }>(
+      '/conversations', undefined, { method: 'POST', body: JSON.stringify(opts), headers: { 'Content-Type': 'application/json' } })
+    const id = String(r.conversation?.id || '')
+    if (!id) throw new Error('POST /conversations 未返回 conversation.id')
+    return { id, title: r.conversation?.title, created_at: r.conversation?.created_at }
+  },
+
+  /** `GET /conversations`（rbac.ts 已存在）→ 归一成会话列表项 */
+  conversations: async (): Promise<{ sessions: Array<{ id: string; title?: string; updated_at?: number }> }> => {
+    const r = await req<{ conversations?: Array<{ id: string; title?: string; created_at?: number }> }>('/conversations')
+    return {
+      sessions: (r.conversations || []).map((c) => ({ id: String(c.id), title: c.title, updated_at: c.created_at })),
+    }
+  },
+
+  /**
+   * ★ 会话列表（Lead：**接后端，别在前端存第二套真相源**）。
+   *   `backend-api` 在做 `GET /api/v1/chat/sessions`（只返回当前用户的）。
+   *   ⚠️ 后端**尚未实现**时会 404 → 调用方必须**如实显示"暂不可用"**，不许假装有历史。
+   */
+  /**
+   * ★ 触发抽取（`POST /documents/:id/extract`，backend-api 已存在该路由）。
+   *   返回 `{taskId}`；**是否入队由后端闸门决定**（正文空/LLM 不可用/单元数超阈值 → needs_confirm）。
+   */
+  /**
+   * ★ 重新解析（`POST /documents/:id/reparse`，backend-api 已交付并验过）——
+   *   202 → `{document_id, task_id, status:'queued', events_url, needs_ocr, est_minutes:[lo,hi], cost_note}`
+   *   ⚠️ 409 = `E_BUSY`（正在运行，未重复入队）；403/404 如实上报（调用方不许静默）。
+   */
+  reparseDocument: async (id: string): Promise<{
+    document_id?: string; task_id?: string; status?: string; events_url?: string
+    needs_ocr?: boolean; est_minutes?: [number, number]; cost_note?: string
+  }> => {
+    return req(`/documents/${encodeURIComponent(id)}/reparse`, undefined, { method: 'POST' })
+  },
+
+  extractDocument: async (id: string): Promise<{ taskId?: string; queued?: boolean; reason?: string }> => {
+    return req<{ taskId?: string; queued?: boolean; reason?: string }>(
+      `/documents/${encodeURIComponent(id)}/extract`, undefined, { method: 'POST' })
+  },
+
+  chatSessions: async (): Promise<{ sessions: Array<{ id: string; title?: string; updated_at?: number; message_count?: number }> }> => {
+    const r = await req<{ sessions?: Array<{ id: string; title?: string; updated_at?: number; message_count?: number }> }>('/chat/sessions')
+    return { sessions: r.sessions || [] }
+  },
+
   chatWsUrl: (sessionId: string, mode?: 'chat' | 'agent', assistant?: 'chat' | 'video') => {
     const qs = [mode ? `mode=${mode}` : '', assistant ? `assistant=${assistant}` : ''].filter(Boolean)
     const q = qs.length ? `?${qs.join('&')}` : ''

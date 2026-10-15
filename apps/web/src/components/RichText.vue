@@ -45,11 +45,14 @@ async function copy(code: string) {
 <template>
   <div class="rich" data-testid="rich-text"
        :data-blocks="st.blocks" :data-code="st.code" :data-unclosed="st.unclosed"
-       :data-math="st.math" :data-math-fail="st.mathFail">
+       :data-math="st.math" :data-math-fail="st.mathFail"
+       :data-headings="st.headings" :data-h2="st.h2" :data-table="st.table" :data-strong="st.strong"
+       :data-list="st.list" :data-quote="st.quote" :data-link="st.link">
     <template v-for="(b, i) in blocks" :key="i">
       <!-- 代码块：语言标签 + 复制 + 长代码折叠 + **未闭合如实标注** -->
       <div v-if="b.kind === 'code'" class="code-block" data-testid="code-block"
-           :data-lang="b.lang || ''" :data-unclosed="b.unclosed ? '1' : '0'">
+           :data-lang="b.lang || ''" :data-unclosed="b.unclosed ? '1' : '0'"
+           :data-hl="codeHtml[i].hl ? '1' : '0'">
         <div class="code-head">
           <span class="pill" :class="b.lang ? (codeHtml[i].hl ? 'blue' : 'warn') : 'warn'" data-testid="code-lang"
                 :data-hl="codeHtml[i].hl ? '1' : '0'">{{ b.lang || '未标语言' }}</span>
@@ -76,11 +79,36 @@ async function copy(code: string) {
     </template>
     <div v-if="stats" class="small faint" data-testid="rich-stats">
       块 {{ st.blocks }} · 代码 {{ st.code }}（未闭合 {{ st.unclosed }}）· 公式 {{ st.math }}（失败 {{ st.mathFail }}）
+      · 标题 {{ st.headings }} · 表格 {{ st.table }} · 粗体 {{ st.strong }} · 列表 {{ st.list }}
     </div>
   </div>
 </template>
 
 <style scoped>
+/* ★ 基础 markdown 样式（**全部走设计 token**，不用浏览器默认样式）
+   用户实测反馈：标题/表格/粗体/列表都没渲染 → 现在既有标签也有样式 */
+.rich-html :deep(.md-h1), .rich-html :deep(.md-h2) { font-family: var(--serif); font-weight: 700; margin: 10px 0 4px; }
+.rich-html :deep(.md-h1) { font-size: 18px; }
+.rich-html :deep(.md-h2) { font-size: 16px; border-bottom: var(--hair) solid var(--rule); padding-bottom: 2px; }
+.rich-html :deep(.md-h3) { font-size: 14.5px; font-weight: 700; margin: 8px 0 3px; }
+.rich-html :deep(.md-h4), .rich-html :deep(.md-h5), .rich-html :deep(.md-h6) { font-size: 13.5px; font-weight: 700; margin: 6px 0 2px; }
+.rich-html :deep(.md-p) { margin: 4px 0; }
+.rich-html :deep(.md-hr) { border: 0; border-top: var(--hair) solid var(--rule-strong); margin: 10px 0; }
+.rich-html :deep(.md-list) { margin: 4px 0 4px 18px; padding: 0; }
+.rich-html :deep(.md-list li) { margin: 2px 0; }
+.rich-html :deep(.md-list li.md-li-2) { margin-left: 14px; list-style-type: circle; }
+.rich-html :deep(.md-quote) { margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--accent);
+  background: var(--paper-2); color: var(--ink-2); }
+.rich-html :deep(.md-code) { font-family: var(--mono); font-size: 12.5px; background: var(--paper-2);
+  border: var(--hair) solid var(--rule); padding: 0 3px; }
+.rich-html :deep(.md-a) { color: var(--accent); text-decoration: underline; }
+/* 表格：边框/表头底色都用 token（不要浏览器默认样式） */
+.rich-html :deep(.md-table) { border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 13px; }
+.rich-html :deep(.md-table th) { background: var(--paper-2); font-weight: 700; text-align: left;
+  border: var(--hair) solid var(--rule-strong); padding: 4px 8px; }
+.rich-html :deep(.md-table td) { border: var(--hair) solid var(--rule); padding: 4px 8px; vertical-align: top; }
+.rich-html :deep(.md-table tbody tr:nth-child(even)) { background: color-mix(in srgb, var(--paper-2) 55%, transparent); }
+
 /* ★ 高亮配色**走设计 token**（不引入 highlight.js 自带主题 —— v1 的教训就是"自带一套配色"）
    只覆盖我们需要的少量 token：关键字/字符串/注释/数字/内置/属性 */
 .code :deep(.hljs-keyword), .code :deep(.hljs-selector-tag), .code :deep(.hljs-literal) { color: var(--accent); font-weight: 600; }

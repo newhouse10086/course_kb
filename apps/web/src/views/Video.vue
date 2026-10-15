@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 /**
  * Video —— 视频课堂（F6）
  *   · 播放器 + **字幕同步**（点字幕跳 currentTime；timeupdate 驱动高亮）
@@ -16,18 +16,20 @@
 import RichText from '../components/RichText.vue'
 import { setAssistantContext } from '../composables/useAssistantContext'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api, listOf } from '../api/client'
 import { TaskStream, type TaskTransport } from '../api/sse'
 import { useCaps } from '../composables/useCaps'
 import { useDocuments } from '../composables/useCorpus'
 import MindMap from '../components/MindMap.vue'
 import VirtualList from '../components/VirtualList.vue'
+import type { CollectionInfo, VideoListItem } from '../api/types'
 import { fmtMs } from '../utils/text'
 import { queryFlag, queryValue, testBarrier, testBarrierDone, writeReport } from '../utils/report'
 import type { TranscriptChapter, VideoArtifact, VideoSegment, VideoSlide } from '../api/types'
 
 const route = useRoute()
+const router = useRouter()
 const { caps } = useCaps()
 const docsApi = useDocuments()
 
@@ -52,6 +54,157 @@ const taskState = ref<{ id: string; progress: number | null; text: string; done:
   id: '', progress: null, text: '', done: '', transport: '',
 })
 const fatal = ref('')
+
+/* ═══ ★ 视频目录（collections 契约，backend-api 裁定：**独立表**） ═══ */
+const collections = ref<CollectionInfo[]>([])
+const collectionsNote = ref('')          // 后端未实现/失败时**如实说明**
+const collectionsLoading = ref(false)
+const activeCollection = ref<string>('') // '' = 全部视频
+const newCollectionName = ref('')
+const collectionBusy = ref(false)
+const collectionVideos = ref<VideoListItem[]>([])
+const videosNote = ref('')
+const uploadFrac = ref(0)
+const uploadNote = ref('')
+const uploadKind = ref<'ok' | 'warn' | 'bad'>('ok')
+const aiParseBusy = ref('')
+const aiParseNote = ref<Record<string, string>>({})
+const videoFileInput = ref<HTMLInputElement | null>(null)
+
+/** 当前目录（含服务端算好的 `can_manage`） */
+const activeCollectionInfo = computed(() => collections.value.find((x: CollectionInfo) => x.id === activeCollection.value) || null)
+/**
+ * ★ 权限用**服务端计算**的 `can_manage` —— 前端不自己推断（坑 21 同族：自述 ≠ 生效）。
+ * ⚠️ 判据是"**有没有任何一个目录归我管**"，不是"当前选中那个"：
+ *   刚进页面时选中的是"全部视频"（没有 collection 对象）→ 若只看选中项，教师会**看不到建目录入口**
+ *   （实测踩到：`collection-teacher-ops` 不渲染）。上传仍要求**先选目录**（按钮自身 gate）。
+ */
+const canManage = computed(() => collections.value.some((x: CollectionInfo) => x.can_manage === true))
+
+async function loadCollections() {
+  collectionsLoading.value = true
+  collectionsNote.value = ''
+  try {
+    const r = await api.collections()
+    collections.value = r.collections || []
+    if (!collections.value.length) collectionsNote.value = '还没有视频目录（教师可新建）'
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    // ★ 未实现就如实说，**不画假目录**
+    collectionsNote.value = (err.status === 404 || err.code === 'E_NOTFOUND')
+      ? '后端尚未实现视频目录（GET /collections 404）—— 如实说明，不假装有目录'
+      : `读取视频目录失败：${err.message || e}`
+    collections.value = []
+  } finally {
+    collectionsLoading.value = false
+  }
+}
+
+async function loadCollectionVideos() {
+  videosNote.value = ''
+  if (!activeCollection.value) { collectionVideos.value = []; return }
+  try {
+    const r = await api.collectionVideos(activeCollection.value)
+    collectionVideos.value = r.videos || r.documents || []
+    if (!collectionVideos.value.length) videosNote.value = '这个目录里还没有视频'
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    collectionVideos.value = []
+    videosNote.value = (err.status === 404 || err.code === 'E_NOTFOUND')
+      ? '后端尚未实现该目录的视频列表（GET /collections/:id/videos 404）'
+      : `读取目录视频失败：${err.message || e}`
+  }
+}
+
+async function pickCollection(id: string) {
+  activeCollection.value = id
+  await loadCollectionVideos()
+}
+
+async function createCollection() {
+  const name = newCollectionName.value.trim()
+  if (!name) { collectionsNote.value = '目录名不能为空（本地拦截，不发请求）'; return }
+  collectionBusy.value = true
+  try {
+    const r = await api.createCollection({ name })
+    newCollectionName.value = ''
+    await loadCollections()
+    const id = r.collection?.id
+    if (id) await pickCollection(id)
+    collectionsNote.value = `已创建目录：${name}`
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    collectionsNote.value = (err.status === 403) ? '无权创建目录（403）—— 只有教师/管理员可以'
+      : (err.status === 404 || err.code === 'E_NOTFOUND') ? '后端尚未实现创建目录（POST /collections 404）'
+        : `创建目录失败：${err.message || e}`
+  } finally {
+    collectionBusy.value = false
+  }
+}
+
+/** 上传视频到**当前选中的目录**（教师） */
+async function uploadToCollection(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!activeCollection.value) { uploadKind.value = 'warn'; uploadNote.value = '请先选择（或新建）一个目录再上传'; input.value = ''; return }
+  uploadFrac.value = 0
+  uploadNote.value = `上传中：${file.name}`
+  uploadKind.value = 'ok'
+  try {
+    const r = await api.uploadDocument(file, (f) => { uploadFrac.value = f }, { collectionId: activeCollection.value })
+    // ⚠️ 字段名是 `document_id`（`UploadAccepted`），不是 `doc_id` —— 我第一版写错了
+    uploadNote.value = `已上传 ${file.name}${r.document_id ? `（${r.document_id}）` : ''} —— 解析状态见列表`
+    await loadCollectionVideos()
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    uploadKind.value = 'bad'
+    uploadNote.value = (err.status === 403) ? '无上传权限（403）'
+      : (err.status === 413) ? '文件太大（413）'
+        : `上传失败：${err.message || e}`
+  } finally {
+    uploadFrac.value = 0
+    input.value = ''
+  }
+}
+
+/** ★ AI 解析：**先展示代价再执行**（`cost_note` + `estimated_llm_calls` 由服务端给） */
+function aiParseCost(v: VideoListItem): string {
+  const a = v.ai_parse || {}
+  const parts: string[] = []
+  if (a.estimated_llm_calls != null) parts.push(`预计 ${a.estimated_llm_calls} 次调用`)
+  if (a.cost_note) parts.push(a.cost_note)
+  return parts.join(' · ') || '（后端未给代价说明 —— 不编数字）'
+}
+
+async function startAiParse(v: VideoListItem) {
+  const a = v.ai_parse || {}
+  if (a.available !== true) {
+    // ★ 不可用 → **不发请求**，逐字显示原因
+    aiParseNote.value = { ...aiParseNote.value, [v.id]: `不可用：${a.reason || '后端未说明原因'}` }
+    return
+  }
+  aiParseBusy.value = v.id
+  try {
+    const r = await api.startVideoParse(v.id)
+    aiParseNote.value = {
+      ...aiParseNote.value,
+      [v.id]: r.queued === false ? `未入队：${r.reason || '后端闸门拒绝（原因未给）'}`
+        : `已提交 AI 解析${r.task_id ? `（${r.task_id}）` : ''} —— 会消耗 LLM 额度`,
+    }
+    await loadCollectionVideos()
+  } catch (e) {
+    const err = e as { status?: number; code?: string; message?: string }
+    aiParseNote.value = {
+      ...aiParseNote.value,
+      [v.id]: (err.status === 404 || err.code === 'E_NOTFOUND') ? '后端尚未实现（POST /tasks 404）'
+        : (err.status === 409 || err.code === 'E_BUSY') ? '正在解析中，未重复入队（409）'
+          : `提交失败：${err.message || e}`,
+    }
+  } finally {
+    aiParseBusy.value = ''
+  }
+}
 const seekLog = ref<Array<{ ms: number; how: string; media_ms: number | null }>>([])
 const player = ref<HTMLVideoElement | null>(null)
 const listRef = ref<InstanceType<typeof VirtualList> | null>(null)
@@ -248,6 +401,8 @@ const tasks: TaskStream[] = []
 async function boot() {
   testBarrier()
   try {
+    // ★ 视频目录（collections）：与文档加载并行，失败**如实显示**（不阻塞播放）
+    void loadCollections()
     const list = await docsApi.load()
     const withVideo = list.filter((d) => d.kind === 'video')
     const chosen = withVideo[0] || list.find((d) => d.id === route.query.doc) || list[0]
@@ -287,6 +442,15 @@ async function boot() {
   } finally {
     await testBarrierDone()
   }
+}
+
+/**
+ * 从目录里点「播放」：切到该视频（走既有加载路径）。
+ * ⚠️ 只改 `route.query.doc` 不会触发重新加载（组件已挂载）→ **显式重跑 boot**。
+ */
+async function openVideoById(id: string) {
+  await router.replace({ query: { ...route.query, doc: id } })
+  await boot()
 }
 
 onBeforeUnmount(() => tasks.forEach((t) => t.stop()))
@@ -490,6 +654,94 @@ async function runSelftest() {
         <button type="button" @click="autoFollow = !autoFollow">自动跟随：{{ autoFollow ? '开' : '关' }}</button>
       </div>
 
+
+      <!-- ═══ ★ 视频目录（collections）：教师建目录/上传；学生选目录 → 播放 → 可选 AI 解析 ═══ -->
+      <div class="panel v-collections" data-testid="collections" :data-count="collections.length"
+           :data-note="collectionsNote">
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+          <b>视频目录</b>
+          <span class="small faint">{{ collectionsLoading ? '读取中…' : `${collections.length} 个` }}</span>
+          <span class="right" />
+          <button type="button" class="small" data-testid="collections-refresh" @click="loadCollections()">刷新</button>
+        </div>
+
+        <!-- ★ 后端未实现/失败 → **如实说明**（不画假目录、不假装有） -->
+        <div v-if="collectionsNote" class="note warn small" data-testid="collections-note">{{ collectionsNote }}</div>
+
+        <ul class="coll-list">
+          <li>
+            <button type="button" class="coll-item" :class="{ on: activeCollection === '' }"
+                    data-testid="collection-all" data-id="" @click="pickCollection('')">全部视频</button>
+          </li>
+          <li v-for="c0 in collections" :key="c0.id">
+            <button type="button" class="coll-item" :class="{ on: activeCollection === c0.id }"
+                    data-testid="collection-item" :data-id="c0.id"
+                    :data-can-manage="c0.can_manage ? '1' : '0'" :data-published="c0.published ? '1' : '0'"
+                    :data-video-count="c0.video_count ?? ''" @click="pickCollection(c0.id)">
+              <span class="t">{{ c0.name }}</span>
+              <span class="small faint">
+                {{ c0.video_count != null ? `${c0.video_count} 个视频` : '' }}
+                {{ c0.published ? '· 已发布' : '· 未发布' }}
+                {{ c0.can_manage ? '· 可管理' : '' }}
+              </span>
+            </button>
+          </li>
+        </ul>
+
+        <!-- 教师：建目录 + 上传到当前目录（权限用**服务端算的 can_manage**） -->
+        <div v-if="canManage" class="coll-ops" data-testid="collection-teacher-ops">
+          <div class="row">
+            <input v-model="newCollectionName" data-testid="collection-name" placeholder="新目录名（如：第 5 讲 索引）"
+                   @keydown.enter="createCollection()" />
+            <button type="button" class="primary small" data-testid="collection-create" :disabled="collectionBusy"
+                    @click="createCollection()">新建目录</button>
+          </div>
+          <div class="row">
+            <input ref="videoFileInput" type="file" accept="video/*" data-testid="collection-file" style="display: none"
+                   @change="uploadToCollection" />
+            <button type="button" class="small" data-testid="collection-upload"
+                    :disabled="!activeCollection" @click="videoFileInput?.click()">上传视频到该目录</button>
+            <span class="small faint">{{ activeCollection ? '' : '（先选一个目录）' }}</span>
+          </div>
+          <div v-if="uploadFrac > 0" class="bar"><i :style="{ width: Math.round(uploadFrac * 100) + '%' }" /></div>
+          <div v-if="uploadNote" class="small" :class="uploadKind === 'bad' ? 'warn-text' : 'faint'"
+               data-testid="collection-upload-note">{{ uploadNote }}</div>
+        </div>
+        <div v-else-if="activeCollection" class="small faint" data-testid="collection-student-note">
+          学生视图：可选择目录并播放；上传/新建目录仅教师可用（服务端 can_manage=false）
+        </div>
+
+        <!-- 目录内视频：解析状态 + ★ AI 解析（先展示代价再执行） -->
+        <div v-if="activeCollection" class="coll-videos" data-testid="collection-videos"
+             :data-count="collectionVideos.length">
+          <div v-if="videosNote" class="small faint" data-testid="collection-videos-note">{{ videosNote }}</div>
+          <div v-for="v in collectionVideos" :key="v.id" class="coll-video" data-testid="collection-video"
+               :data-id="v.id" :data-parse-state="v.parse_state || ''"
+               :data-ai-available="v.ai_parse?.available ? '1' : '0'">
+            <div class="row">
+              <b class="small">{{ v.title || v.id }}</b>
+              <span class="pill" :class="v.parse_state === 'done' ? 'ok' : v.parse_state === 'failed' ? 'bad' : v.parse_state === 'running' ? 'orange' : 'faint'"
+                    data-testid="parse-state">{{ v.parse_state || 'none' }}</span>
+              <span v-if="v.parse_reason" class="small faint" data-testid="parse-reason">{{ v.parse_reason }}</span>
+              <span class="right" />
+              <button type="button" class="small" data-testid="btn-play"
+                      @click="openVideoById(v.id)">播放</button>
+              <button type="button" class="small" data-testid="btn-ai-parse"
+                      :disabled="v.ai_parse?.available !== true || aiParseBusy === v.id"
+                      :data-gate-reason="v.ai_parse?.available === true ? '' : (v.ai_parse?.reason || '后端未说明原因')"
+                      :title="v.ai_parse?.available === true ? '' : `不可用：${v.ai_parse?.reason || '后端未说明原因'}`"
+                      @click="startAiParse(v)">AI 解析</button>
+            </div>
+            <!-- ★ 代价**先展示再执行**（次数 + 说明；后端没给就明说"不编数字"） -->
+            <div class="small faint" data-testid="ai-parse-cost">{{ aiParseCost(v) }}</div>
+            <div v-if="v.ai_parse?.available !== true" class="small warn-text" data-testid="ai-parse-reason">
+              不可用：{{ v.ai_parse?.reason || '后端未说明原因' }}
+            </div>
+            <div v-if="aiParseNote[v.id]" class="small faint" data-testid="ai-parse-note">{{ aiParseNote[v.id] }}</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 重跑入口：能力门控（ASR 不可用 → disabled + 原因；点击也不会提交） -->
       <div class="v-toolbar">
         <button
@@ -653,6 +905,20 @@ async function runSelftest() {
 </template>
 
 <style scoped>
+/* ★ 视频目录（collections） */
+.v-collections { padding: 10px 12px; }
+.coll-list { list-style: none; margin: 6px 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.coll-item { border: var(--hair) solid var(--rule-strong); background: var(--panel); padding: 3px 10px;
+  cursor: pointer; color: var(--ink); border-radius: var(--r-sm); }
+.coll-item.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); font-weight: 600; }
+.coll-item .t { display: block; font-size: 13px; }
+.coll-ops { margin-top: 6px; padding-top: 6px; border-top: var(--hair) dotted var(--rule); }
+.coll-ops .row { display: flex; gap: 6px; align-items: center; margin: 4px 0; flex-wrap: wrap; }
+.coll-ops input[type="text"], .coll-ops input:not([type]) { border: var(--hair) solid var(--rule-strong);
+  padding: 3px 8px; font-size: 13px; background: var(--panel); color: var(--ink); min-width: 220px; }
+.coll-videos { margin-top: 8px; padding-top: 6px; border-top: var(--hair) dotted var(--rule); }
+.coll-video { padding: 5px 0; border-bottom: var(--hair) dotted var(--rule); }
+.coll-video .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .v-layout { display: flex; gap: 18px; padding: 14px 22px 40px; align-items: flex-start; }
 .v-left { flex: 1 1 58%; min-width: 0; position: sticky; top: calc(var(--topbar-h) + 12px); }
 .v-right { flex: 1 1 42%; min-width: 0; }

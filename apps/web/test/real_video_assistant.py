@@ -33,10 +33,23 @@ REPO = WEB.parent.parent          # course-kb/
 sys.path.insert(0, str(HERE))
 from cdp import Chrome, find_chrome  # noqa: E402
 
+try:
+    sys.stdout.reconfigure(encoding='utf-8')   # ⚠️ Windows 控制台默认 GBK：中文/emoji 会 UnicodeEncodeError
+except Exception:
+    pass
+
+PROTECTED_PORTS = {8787, 5173, 8799}
+ALLOW_KILL: set[int] = set()
 PORT = 8801   # ⚠️ 8799 已被别人的实例占用（node src/index.ts, 14:38 启动）→ 用 8801，不动别人的
 for i, a in enumerate(sys.argv):
     if a == '--port' and i + 1 < len(sys.argv):
         PORT = int(sys.argv[i + 1])
+        if PORT in PROTECTED_PORTS:
+            print(f'拒绝在受保护端口 {PORT} 上起隔离实例（后端/前端/别人的实例）—— 换一个端口')
+            raise SystemExit(2)
+    # ★ 显式越权开关：默认**不许**清理受保护端口（8787/5173/8799）
+    if a == '--allow-kill' and i + 1 < len(sys.argv):
+        ALLOW_KILL.add(int(sys.argv[i + 1]))
 WANT_MODEL = 'deepseek-v4.1-flash'
 CHEAP_FALLBACKS_OK = ('deepseek', 'glm')     # 兜底链里**不许**出现 kimi
 QUESTION = '请用一段话讲清楚 B+ 树节点分裂的代价，带一个公式和一段 SQL 示例。'
@@ -46,19 +59,56 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ★★ 端口保护（协作事故后的硬规则，2026-10-15）
+#   8787 = 后端（用户在跑）· 5173 = 前端（Vite dev，用户在跑）· 8799 = 别人的隔离实例
+#   → **任何测试都不许杀这三个端口上的进程**。要杀必须显式 `--allow-kill <port>`。
+#   ⚠️ 事故背景：某个测试"收尾按端口补杀"时把 **8787 后端**也杀了（Lead 的后端 exit 1）。
+#      本函数原来只按"谁在这个端口就杀谁" —— 只要端口参数被写错，就会误杀别人的服务。
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 def kill_port_owner(port: int) -> None:
-    """杀掉仍监听该端口的进程（`npm start` 的 terminate 杀不掉 node 子进程 —— 实测）"""
+    """杀掉仍监听该端口的进程（`npm start` 的 terminate 杀不掉 node 子进程 —— 实测）。
+
+    ★ 两道保护（缺一不可）：
+      ① **端口白名单**：8787/5173/8799 直接拒绝（除非显式 `--allow-kill`）
+      ② **PID 归属核对**：只杀"**本脚本自己启动的**" PID（不是"谁在端口上就杀谁"）
+    """
+    if port in PROTECTED_PORTS and port not in ALLOW_KILL:
+        log(f'拒绝按端口清理 {port}：这是**受保护端口**（后端/前端/别人的实例）—— '
+            f'如确需清理请显式 --allow-kill {port}')
+        return
     try:
         out = subprocess.run(['powershell', '-NoProfile', '-Command',
                               f'(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue'
                               f' | Select-Object -First 1).OwningProcess'],
                              capture_output=True, text=True, timeout=30)
         pid = (out.stdout or '').strip()
-        if pid.isdigit():
-            subprocess.run(['powershell', '-NoProfile', '-Command', f'Stop-Process -Id {pid} -Force'], timeout=30)
-            log(f'收尾：按端口杀掉残留实例 PID={pid}')
+        if not pid.isdigit():
+            return
+        # ★ 归属核对（**fail-closed**）：只清理本脚本启动过的 PID。
+        #   ⚠️ 我第一版写成 `if STARTED_PIDS and pid not in STARTED_PIDS` —— 集合为空时**fail-open**
+        #      （"没登记过任何 PID"反而会去杀端口上的任意进程）→ 改成"没登记就一律不杀"。
+        if not STARTED_PIDS or int(pid) not in STARTED_PIDS:
+            log(f'拒绝清理端口 {port} 上的 PID={pid}：**不是本脚本启动的**（端口归属不符）')
+            return
+        subprocess.run(['powershell', '-NoProfile', '-Command', f'Stop-Process -Id {pid} -Force'], timeout=30)
+        log(f'收尾：按端口杀掉**本脚本启动的**残留实例 PID={pid}')
     except Exception as e:
         log(f'收尾清理失败（不致命）：{e}')
+
+
+# 本脚本启动过的 PID（收尾只允许清理这些）—— 起实例后立刻登记
+STARTED_PIDS: set[int] = set()
+
+
+def remember_pid(p: "subprocess.Popen[bytes] | subprocess.Popen[str]") -> None:
+    """登记本脚本启动的进程 PID（`npm start` 会包一层，所以还要按端口核对归属）"""
+    try:
+        STARTED_PIDS.add(int(p.pid))
+    except Exception:
+        pass
 
 
 def check_settings(path: Path) -> tuple[bool, str]:
@@ -116,6 +166,7 @@ def main() -> int:
     log('create-admin：' + (' / '.join(tail[-3:]) if tail else f'exit={ca.returncode}'))
     server = subprocess.Popen(['npm', 'start'], cwd=str(REPO / 'apps' / 'server'), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
+    remember_pid(server)   # ★ 登记：收尾只允许清理**本脚本启动过的** PID（不是"谁在端口上就杀谁"）
     proxy = None
     calls = 0
     try:
@@ -136,6 +187,7 @@ def main() -> int:
         proxy = subprocess.Popen(['node', str(HERE / 'mock-server.mjs'), '--proxy', f'http://127.0.0.1:{PORT}',
                                   '--port-file', str(pf)], cwd=str(WEB),
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        remember_pid(proxy)
         for _ in range(200):
             if pf.exists():
                 break

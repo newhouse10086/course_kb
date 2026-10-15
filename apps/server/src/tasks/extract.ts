@@ -40,6 +40,8 @@ export interface CompleteJsonResult {
   usedProvider?: string;
   degradedFrom?: string;
   degradedReason?: string;
+  /** ★ 实测的结构化输出模式（provider 降级链的回执；上游写进 meta） */
+  structuredOutputMode?: 'strict' | 'lenient';
 }
 
 export type CompleteJsonFn = (req: CompleteJsonRequest) => Promise<CompleteJsonResult>;
@@ -99,6 +101,12 @@ export interface ExtractDocumentResult {
   usedProvider?: string;
   degradedFrom?: string;
   degradedReason?: string;
+  /**
+   * ★ **实测**的结构化输出模式（来自 provider 降级链的回执）：
+   * `'strict'` = 端点接受严格 schema；`'lenient'` = 端点拒绝 → 已回落裸 schema。
+   * 上游写进 `meta.structured_output_mode`（可观测：网关恢复/退化看得见）。
+   */
+  structuredOutputMode?: 'strict' | 'lenient';
   stats: {
     /** worker pick 出来的 item 数（全量 PDF 实测 1905，不是单元数 2523） */
     items: number;
@@ -110,6 +118,12 @@ export interface ExtractDocumentResult {
     unitsDone: number;
     pick?: Record<string, unknown>;
     skippedUnits?: number;
+    /** ★ 真正发 LLM 的 item 数（= plan items − 空正文跳过） */
+    itemsRunnable?: number;
+    /** ★ 因**正文为空**跳过 LLM 的单元数（单元保留在层级树里，未删除） */
+    itemsSkippedEmpty?: number;
+    /** ★ 被跳过的单元 id 列表（如实上报，便于排查"为什么这篇没出卡片"） */
+    skippedEmptyUnitIds?: string[];
     errorMessages?: string[];
   };
 }
@@ -270,15 +284,87 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
         };
       }
 
+      // ═══════════════════════════════════════════════════════════════════
+      // ★★ (a) **单元级**空正文闸门（文档级 text_gate **抓不到**"个别单元为空"）
+      //
+      // 真实缺陷（Lead 真库实测 doc_ec5a4ce88038，328 字符 markdown）：
+      //   第一次 parse → cards=3；★ **reparse → cards=0**（越修越糟）。
+      // 根因链：markdown `# 数据库索引` **紧跟** `## 聚簇索引` → 顶层标题**没有自己的正文**
+      //   → `unit.text=''`（title 有值）→ 把**空正文**发给 LLM → 上游 **HTTP 400**
+      //   → extract_status="partial" → **整个抽取 0 卡片** → 上层全量替换 cards → 旧卡片被清。
+      // 全库规模：单元 2873 中**空正文 238（8%）**（扫描件 167 全空；434 页教材 69 空，集中在 L3 标题）。
+      //
+      // ★★ 关键：**单元不删** —— 空正文的标题单元是 **Wiki 层级树的骨架**，
+      //    这里只是"不发空正文给模型"，**不是**"删单元"。
+      // ★★ 不许静默跳过：跳过数 + 单元 id 走 `warnings`（`W_EMPTY_INPUT`）→
+      //    上层把它写进 `meta.extract_warnings`（handlers.ts 已有该通道），前端可如实显示。
+      // ═══════════════════════════════════════════════════════════════════
+      const textById = new Map<string, string>();
+      const textByOrd = new Map<number, string>();
+      const titleById = new Map<string, string>();
+      const titleByOrd = new Map<number, string>();
+      for (const u of req.units) {
+        textById.set(u.id, u.text ?? '');
+        textByOrd.set(u.ord, u.text ?? '');
+        titleById.set(u.id, u.title ?? '');
+        titleByOrd.set(u.ord, u.title ?? '');
+      }
+      const runnableItems: Record<string, unknown>[] = [];
+      const emptySkipped: { unitId: string; title: string; key: string; ord: number }[] = [];
+      for (const item of items) {
+        const it = item as Record<string, unknown>;
+        const key = asString(it.key) || asString(it.unit_key) || asString(it.unit_id);
+        const unitId = asString(it.unit_id) || key.split('#')[0] || '';
+        const ord = asNumber(it.unit_ord, Number.NaN);
+        const known = textById.has(unitId) || (Number.isFinite(ord) && textByOrd.has(ord));
+        const text = textById.get(unitId) ?? (Number.isFinite(ord) ? textByOrd.get(ord) : undefined) ?? '';
+        // ⚠️ 只有**能证明**正文为空时才跳过（known=false 时**放行**）——
+        //    否则"查不到正文"会变成"静默丢单元"，那是更坏的一类 bug。
+        if (known && text.trim() === '') {
+          emptySkipped.push({
+            unitId,
+            title: titleById.get(unitId) ?? (Number.isFinite(ord) ? titleByOrd.get(ord) : undefined) ?? '',
+            key,
+            ord: Number.isFinite(ord) ? ord : -1,
+          });
+          continue;
+        }
+        runnableItems.push(it);
+      }
+      const emptyWarnings = emptySkipped.map((s) => ({
+        code: 'W_EMPTY_INPUT',
+        unit_id: s.unitId,
+        title: s.title,
+        key: s.key,
+        skipped_units: emptySkipped.length,
+        unit_ids: emptySkipped.map((x) => x.unitId),
+        msg:
+          `该单元正文为空（标题单元通常没有自己的正文）→ **未调用 LLM**（不再产生 E_LLM: HTTP 400）；` +
+          `单元**保留**在层级树里（未删除）。本文档共 ${emptySkipped.length} 个空正文单元。`,
+      }));
+      if (runnableItems.length === 0) {
+        // 全空 → 不调 LLM（否则就是拿空正文去换 400）。**抛错**而不是"返回 0 卡片"：
+        // 返回 0 卡片会被上层全量替换 → **清掉旧卡片**（"越修越糟"）。抛错则上层不动产物。
+        // ⚠️ 码用 `E_BADREQUEST`（400，**封闭错误码集合**成员，见 `store/errors.ts`）：
+        //    "输入里没有任何可抽取的正文"属输入不合法，**不是**模型故障 ——
+        //    原先这里产生 `E_LLM: HTTP 400`，会被误读成"模型有问题"。
+        throw new ApiError('E_BADREQUEST', `全部 ${items.length} 个单元正文为空 → 未调用 LLM（单元保留）`, {
+          detail: `skipped_empty_units=${emptySkipped.length}; unit_ids=${emptySkipped.map((s) => s.unitId).join(',')}`,
+          hint: '文档级闸门（text_gate=empty_body）本应先挡住；若这是重跑，上次的卡片/图谱会**保留不动**',
+        });
+      }
+
       // ── ② 逐个 item 调 LLM（**并发 = 1**，契约 C1）───────────────────
       const payloads: { key: string; data: unknown }[] = [];
       const failureMessages: string[] = [];
       let usedProvider = '';
       let degradedFrom = '';
       let degradedReason = '';
+      /** ★ 实测的结构化输出模式（strict=端点接受严格 schema / lenient=回落裸 schema） */
+      let structuredOutputMode: 'strict' | 'lenient' | undefined;
 
-      for (let i = 0; i < items.length; i += 1) {
-        const item = items[i] as Record<string, unknown>;
+      for (let i = 0; i < runnableItems.length; i += 1) {
+        const item = runnableItems[i] as Record<string, unknown>;
         if (req.signal?.aborted) break;
         const key = asString(item.key) || asString(item.unit_key) || asString(item.unit_id);
         const system = asString(item.system);
@@ -305,27 +391,49 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
           });
           payloads.push({ key, data: res.data });
           if (res.usedProvider) usedProvider = res.usedProvider;
+          /**
+           * ★ 记录**实测**的结构化输出模式（strict / lenient）→ 写进 meta。
+           * 为什么要记：端点对严格 schema **时好时坏**（实测同一端点 200/400 都出现过），
+           * 记下来才能看见"网关恢复（strict 命中率上升）/退化（掉到 lenient）"——
+           * **可观测，不是猜的**（坑 21：抓了但没上报 = 等于没抓）。
+           */
+          if (res.structuredOutputMode) structuredOutputMode = res.structuredOutputMode;
           if (res.degradedFrom) {
             degradedFrom = res.degradedFrom;
             degradedReason = res.degradedReason ?? '';
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (failureMessages.length < 5) failureMessages.push(`item ${i + 1}(${key.slice(0, 40)}): ${msg}`);
+          /**
+           * ★ 把 provider 的 `detail` 一起留下 —— 它常含**模型原文**。
+           *
+           * 现场教训（Lead 报的卡点）：任务 error 只有 `E_LLM: amr 返回非 JSON`，
+           * **看不到模型到底返回了什么**（散文？markdown 包裹的 JSON？被截断的半截 JSON？）→ 排查只能靠猜。
+           * 而 provider **已经抓到了**原文：`providers/llm/openai_compatible.ts` 的
+           * `new ProviderError('E_LLM', '…返回非 JSON', '模型未遵守 json_schema', raw.slice(0, 500))`
+           * —— 第 4 个参数就是原文，**只是这里聚合失败信息时被丢掉了**。
+           * ⚠️ 截断 240 字符：够判断形态，又不让任务 detail 膨胀。
+           * ⚠️ 模型输出是外部文本 → 只进 `detail`（排查用），不进用户可见的 `msg`。
+           */
+          const detail = err instanceof Error ? String((err as { detail?: unknown }).detail ?? '') : '';
+          const rawHint = detail ? ` raw=${JSON.stringify(detail.slice(0, 240))}` : '';
+          if (failureMessages.length < 5) {
+            failureMessages.push(`item ${i + 1}(${key.slice(0, 40)}): ${msg}${rawHint}`);
+          }
         }
-        req.onProgress?.({ stage: 'extract', done: i + 1, total: items.length });
+        req.onProgress?.({ stage: 'extract', done: i + 1, total: runnableItems.length });
       }
 
       // ⚠️ 全部 LLM 调用失败 → **绝不能**继续走 convert 然后报"0 张卡片算成功"
       if (payloads.length === 0) {
-        throw new ApiError('E_LLM', `LLM 调用全部失败（${items.length} 个 item 无一成功）`, {
+        throw new ApiError('E_LLM', `LLM 调用全部失败（${runnableItems.length} 个 item 无一成功）`, {
           ...(failureMessages.length > 0 ? { detail: failureMessages.join(' | ') } : {}),
           hint: '检查 LLM 凭据/额度；或稍后重试（provider 层有降级链）',
         });
       }
 
       // ── ③ convert：worker 校验 + 转卡片/实体/边 ──────────────────────
-      req.onProgress?.({ stage: 'convert', done: payloads.length, total: items.length });
+      req.onProgress?.({ stage: 'convert', done: payloads.length, total: runnableItems.length });
       const convRun = await deps.runner.raw({
         job: 'extract.convert',
         input: {
@@ -412,6 +520,39 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
         .filter(Boolean)
         .slice(0, 5);
 
+      // ═══════════════════════════════════════════════════════════════════
+      // ★★ (b) **零卡片 + 有失败 → 抛错**，让上层**不覆盖**上次的卡片/图谱（方案 B）
+      //
+      // 为什么用 (B) 而不是事务性替换 (A)：(A) 要"新产物入临时区再原子替换"，
+      // 涉及 units/cards/entities/edges/xrefs **五张表 + 索引重建** —— 改面大、中途失败会留半套产物。
+      // (B) 直接消除用户损失、改动小；(A) 留作后续增强（"先用最小改动消除用户损失，高风险改动推后"）。
+      //
+      // 判据（**只看"是否真的产出可用结果"**，不看"接口返回 200"）：
+      //   · 有卡片 → 照常返回（partial 也是真进度，替换是对的）
+      //   · 0 卡片 **且** 有失败（LLM 失败 / convert 报错 / worker 自报 failed）→ 抛错 → 上层不动产物
+      //   · 0 卡片 **且无任何失败**（worker `done_empty`：内容确实没有知识点）→ 照常返回（替换是对的）
+      // ⚠️ 必须放在 `errorMessages` 之后（tsc 抓到的"used before declaration"）。
+      // ═══════════════════════════════════════════════════════════════════
+      const convErrorCount = asNumber(conv.error_count, 0);
+      const workerStatusNow = asString(conv.status);
+      const llmFailCount = runnableItems.length - payloads.length;
+      const looksFailed =
+        failureMessages.length > 0 || convErrorCount > 0 || workerStatusNow === 'failed' || conv.ok === false;
+      if (cards.length === 0 && looksFailed) {
+        const reason =
+          [...failureMessages, ...errorMessages].join(' | ') || `worker status=${workerStatusNow || 'unknown'}`;
+        throw new ApiError(
+          failureMessages.length > 0 ? 'E_LLM' : 'E_LLM_SCHEMA',
+          `抽取未产出任何卡片（${reason.slice(0, 200)}）→ **不覆盖**上次抽取结果`,
+          {
+            detail:
+              `worker_status=${workerStatusNow || 'unknown'}; error_count=${convErrorCount}; ` +
+              `llm_failures=${llmFailCount}; items=${runnableItems.length}; skipped_empty=${emptySkipped.length}`,
+            hint: '上次的卡片/图谱保持不动（避免"重跑失败反而清空"）；修好后可再跑一次',
+          },
+        );
+      }
+
       return {
         cards,
         entities,
@@ -419,13 +560,24 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
         sections,
         // ★ 透传 worker 的批次状态与告警（`done_empty` 必须能被上层看见，不许当成功）
         ...(asString(conv.status) ? { status: asString(conv.status) } : {}),
-        ...(asArray(conv.warnings).length > 0 ? { warnings: asArray(conv.warnings) } : {}),
+        // ★ 空正文跳过（W_EMPTY_INPUT）与 worker 的告警（W_NO_CARDS 等）**都要带上**：
+        //   前者是"我们跳过了什么"（不许静默），后者是"模型为什么不产出"
+        ...(emptyWarnings.length > 0 || asArray(conv.warnings).length > 0
+          ? { warnings: [...emptyWarnings, ...asArray(conv.warnings)] }
+          : {}),
         ...(usedProvider ? { usedProvider } : {}),
         ...(degradedFrom ? { degradedFrom, degradedReason } : {}),
+        // ★ **实测**的结构化输出模式（strict / lenient）→ handler 写进 meta：
+        //   端点对严格 schema 时好时坏，记下来才看得见"网关恢复/退化"（可观测，不是猜的）。
+        ...(structuredOutputMode ? { structuredOutputMode } : {}),
         stats: {
           items: items.length,
+          // ★ 新增：真正发 LLM 的 item 数 / 空正文跳过数（+ id 列表）—— 判据要能对账
+          itemsRunnable: runnableItems.length,
+          itemsSkippedEmpty: emptySkipped.length,
+          skippedEmptyUnitIds: emptySkipped.map((s) => s.unitId),
           llmCalls: payloads.length,
-          llmFailures: items.length - payloads.length,
+          llmFailures: runnableItems.length - payloads.length,
           errorCount: asNumber(conv.error_count, 0),
           ok: conv.ok === true,
           unitsDone: asNumber(convStats.units_done, 0),

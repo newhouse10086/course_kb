@@ -14,6 +14,7 @@ import type { FastifyInstance } from 'fastify';
 import type { AppDeps, ChatConnectionLike } from '../app-deps.ts';
 import { redact } from '../config.ts';
 import { auditRenderFormat, type RenderAudit } from '../agent/prompts.ts';
+import { checkSessionOwner } from '../store/chat-session-owner.ts';
 import { safeJsonStringify } from '../tasks/bus.ts';
 
 interface WsLike {
@@ -133,6 +134,68 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
     const { sessionId } = req.params as { sessionId: string };
     // RBAC：WS 握手同样过 401 闸门 → 这里 req.user 必然存在（未登录根本连不上）
     const user = req.user;
+
+    /**
+     * ★★ **会话归属闸门（IDOR 修复）** —— 必须在**任何**会话读写之前。
+     *
+     * ## 缺陷（修复前）
+     * 这里只校验了"**已登录**"，**没有校验"这个 sessionId 属于你"**；而 pi 转录文件在共享目录
+     * `data/chat/` 按 `<ISO>_<sessionId>.jsonl` 找 ⟹ 用户 A 知道/猜到 B 的 sessionId
+     * 就能**读 B 的历史、以 B 的身份继续对话**（B 的知识库可见性、B 的笔记都会生效）。
+     *
+     * ## 规则（见 `store/chat-session-owner.ts`，fail-closed）
+     * 归属行（`conversations` 表）匹配 → 放行；不匹配 → 拒绝；
+     * **无归属行但有转录文件** → 拒绝（遗留会话归属不明，宁可失效也不跨用户放行）。
+     *
+     * ## 为什么拒绝理由只有一句
+     * "不存在"与"不属于你"**逐字相同** → 攻击者无法用"id 是否存在"枚举空间。
+     */
+    if (!user) {
+      // 理论上不可达（401 闸门在前）；真到了也**不许**放行
+      try {
+        socket.send(safeJsonStringify({ type: 'error', code: 'E_UNAUTHORIZED', msg: '未登录' }));
+        socket.close(1008, 'unauthorized');
+      } catch {
+        /* 已断开 */
+      }
+      return;
+    }
+    const ownerCheck = checkSessionOwner({
+      repo: deps.repo,
+      root: deps.cfg.root,
+      sessionId,
+      userId: user.id,
+    });
+    if (!ownerCheck.ok) {
+      try {
+        // ★ 只发**统一**理由（不区分"不存在"/"别人的"）
+        socket.send(
+          safeJsonStringify({
+            type: 'error',
+            code: 'E_FORBIDDEN',
+            msg: ownerCheck.reason,
+            hint: '聊天会话必须由你自己的账号创建：先 POST /api/v1/conversations 取得 id，再用该 id 连接。',
+          }),
+        );
+        socket.close(1008, 'session not owned');
+      } catch {
+        /* 已断开 */
+      }
+      return;
+    }
+    if (ownerCheck.created) {
+      // 首次连接 → 建立归属（审计留痕：谁认领了哪个会话）
+      try {
+        deps.repo.rbac.audit({
+          userId: user.id,
+          action: 'chat_session_claim',
+          target: sessionId,
+          detail: { via: 'ws-handshake' },
+        });
+      } catch {
+        /* 审计失败不影响连接 */
+      }
+    }
 
     // ★ 模式：从查询参数读（建连接时就要定，见 `validateMode` 注释）
     const modeRaw = (req.query as Record<string, unknown> | undefined)?.mode;

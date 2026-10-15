@@ -510,6 +510,8 @@ def job_extract(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
     llm = LLMClient(config=cfg)
     checkpoint_file = opt(payload, "checkpoint_file")
     outcome = extract_units(
+            text_origin_pages=_text_origin_pages(payload),
+            text_origin=str(payload.get('text_origin') or ''),
         doc_id=doc_id,
         units=units,
         llm=llm,
@@ -526,6 +528,24 @@ def job_extract(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
     data = outcome.to_dict()
     emit.progress("extract", 1.0, {"cards": len(outcome.cards), "units_done": outcome.stats.get("units_done")})
     return data
+
+
+def _text_origin_pages(payload: dict[str, Any]) -> dict[str, str]:
+    """取逐页来源表（``documents.meta.text_origin_pages``，Node 原样转发）。
+
+    ⚠️ 只做**形状**校验（dict[str,str]），值只认 ``native``/``ocr``（其它值忽略）——
+    worker 不猜来源，拿不到就当"未知"（不写进结果，也不编造）。
+    """
+    raw = payload.get("text_origin_pages")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        val = str(v or "").strip().lower()
+        if key and val in ("native", "ocr"):
+            out[key] = val
+    return out
 
 
 def _filter_units_by_title(
@@ -600,6 +620,8 @@ def job_extract_plan(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
         units, opt(payload, "skip_titles")
     )
     out = plan_prompts(
+            text_origin_pages=_text_origin_pages(payload),
+            text_origin=str(payload.get('text_origin') or ''),
         units=units,
         source_name=str(opt(payload, "source_name", "课程资料")),
         max_pages=int(opt(payload, "max_pages", 8) or 8),
@@ -627,6 +649,8 @@ def job_extract_convert(payload: dict[str, Any], emit: Emitter) -> dict[str, Any
     units = units_from_payload(need(payload, "units", list), doc_id)
     payloads = need(payload, "payloads", list)
     outcome = convert_payloads(
+            text_origin_pages=_text_origin_pages(payload),
+            text_origin=str(payload.get('text_origin') or ''),
         doc_id=doc_id,
         units=units,
         payloads=payloads,

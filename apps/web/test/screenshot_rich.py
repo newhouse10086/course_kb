@@ -61,7 +61,12 @@ def main() -> int:
                             " setTimeout(()=>document.querySelector('[data-testid=\"chat-send\"]').click(),150); return 1 })()")
                 ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"code-unclosed\"]')",
                             timeout=90, interval=0.3)
-                time.sleep(1.0)
+                # ★ 滚到消息顶部：让**标题 + 表格 + 粗体**（用户最直接的抱怨）出现在截图里
+                # ★ 展开消息区并滚到顶：让**标题 + 表格 + 粗体**（用户最直接的抱怨）完整出现在截图里
+                #   （消息区默认 max-height:62vh + 自动滚到底 → 顶部内容截不到）
+                ch.evaluate("(() => { const l=document.querySelector('[data-testid=\"chat-log\"]');"
+                            " if (!l) return 0; l.style.maxHeight='none'; l.scrollTop = 0; return 1 })()")
+                time.sleep(0.8)
                 p = OUT / f"rich-formula-code-{theme}.png"
                 ch.screenshot(str(p), full_page=True)
                 print(f"  ✓ {p.name}（{p.stat().st_size // 1024} KB）")
@@ -82,9 +87,17 @@ def main() -> int:
                 ch.screenshot(str(p2), full_page=True)
                 print(f"  ✓ {p2.name}（{p2.stat().st_size // 1024} KB）")
                 shots += 1
+                # ④ 登录页（用户要求：不出现 httpOnly/cookie/token/401 这类技术词）
+                ch.navigate(f"{base}/#/login?theme={theme}", timeout=120)
+                ch.wait_for("!!document.getElementById('login-report')", timeout=120, interval=0.3)
+                time.sleep(0.6)
+                p4 = OUT / f"login-{theme}.png"
+                ch.screenshot(str(p4), full_page=True)
+                print(f"  ✓ {p4.name}（{p4.stat().st_size // 1024} KB）")
+                shots += 1
                 ch.navigate("about:blank", timeout=30)
-        print(f"\n{'✓' if shots == 6 else '✗'} 渲染截图 {shots}/6 张 → {OUT}")
-        return 0 if shots == 6 else 1
+        print(f"\n{'✓' if shots == 8 else '✗'} 渲染截图 {shots}/8 张 → {OUT}")
+        return 0 if shots == 8 else 1
     finally:
         mock.terminate()
         try:

@@ -94,6 +94,7 @@ test('★★ 安全：仅 admin 允许 agent 工具；student/teacher 一律 fal
       const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
       assert.equal(login.status, 200, `${name} 登录失败`);
       const before = seen.length;
+      registerSession(`sec-${name}`, name); // ★ 新契约：会话须先登记（且必须登记给**该用户**）
       const ws = new WebSocket(`${wsBase}/api/v1/chat/sec-${name}`, { headers: { cookie } });
       await new Promise<void>((resolve, reject) => {
         ws.addEventListener('open', () => {
@@ -124,6 +125,7 @@ test('★★ 安全：仅 admin 允许 agent 工具；student/teacher 一律 fal
 
     // admin：允许（管理员本来就有服务器权限，工具不扩大其权力）
     const adminSeenBefore = seen.length;
+    registerSession('sec-admin'); // ★ 新契约：先登记再连
     const wsAdmin = new WebSocket(`${wsBase}/api/v1/chat/sec-admin`, {
       headers: { cookie: authCookie! },
     });
@@ -238,9 +240,30 @@ async function listen(built: BuiltApp): Promise<string> {
   await built.app.listen({ host: '127.0.0.1', port: 0 });
   const addr = built.app.server.address();
   if (!addr || typeof addr === 'string') throw new Error('无法取到监听地址');
+  currentApp = built; // ★ 供 `registerSession` 用（新契约：会话必须先登记）
   // RBAC：登录一次，WS 握手时带上 cookie（/chat 受 401 闸门保护）
   authCookie = await loginFor(`http://127.0.0.1:${addr.port}`);
   return `ws://127.0.0.1:${addr.port}`;
+}
+
+/**
+ * ★★ **新契约**：聊天会话必须**先由服务端登记**才能连 WS（IDOR 修复，见
+ * `store/chat-session-owner.ts`）。本文件原先用临时 id 直连 —— 那描述的正是**被移除的
+ * "自动认领"旧行为**（自动认领会带来存在性预言机 + 抢注）。
+ *
+ * 测试里等价于前端先 `POST /api/v1/conversations`。
+ */
+let currentApp: BuiltApp | null = null;
+function registerSession(sessionId: string, username: string = ADMIN_USER): void {
+  assert.ok(currentApp, '必须先 listen() 才能登记会话');
+  const row = currentApp.deps.repo.rbac.getUserRowByName(username);
+  assert.ok(row, `登记会话前用户 ${username} 必须存在`);
+  currentApp.deps.repo.rbac.claimConversation({ id: sessionId, userId: row.id });
+}
+/** 从 WS URL 里取会话 id（`…/api/v1/chat/<id>?mode=…` → `<id>`）。 */
+function sessionIdOf(url: string): string {
+  const after = url.split('/api/v1/chat/')[1] ?? '';
+  return after.split('?')[0] ?? '';
 }
 
 interface Collected {
@@ -252,6 +275,7 @@ interface Collected {
 
 /** 连上去、收集帧，直到服务端关闭（带超时，避免测试挂死）。 */
 function connect(url: string, opts: { send?: string; sendSeq?: string[]; timeoutMs?: number } = {}): Collected {
+  registerSession(sessionIdOf(url)); // ★ 新契约：先登记再连（否则守卫在工厂之前就拒）
   const ws = new WebSocket(url, authCookie ? { headers: { cookie: authCookie } } : undefined);
   const frames: Record<string, unknown>[] = [];
   const raw: string[] = [];
@@ -328,6 +352,7 @@ test('★ 模式校验：?mode=agent 合法；未知 mode → 明确报错并关
     send?: string,
     waitMs = 1500,
   ): Promise<{ frames: Record<string, unknown>[]; closed: boolean }> => {
+    registerSession(sessionIdOf(path)); // ★ 新契约：先登记再连
     const ws = new WebSocket(`${base}${path}`, { headers: { cookie: authCookie! } });
     const frames: Record<string, unknown>[] = [];
     let closed = false;

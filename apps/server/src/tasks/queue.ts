@@ -60,6 +60,32 @@ interface QueueItem {
 /** 会真的调模型的任务 kind（模型热切换必须等它们跑完 / 或中止它们）。 */
 export const LLM_KINDS: ReadonlySet<string> = new Set(['extract', 'rollup', 'translate', 'mindmap']);
 
+/**
+ * ★ 自动抽取的单元数阈值（**可配，且断言真的被读** —— 坑 24：别做死旋钮）。
+ *
+ * 默认 **100**：并发=1 下 100 次 LLM 调用 ≈ 10–20 分钟，**已是"后台任务"量级**；
+ * 300 次 ≈ 30–60 分钟 —— 太久，**不能无声发生**。超阈值 → 标 `needs_confirm` 交给用户决定。
+ *
+ * ⚠️ 非法值（0/负数/NaN）**回落默认**，不静默变 0（0 会让"任何文档都不自动抽取"，看起来像没这功能）。
+ */
+export function autoExtractMaxUnits(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env.COURSE_KB_AUTO_EXTRACT_MAX_UNITS);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return 100;
+}
+
+/**
+ * ★ 抽取时长估算（**区间**，不是假精确）。
+ *
+ * 依据实测：单次结构化抽取在本机约 **20s（顺利）～120s（撞超时/负载高）**
+ * → 用这两个端点做区间，报给用户的是"要等多久"的**量级**（这正是用户感受到的痛）。
+ */
+export function estimateExtractMinutes(units: number): [number, number] {
+  const perCallLoSec = 20;
+  const perCallHiSec = 120;
+  return [Math.max(1, Math.round((units * perCallLoSec) / 60)), Math.max(1, Math.round((units * perCallHiSec) / 60))];
+}
+
 export class TaskQueue {
   private readonly repo: Repo;
   private readonly bus: TaskEventBus;
@@ -91,6 +117,13 @@ export class TaskQueue {
    * RBAC §5：`priority`（0 教师/系统 > 1 学生）与 `userId` 决定**调度顺序**与**配额**。
    * 超配额 → 抛 `E_QUOTA`（429），**不静默排队到天荒地老**。
    */
+  // ⚠️ 这里曾有 `maybeAutoExtract`（parse 成功后自动入队 extract）—— **已删除**。
+  // 原因：`parse` handler **自身就会抽取**（`handlers.ts` ④ 步）⟹ 队列再链一次 = **双倍花费**
+  //       （Lead 真上传实测：只有 parse 任务却产出了卡片）。
+  // 闸门现在在**权威路径**上：`handlers.ts::decideAutoExtract`（纯函数，7 条断言）。
+  // ★ **不要在这里重新加自动链** —— 那会造出**第二条抽取路径**（双倍花费 + 两套真相）。
+  //   唯一合法的手动入口是 `POST /api/v1/documents/:id/extract`（`routes/documents.ts`）。
+
   enqueue(input: {
     docId?: string | null;
     kind: string;
@@ -98,8 +131,7 @@ export class TaskQueue {
     taskId?: string;
     priority?: number;
     userId?: string | null;
-  }): string {
-    if (this.stopped) throw new ApiError('E_BUSY', '任务队列已停止', { hint: '服务正在关闭' });
+  }): string {    if (this.stopped) throw new ApiError('E_BUSY', '任务队列已停止', { hint: '服务正在关闭' });
     const userId = input.userId ?? null;
     const priority = Number.isFinite(input.priority) ? Number(input.priority) : 0;
 
@@ -405,6 +437,8 @@ export class TaskQueue {
     const params = { ...item.params, ...((row.detail_json ? safeParse(row.detail_json).params : {}) ?? {}) };
     let lastProgress = 0;
     let extraDetail: Record<string, unknown> = {};
+    /** ★ parse 是否成功结束（决定要不要自动链式抽取；在 `finally` 里用，故声明在外层） */
+    let parsedOk = false;
 
     const ctx: TaskHandlerContext = {
       taskId,
@@ -434,9 +468,47 @@ export class TaskQueue {
 
     this.repo.updateTask(taskId, { status: 'running', stage: '启动中' });
 
+    /**
+     * ★★ **任务终态必须回写文档状态**（用户直接撞到的 bug）。
+     *
+     * ## 缺陷（真库证据）
+     * `doc_473f915e315f` / `doc_055d06be9a5d` / `doc_45d7826c5c4c` 的 `tasks.status='failed'`，
+     * 但 `documents.status` **至今仍是 `extracting`** ⟹ 界面**不显示失败、不显示原因**，
+     * 用户以为"还在跑"（"显示是可用的，请问抽取的结果在哪"）。
+     * 这正是我们一路在守的那条：**"看起来成功"比崩溃危险**。
+     *
+     * ## 为什么放在队列层（而不是各 handler 里）
+     * 失败路径有三条出口（无处理器 / 抛异常 / 取消），**每个 handler 各自记得回写**是不可靠的
+     * （抽取 handler 就漏了）。队列是**唯一**知道"任务终态 + docId"的地方 ⟹ 一处回写，全体受益。
+     *
+     * ## 状态映射（如实，不美化）
+     * - `failed` → `documents.status='failed'` + 可读 reason 进 meta（`task_failed_error`）
+     * - `cancelled` → 同样标 `failed`（**未完成就是未完成**），reason 写明"已取消"
+     */
+    const writebackDoc = (finalStatus: 'failed' | 'cancelled', reason: string): void => {
+      if (!item.docId) return;
+      try {
+        this.repo.updateDocument(item.docId, { status: 'failed' });
+        this.repo.mergeDocumentMeta(item.docId, {
+          task_failed_kind: item.kind,
+          task_failed_status: finalStatus,
+          task_failed_error: reason,
+          task_failed_at: Date.now(),
+        });
+      } catch {
+        // 回写失败**不许**把队列搞挂（但也不静默：进日志/总线）
+        this.bus.publish(taskId, 'log', {
+          task_id: taskId,
+          level: 'warn',
+          msg: `文档状态回写失败（documents.status 可能仍停留在进行中）：doc=${item.docId}`,
+        });
+      }
+    };
+
     if (!handler) {
       const msg = `没有注册 kind=${item.kind} 的处理器（可用：${Object.keys(this.handlers).sort().join(', ') || '(空)'}）`;
       this.repo.updateTask(taskId, { status: 'failed', error: msg, stage: '失败' });
+      writebackDoc('failed', msg);
       this.bus.publish(taskId, 'failed', { task_id: taskId, error: msg, code: 'E_INTERNAL' });
       this.bus.finish(taskId);
       this.release(taskId, item.userId);
@@ -457,10 +529,12 @@ export class TaskQueue {
           elapsed_ms: Date.now() - startedAt,
         });
         this.bus.finish(taskId);
+        parsedOk = true; // ★ 自动链式放到 finally 之后（那时配额槽已释放，否则会被 E_QUOTA 挡住）
       }
     } catch (err) {
       if (ac.signal.aborted) {
         this.finishAs(taskId, 'cancelled', '已取消', startedAt, extraDetail);
+        writebackDoc('cancelled', '任务已取消（未完成）');
       } else {
         const isApi = err instanceof ApiError;
         const code = isApi ? err.code : 'E_INTERNAL';
@@ -473,6 +547,8 @@ export class TaskQueue {
           progress: lastProgress,
           detail: { ...extraDetail, ...(detail ? { error_detail: detail } : {}) },
         });
+        // ★ 回写文档状态（否则 documents.status 永远停在 extracting/parsing —— 用户看到的"假进行中"）
+        writebackDoc('failed', msg);
         this.bus.publish(taskId, 'failed', {
           task_id: taskId,
           error: msg,
@@ -483,6 +559,17 @@ export class TaskQueue {
       }
     } finally {
       this.release(taskId, item.userId);
+      /**
+       * ⚠️ **队列级自动链式已移除**（Lead 真上传实测暴露的概念冲突）：
+       * `parse` handler 的 ④ 步**本身就会抽取**（`handlers.ts:440-455`）→ 队列再链一次 = **双倍花费**。
+       *
+       * ⟹ **唯一权威路径 = `parse` ④**，闸门（`text_gate` / 单元数阈值 / `needs_confirm`）也在那里
+       *   （`decideAutoExtract`，纯函数 → 可穷举断言）。队列只负责"任务终态 → 回写文档状态"。
+       *
+       * ★ 教训（写进提交信息）：**"多一条自动链"看起来是补功能，实际是造出第二条抽取路径** ——
+       *   两条路径都能抽 = **双倍花费 + 两套真相**（这次靠 `extract_status` 幂等闸门才没双跑）。
+       */
+      void parsedOk;
     }
   }
 

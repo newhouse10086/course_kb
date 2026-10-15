@@ -468,6 +468,26 @@ const MINIMAL_PDF = Buffer.from('%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>e
 
 export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}) {
   const F = buildFixture()
+  let CONV_SEQ = 0
+  /** ★ 会话消息表（模拟 pi 的落盘转录）：重连同一 sessionId 时用 `history` 帧下发 */
+  const SESSION_MSGS = new Map()
+  /** ★ 记录 reparse 调用次数：用于断言"禁用状态下点击**不发请求**" */
+  let REPARSE_CALLS = 0
+  /** ★ 视频目录夹具（collections 契约）；`can_manage` 由**夹具角色**决定（模拟服务端计算） */
+  const COLLECTIONS_FIXTURE = () => {
+    const teacher = (globalThis.__MOCK_CFG__?.role || 'teacher') === 'teacher'
+    return [
+      { id: 'col_0001', name: '第 5 讲 索引与执行计划', description: '合成夹具数据', owner_id: 'usr_mock',
+        visibility: 'class', review_status: 'approved', sort_order: 1, created_at: 1760400000000, updated_at: 1760400001000,
+        published: true, can_manage: teacher, video_count: 1 },
+      { id: 'col_0002', name: '第 6 讲 事务与锁', description: null, owner_id: 'usr_other',
+        visibility: 'class', review_status: 'pending', sort_order: 2, created_at: 1760400002000, updated_at: 1760400002000,
+        published: false, can_manage: false, video_count: 0 },
+    ]
+  }
+  let AI_PARSE_CALLS = 0
+  /** ★ 新建的目录（夹具静态列表之外，模拟"服务端真的存了"） */
+  const CREATED_COLLECTIONS = []
   const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [], role: 'teacher', running_llm: true,
     /** 检索帧用哪种模式（none/wiki/kg/rag）；kg_hit=1 时 kg 才有命中（默认 kg = 查了 0 命中） */
     retrieval: 'wiki', kg_hit: false,
@@ -476,7 +496,13 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     /** 知识库为空（agent 必然 0 命中 → 前端要如实提示"先上传并抽取"） */
     empty_kb: false,
     /** 助手回答用"含公式/代码/未闭合围栏"的样例（e2e ?rich=1） */
-    rich_answer: false }
+    rich_answer: false,
+    /** 连接后是否发 `history` 帧（夹具 ?history=1） */
+    history: false,
+    /** 视频目录接口"未实现"注入（夹具 ?collections_missing=1） */
+    collections_missing: false,
+    /** 会话登记失败注入（夹具 ?conv_fail=1）：验证"登记失败 → 输入禁用 + 可读提示" */
+    conv_fail: false }
   globalThis.__MOCK_CFG__ = CFG   // capabilitiesPayload() 在顶层，靠它读到 fixture 开关
   /** 模型/设置/sandbox 的运行期状态（真后端在 settings.json + SQLite 里） */
   const STATE = {
@@ -577,7 +603,94 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         ws.forEach((f) => f())
         return json({ released: true })
       }
-      if (api === '/_fixture/config') {
+      // ★ 会话列表：**真实接口是 `GET /conversations`**（Lead 实测 /chat/sessions 不存在 → 404）
+    // ★ 重新解析（202 契约）；`/_fixture/reparse_calls` 暴露调用次数给 e2e
+    if (api === '/_fixture/reparse_calls') return json({ calls: REPARSE_CALLS })
+    if (api === '/_fixture/ai_parse_calls') return json({ calls: AI_PARSE_CALLS })
+    // ★ 视频目录（collections 契约）
+    if (api === '/collections' && req.method === 'GET') {
+      if (globalThis.__MOCK_CFG__?.collections_missing) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        return res.end(JSON.stringify({ error: { code: 'E_NOTFOUND', msg: '接口尚未实现（夹具注入）' } }))
+      }
+      /**
+       * ⚠️ `can_manage` 必须**按当前请求者的角色重算**（服务端语义）：
+       *   我第一版让"新建的目录"带着创建时的 `can_manage: true` 留在内存里 →
+       *   下一个用例切成学生角色后**仍然看得到教师入口**（夹具状态泄漏，与 conv_fail 那次同族）。
+       */
+      const role = globalThis.__MOCK_CFG__?.role || 'teacher'
+      const list = [...COLLECTIONS_FIXTURE(),
+        ...CREATED_COLLECTIONS.map((c) => ({ ...c, can_manage: role === 'teacher' }))]
+      return json({ total: list.length, collections: list })
+    }
+    if (api === '/collections' && req.method === 'POST') {
+      const body = JSON.parse(String(req.body || '{}'))
+      if ((globalThis.__MOCK_CFG__?.role || 'teacher') !== 'teacher') {
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        return res.end(JSON.stringify({ error: { code: 'E_FORBIDDEN', msg: '只有教师可以建目录' } }))
+      }
+      const created = { id: `col_new_${Math.random().toString(16).slice(2, 8)}`, name: body.name,
+        owner_id: 'usr_mock', visibility: body.visibility || 'class', review_status: 'draft',
+        published: false, can_manage: true, video_count: 0, created_at: Date.now(), updated_at: Date.now() }
+      CREATED_COLLECTIONS.push(created)   // ★ 新建的要真的进列表（否则"创建后列表增加"不可验）
+      return json({ collection: created }, 201)
+    }
+    if (/^\/collections\/[^/]+\/videos$/.test(api)) {
+      const cid = api.split('/')[2]
+      const videos = cid === 'col_0001'
+        ? [
+            { id: DOC_VIDEO, title: '第 5 讲 索引与执行计划（合成夹具数据）', kind: 'video', collection_id: cid,
+              duration_ms: 1_800_000, size_bytes: 1024 * 1024,
+              parse_state: 'done', parse_reason: null,
+              ai_parse: { available: true, reason: null, llm_model: 'deepseek-v4.1-flash',
+                cost_note: '解析会消耗 LLM 额度（约 1 讲一次）。', estimated_llm_calls: 42 } },
+            { id: 'doc_video_raw_0002', title: '第 5 讲 原始录像（未解析）', kind: 'video', collection_id: cid,
+              parse_state: 'none', parse_reason: '还没有解析过',
+              ai_parse: { available: false, reason: 'ASR 能力不可用：缺少 faster-whisper（见 /capabilities）',
+                llm_model: 'deepseek-v4.1-flash', cost_note: '解析会消耗 LLM 额度。', estimated_llm_calls: 38 } },
+          ]
+        : []
+      return json({ total: videos.length, videos })
+    }
+    // ★ 触发 AI 解析（POST /tasks {kind:'video_parse'}）
+    if (api === '/tasks' && req.method === 'POST') {
+      AI_PARSE_CALLS += 1
+      return json({ task_id: 'tsk_aiparse_mock', status: 'queued' }, 202)
+    }
+    if (/^\/documents\/[^/]+\/reparse$/.test(api) && req.method === 'POST') {
+      REPARSE_CALLS += 1
+      return json({
+        document_id: api.split('/')[2], task_id: 'tsk_reparse_mock', status: 'queued',
+        events_url: '/api/v1/tasks/tsk_reparse_mock/events', needs_ocr: true,
+        est_minutes: [65, 87],
+        cost_note: '重跑会重新解析并在完成后自动抽取（抽取会消耗 LLM 额度）。',
+      }, 202)
+    }
+    if (api === '/conversations' && req.method === 'GET') {
+      return json({
+        total: 2, offset: 0, limit: 50,
+        conversations: [
+          { id: 'cnv_mock0001', title: '新问答', doc_id: null, created_at: Date.now() - 3600_000 },   // ★ 默认名（模拟用户痛点）
+          { id: 'cnv_mock0002', title: 'B+ 树节点分裂的代价', doc_id: null, created_at: Date.now() - 86_400_000 },
+        ],
+      })
+    }
+    // ★ 登记会话（安全修复后的**唯一合法入口**）：返回服务端签发的 id
+    if (api === '/conversations' && req.method === 'POST' && CFG.conv_fail) {
+      res.writeHead(503, { 'Content-Type': 'application/json' })
+      return res.end(JSON.stringify({ error: { code: 'E_UNAVAILABLE', msg: '会话登记服务不可用（夹具注入）' } }))
+    }
+    if (api === '/conversations' && req.method === 'POST') {
+      CONV_SEQ += 1
+      const id = `cnv_mock${String(CONV_SEQ).padStart(4, '0')}${Math.random().toString(16).slice(2, 6)}`
+      return json({ conversation: { id, user_id: 'usr_mock', doc_id: null, title: '新会话', created_at: Date.now() } }, 201)
+    }
+    // 老别名（保留 404 语义，验证前端优先走 /conversations）
+    if (api === '/chat/sessions') {
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      return res.end(JSON.stringify({ error: { code: 'E_NOTFOUND', msg: '接口不存在' } }))
+    }
+    if (api === '/_fixture/config') {
         for (const k of Object.keys(CFG)) if (q.has(k) && typeof CFG[k] === 'boolean') CFG[k] = ['1', 'true', 'yes'].includes(q.get(k))
         if (q.has('role')) CFG.role = q.get('role')
         if (q.has('maxrows')) { STATE.sandbox.limits.maxRows = Math.max(1, Number(q.get('maxrows')) || 200); if (STATE.db) STATE.db.maxRows = STATE.sandbox.limits.maxRows }
@@ -585,6 +698,13 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         if (q.has('agent_roles')) CFG.agent_roles = String(q.get('agent_roles')).split(',').filter(Boolean)
         if (q.has('empty_kb')) CFG.empty_kb = ['1', 'true'].includes(q.get('empty_kb'))
         if (q.has('rich')) CFG.rich_answer = ['1', 'true'].includes(q.get('rich'))
+        if (q.has('history')) CFG.history = ['1', 'true'].includes(q.get('history'))
+        if (q.has('conv_fail')) CFG.conv_fail = ['1', 'true'].includes(q.get('conv_fail'))
+        if (q.has('collections_missing')) CFG.collections_missing = ['1', 'true'].includes(q.get('collections_missing'))
+    // ⚠️ mock 里有**两个** server（normal/degraded），各自有自己的 CFG；而 WS 处理函数读的是
+    //    `globalThis.__MOCK_CFG__`（谁后创建谁覆盖）→ 夹具必须**顺手把自己这份发布出去**，
+    //    否则"给 normal 设的开关"会被 degraded 的 CFG 覆盖（实测：history 帧发不出来）
+    globalThis.__MOCK_CFG__ = CFG
         if (q.has('kg_hit')) CFG.kg_hit = ['1', 'true'].includes(q.get('kg_hit'))
         if (q.has('running_llm')) { CFG.running_llm = ['1', 'true', 'yes'].includes(q.get('running_llm')); STATE.runningLlmTask = CFG.running_llm }
         return json({ config: { ...CFG, uploads: CFG.uploads.length } })
@@ -867,7 +987,12 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       // ---------- §5.2 documents ----------
       if (api === '/documents' && req.method === 'GET') {
         let docs = [
-          { id: DOC_PDF, title: 'MySQL 26.7 Reference Manual（上游真实产物 · mock）', kind: 'pdf', page_count: 6392, size_bytes: 44160000, lang: 'en', status: 'ready', created_at: 1760400000000, updated_at: 1760400000000, meta: { toc_entries: 2545, chapters: 42 } },
+          { id: DOC_PDF, title: 'MySQL 26.7 Reference Manual（上游真实产物 · mock）', kind: 'pdf', page_count: 6392, size_bytes: 44160000, lang: 'en', status: 'ready', created_at: 1760400000000, updated_at: 1760400000000,
+            // ★ 抽取状态夹具：`done_empty` = **跑完了但零卡片**（绝不能被显示成"成功"）；
+            //   `needs_confirm` + 估算（**次数 + 时长都要有**，用户真正感受到的痛是"要等 3–7 小时"）
+            meta: { toc_entries: 2545, chapters: 42, extract_status: 'done_empty', needs_confirm: true,
+              extract_estimate: { llm_calls: 2523, duration_human: '3–7 小时' },
+              extract_progress: { done: 340, total: 2523 } } },
           { id: DOC_VIDEO, title: '第 5 讲 索引与执行计划（合成夹具数据）', kind: 'video', page_count: 0, size_bytes: 1024 * 1024, lang: 'zh', status: 'ready', created_at: 1760400001000, updated_at: 1760400001000, meta: { fixture: true } },
         ]
         if (q.get('kind')) docs = docs.filter((d) => d.kind === q.get('kind'))
@@ -1076,7 +1201,22 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         return
       }
       const isAgent = connMode === 'agent'
-      send({ type: 'ready', session_id: sessionId, model: 'deepseek-v4.1-flash', mode: 'sdk', agent_mode: connMode,
+      /**
+       * ★ 第 12 种帧 `history`（真实语义）：**同一 sessionId 重连**时，若盘上有转录 → 下发。
+       *   mock 用内存 map 模拟；夹具 `?history=1` 则强制注入一段示例历史（供专门用例）。
+       */
+      const prior = SESSION_MSGS.get(sessionId) || []
+      if (globalThis.__MOCK_CFG__?.history) {
+        // 夹具优先（专门用例要断言"历史里的 markdown 表格也渲染"）
+        send({ type: 'history', truncated: false, messages: [
+          { role: 'user', text: '上一轮我问了什么？', ts: Date.now() - 120_000 },
+          { role: 'assistant', text: '## 上次的结论\n\n| 项 | 值 |\n|---|---|\n| 聚簇索引 | **整行数据** |', ts: Date.now() - 119_000 },
+        ] })
+      } else if (prior.length) {
+        send({ type: 'history', truncated: false, messages: prior })
+      }
+      // ★ pi-bridge 契约：`ready.reason` 决定"该不该清空消息"；`connect` → 不清
+      send({ type: 'ready', session_id: sessionId, reason: 'connect', model: 'deepseek-v4.1-flash', mode: 'sdk', agent_mode: connMode,
         tools: isAgent ? ['kb_search', 'kb_get'] : [],
         tools_source: isAgent ? 'kb-readonly' : 'disabled-by-role',
         assistant, system_prompt: assistant === 'video' ? 'VIDEO_ASSISTANT_SYSTEM_PROMPT(+RENDER_CONTRACT)' : 'CHAT_ASSISTANT_SYSTEM_PROMPT(+RENDER_CONTRACT)' })
@@ -1116,6 +1256,29 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
            */
           const text = CFG.rich_answer
             ? [
+              // ★ 用户实测反馈的原样场景：标题 / 表格 / 粗体 / 列表 —— 以前全是 `##` 和 `|` 纯文本
+              '## 一、聚簇索引 vs 二级索引（快速回顾）',
+              '',
+              '| 对比项 | 聚簇索引 | 二级索引 |',
+              '|---|---|---|',
+              '| 叶子节点存什么 | **整行数据** | **索引列值 + 主键值** |',
+              '| 是否需要回表 | 不需要 | 查询非索引列时**要回表** |',
+              '',
+              '记一句话：**二级索引的叶子节点上挂着主键，主键再指向聚簇索引的行。**',
+              '',
+              '### 要点',
+              '- 聚簇索引：`PRIMARY KEY` 默认就是它',
+              '- 二级索引：叶子节点只存主键值',
+              '  - 所以非覆盖查询要回表',
+              '1. 先看执行计划 `EXPLAIN`',
+              '2. 再看是否走覆盖索引',
+              '',
+              '> 注意：回表代价 = 随机 I/O，行数多时非常明显。',
+              '',
+              '参考 [MySQL 手册](https://dev.mysql.com/doc/) 与 [本节卡片](#/wiki?doc=doc_refman00001&unit=unt_0001)。',
+              '',
+              '---',
+              '',
               '聚簇索引把整行数据放在 B+ 树的叶子节点上。',
               '',
               '行内公式：$O(\\log n)$；块级公式：',
@@ -1194,6 +1357,11 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
                 timer = setTimeout(() => {
                   send({ type: 'tool_end', id: 'call_1', ok: true, duration_ms: 37 })
                   send({ type: 'message_end', message: { role: 'assistant', text } })
+            // ★ 落"转录"：同一会话重连时用 history 恢复（模拟 pi 的 JSONL）
+            const arr = SESSION_MSGS.get(sessionId) || []
+            arr.push({ role: 'user', text: String(msg.message || ''), ts: Date.now() - 1000 })
+            arr.push({ role: 'assistant', text, ts: Date.now() })
+            SESSION_MSGS.set(sessionId, arr)
                   send({ type: 'settled', aborted: false })
                 }, 60)
               }, 80)

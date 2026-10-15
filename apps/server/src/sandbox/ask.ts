@@ -1194,7 +1194,14 @@ export function createAskHandler(deps: AskDeps = {}): AskHandler {
       let session: ChatSessionLike;
       try {
         const manager = deps.manager ?? (await getAskManager());
-        session = await manager.getOrCreate(askSessionKey(sessionId));
+        // ★★ 必须带上**学生身份**：`ask-<沙箱sessionId>` 若不带身份，
+        //   学生 A 就能续上学生 B 的答疑上下文（**含 B 的 SQL 与报错 = 作业内容**）——
+        //   这条比聊天那条更敏感。身份来自**服务端**（`req.userId` 或 `deps.resolveUserId`），
+        //   绝不从客户端帧里读；拿不到身份时由 agent 层的归属登记 **fail-closed** 兜底。
+        const askUserId = (req.userId ?? '').trim() !== '' ? req.userId : await deps.resolveUserId?.(sessionId);
+        session = await manager.getOrCreate(askSessionKey(sessionId), {
+          ...(askUserId ? { userId: askUserId } : {}),
+        });
       } catch (err) {
         const classified = classifyFailure(err, { where: '创建答疑会话' });
         // 复用 agent 层的分类器：`pi SDK 不可用：…` 与 `pi SDK 正常，…` 两种 hint 前缀可区分层次

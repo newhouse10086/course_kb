@@ -32,14 +32,15 @@
 
 import { fileURLToPath } from 'node:url';
 import { mkdir } from 'node:fs/promises';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 import type { AgentSession, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
 
 import { AGENT_ERROR_CODES, HINT_SDK_OK, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
 import { composeMessageWithContext, sanitizeUntrusted } from './guards.ts';
 import { KB_TOOL_NAMES, type KbProvider } from './kb_tools.ts';
+import { entriesToHistory } from './history.ts';
 import { loadSdk, type SdkLoadResult } from './sdk.ts';
 import {
   beginRound,
@@ -511,6 +512,97 @@ function readEntries(sessionManager: unknown): unknown[] {
   }
 }
 
+/** 会话归属被拒绝（跨用户 / 无法确认归属） */
+export class SessionOwnershipError extends Error {
+  readonly code = 'E_AGENT_SESSION_OWNERSHIP';
+  constructor(message: string) {
+    super(message);
+    this.name = 'SessionOwnershipError';
+  }
+}
+
+/**
+ * ★★ **会话归属登记**（跨用户读取的兜底防线）。
+ *
+ * ## 为什么必须有
+ * 会话 key 是**客户端自选的字符串**（`WS /api/v1/chat/<sessionId>`、`ask-<沙箱sessionId>`），
+ * **不含用户信息**，服务端也**没有任何归属校验**（路由层 grep 过，0 处）。
+ * ⟹ **今天就能跨用户读**：只要知道/猜到别人的 key，连上去就续上别人的上下文
+ * —— 聊天是"让模型复述对话"，答疑更敏感（**别人的 SQL 与报错 = 作业内容**）。
+ *
+ * ## 它做什么 / 不做什么
+ * - 做：**同一个 key 一旦被 A 认领，B 就拿不到**（含"无身份者"）
+ * - **不做**：防不了"A 自选 key 恰好等于 B 的 key" —— 那要靠**路由层**把 key 与用户绑定
+ *   （根因在 `routes/chat.ts`，已转 backend-api）。**这是纵深防御，不是根因修复。**
+ *
+ * ## fail-closed 规则（默认拒绝）
+ * | 情况 | 结果 |
+ * |---|---|
+ * | 已登记 + 同用户 | 放行 |
+ * | 已登记 + 不同用户 | **拒** |
+ * | 已登记 + 无身份 | **拒**（不能靠"没给身份"绕过） |
+ * | 未登记 + **有历史文件** | **拒**（老会话文件都在，这一条最关键；要迁移须显式 `allowUnclaimed`） |
+ * | 未登记 + 无历史 + 有身份 | 放行并**认领** |
+ * | 未登记 + 无历史 + 无身份 | 放行（不认领）—— 答疑等旧调用路径不因此被打断 |
+ */
+class SessionOwners {
+  private map = new Map<string, string>();
+  private loaded = false;
+  private file: string | null;
+  private diag: (message: string) => void;
+  constructor(file: string | null, diag: (message: string) => void) {
+    this.file = file;
+    this.diag = diag;
+  }
+
+  private load(): void {
+    if (this.loaded) return;
+    this.loaded = true;
+    if (!this.file) return;
+    try {
+      if (!existsSync(this.file)) return;
+      const raw = JSON.parse(readFileSync(this.file, 'utf8')) as { owners?: Record<string, string> };
+      for (const [k, v] of Object.entries(raw.owners ?? {})) {
+        if (typeof v === 'string' && v !== '') this.map.set(k, v);
+      }
+    } catch (err) {
+      // 登记文件损坏 → 当作**未登记**（随后"有历史文件但无登记"会 fail-closed 拒掉，不会放开）
+      this.diag(`会话归属登记文件读取失败（按未登记处理，随后有历史的会话会被拒）：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  ownerOf(key: string): string | undefined {
+    this.load();
+    return this.map.get(key);
+  }
+
+  /** 认领（已属他人则抛错） */
+  claim(key: string, userId: string): void {
+    this.load();
+    const existing = this.map.get(key);
+    if (existing !== undefined && existing !== userId) {
+      throw new SessionOwnershipError(
+        `会话 ${key} 已归属其他用户，拒绝访问（跨用户读取防护）。若确需迁移，请由运维处理归属登记文件。`,
+      );
+    }
+    if (existing === userId) return;
+    this.map.set(key, userId);
+    this.persist();
+  }
+
+  private persist(): void {
+    if (!this.file) return;
+    try {
+      mkdirSync(dirname(this.file), { recursive: true });
+      const tmp = `${this.file}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ version: 1, owners: Object.fromEntries(this.map) }, null, 0), 'utf8');
+      renameSync(tmp, this.file); // 原子替换，避免半截文件
+    } catch (err) {
+      this.diag(`会话归属登记写入失败（内存仍然生效，但重启后会丢失）：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 /** 一个被管理的 pi 会话。 */
 export class ManagedAgentSession implements ChatSessionLike {
   readonly id: string;
@@ -658,6 +750,16 @@ export class ManagedAgentSession implements ChatSessionLike {
   }
 
   /** 构造 `ready` 帧（每次都读实时状态，避免报陈旧信息）。 */
+  /** ★ 历史消息（恢复用）：交给 gent/history.ts 的**共享映射**（HTTP 侧复用同一份）*/
+  history(): { messages: { role: 'user' | 'assistant'; text: string; ts: number }[]; truncated: boolean } | null {
+    try {
+      const entries = readEntries(this.piSession.sessionManager);
+      return entriesToHistory(entries);
+    } catch {
+      return null;
+    }
+  }
+
   readyFrame(): ReadyFrame {
     const tools = this.activeTools();
     return makeReadyFrame({
@@ -917,6 +1019,8 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   readonly cwd: string;
   readonly agentDir: string | undefined;
   readonly sessionDir: string | null;
+  /** ★ 会话归属登记（跨用户读取的兜底防线，见 SessionOwners） */
+  private readonly owners: SessionOwners;
   /** 工具从哪来：explicit（我们显式给的，含默认的空集）/ pi-default（**仅当显式放行**） */
   readonly toolsSource: 'explicit' | 'dangerous-opt-in';
   readonly idleTtlMs: number;
@@ -978,6 +1082,47 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     this.onDiagnostic = opts.onDiagnostic ?? (() => {});
     const persist = opts.persist !== false;
     this.sessionDir = opts.sessionDir === undefined ? (persist ? join(this.cwd, 'data', 'chat') : null) : opts.sessionDir;
+    // ★ 归属登记文件放在会话目录下（与会话文件同生命周期；sessionDir=null 时仅内存生效）
+    this.owners = new SessionOwners(
+      this.sessionDir ? join(this.sessionDir, '_owners.json') : null,
+      (m) => this.diagnostic(m),
+    );
+  }
+
+  /**
+   * ★★ 会话归属校验（fail-closed）。规则见 `SessionOwners` 文档。
+   *
+   * 这是**纵深防御**：根因（key 由客户端自选且与用户无关）在路由层。
+   */
+  private enforceOwnership(sessionId: string, userId: string | undefined, allowUnclaimed: boolean): void {
+    const owner = this.owners.ownerOf(sessionId);
+    const hasHistory = this.sessionDir !== null && findSessionFile(this.sessionDir, sessionId) !== null;
+    if (owner !== undefined) {
+      if (userId === undefined) {
+        throw new SessionOwnershipError(
+          `会话 ${sessionId} 已归属用户 ${owner}，但本次连接**没有提供身份** → 拒绝（不能靠"不给身份"绕过归属校验）`,
+        );
+      }
+      if (owner !== userId) {
+        throw new SessionOwnershipError(
+          `会话 ${sessionId} 归属用户 ${owner}，与当前用户 ${userId} 不符 → 拒绝（跨用户读取防护）`,
+        );
+      }
+      return;
+    }
+    // 未登记
+    if (hasHistory) {
+      if (!allowUnclaimed) {
+        throw new SessionOwnershipError(
+          `会话 ${sessionId} 存在历史文件但**没有归属登记** → 拒绝打开（无法确认归属；` +
+            `这是为防"直接连别人的 key 读历史"）。请新建会话；确需沿用旧会话请由运维显式认领（allowUnclaimed）。`,
+        );
+      }
+      if (userId !== undefined) this.owners.claim(sessionId, userId);
+      return;
+    }
+    if (userId !== undefined) this.owners.claim(sessionId, userId);
+    // 无身份 + 无历史：放行但不认领（不打断旧调用路径；首次带身份访问时再认领）
   }
 
   diagnostic(message: string): void {
@@ -1231,7 +1376,13 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   }
 
   /** 取会话（同 id 复用；已 dispose 则重建）。 */
-  async getOrCreate(sessionId: string, init?: { tools?: string[]; kbUserId?: string }): Promise<ManagedAgentSession> {
+  async getOrCreate(
+    sessionId: string,
+    init?: { tools?: string[]; kbUserId?: string; userId?: string; allowUnclaimed?: boolean },
+  ): Promise<ManagedAgentSession> {
+    // ★★ 归属校验必须**在复用已有会话之前**：否则"已建好的会话"会被直接返回，
+    //   归属检查形同虚设（跨用户连接就能拿到别人的活会话）。
+    this.enforceOwnership(sessionId, init?.userId ?? init?.kbUserId, init?.allowUnclaimed === true);
     const existing = this.sessions.get(sessionId);
     if (existing && !existing.disposed) {
       // 已存在的会话保持原有工具集（避免半个会话中途换工具）。若请求的不同，记诊断说明**没生效**。

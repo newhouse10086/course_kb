@@ -39,6 +39,11 @@ export type ChatServerEvent =
    *   `resolved` 是服务端用知识库解析出的**真实标题**（客户端传的 id 不可信）；
    *   `dropped` 非空 → 前端**必须如实显示**（"未找到你当前章节，已忽略"），不许静默。
    */
+  /**
+   * ★ 第 12 种帧 `history`（pi-bridge 2026-10-15）：连接恢复时紧跟 `ready` 发一帧，
+   *   只含 user/assistant 的**文本块**（系统提示词已被出口自检剥离）。
+   */
+  | { type: 'history'; messages?: Array<{ role: 'user' | 'assistant'; text: string; ts?: number }>; truncated?: boolean }
   | { type: 'context'; used?: PromptContext; resolved?: { doc_title?: string; unit_title?: string; unit_span?: unknown }; dropped?: Array<{ field: string; value?: string; reason?: string }>; note?: string }
   | { type: 'settled'; aborted?: boolean; abort_source?: string }
   | { type: 'error'; code?: string; msg?: string; hint?: string }

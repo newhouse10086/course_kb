@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -108,6 +109,11 @@ CARD_SYSTEM_PROMPT = """你是**数据库课程的知识工程师**，把 {sourc
 
 ## 诚实原则（最重要）
   · **原文没说的，填 `unknown` 或 null，绝不编造**
+  · ★ **`cards` 键必须存在**：没有实质知识点就给**空数组 `[]`**，**不许省略该键** ——
+    省略会让下游无法区分"本节确实没有知识点"与"你的输出被截断"（两者处置完全不同）。
+  · **若正文来自 OCR**（可能含错字、串行、缺字符）：只在证据充分时抽取，`confidence` 相应下调；
+    **不得用常识补全看不清的内容**，也**不要"顺手修正"OCR 的错字** ——
+    `evidence_quote` 必须与**给你的正文逐字一致**，你修正后的文本将无法回溯源文。
   · `prerequisites`/`cautions` 没提到就给空数组
   · `confidence` 反映信息完整度：信息稀疏时**必须低**
   · 宁可少写，也不要写看起来合理但原文没说的内容
@@ -439,6 +445,182 @@ def card_span(pu: "units_mod.PickedUnit", evidence_page: Any) -> Span:
     return pu.span
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# ★ 证据逐字校验（wiki-architect 协调请求 ②）
+#
+# **重要事实**：改前本项目**没有**任何 `evidence_quote` 逐字校验 ——
+# 它只是提示词里的一句要求（"必须逐字摘录"），模型不照做也没人知道。
+# 本块把它变成**可断言的事实**：每张卡片的引用都要在**该单元正文**里找到。
+#
+# 关于 OCR 的一个关键澄清（与请求方的假设不同）：
+#   校验对象是**我们喂给模型的那段正文**（unit.text）——OCR 单元的 unit.text **就是**
+#   OCR 结果。所以 OCR 的错字**不会**造成"引用找不到"：模型照着有错字的正文逐字抄，
+#   依然能匹配上。真正会造成不匹配的是**模型自己改写了**（比如"顺手修正"错字、
+#   翻译、压缩），而这恰恰是提示词禁止的行为 → 校验正是用来抓它的。
+#   唯一与 OCR 有关的"假失败"来源是**空白/换行差异**（PDF 抽文本会插换行），
+#   所以先做**空白规范化**再比对（只归一空白，**不动任何字符**）。
+# ═══════════════════════════════════════════════════════════════════════
+
+#: 归一空白：连续空白（含全角空格 U+3000、制表、换行）压成一个半角空格
+_QUOTE_WS_RE = re.compile(r"[\s\u3000]+")
+
+#: 模糊匹配的"改写 vs 编造"判据：最长公共块 ≥ 引用的这个比例 → 认定"改写"
+QUOTE_REWRITE_RATIO = 0.6
+
+
+def normalize_quote(s: str) -> str:
+    """归一**空白**（折叠成单空格）—— 供展示/调试用，不改变任何字符。"""
+    return _QUOTE_WS_RE.sub(" ", (s or "").replace("\ufeff", "")).strip()
+
+
+def _squeeze(s: str) -> str:
+    """**去掉全部空白**（含全角空格）—— 用于比对。
+
+    为什么必须去掉而不是"折叠"：PDF 抽文本会在词间插换行，而模型写引用时用空格，
+    折叠后两边仍不一致（`索引 是加速` vs `索引是加速`）→ 会造出**假的"引用找不到"**。
+    去掉空白是**唯一**与"OCR/抽文本"相关的假失败来源，所以在这里一次性消除；
+    注意：只动空白，**不动任何字符** —— 错字/改写照样能被抓到。
+    """
+    return _QUOTE_WS_RE.sub("", (s or "").replace("\ufeff", ""))
+
+
+@dataclass
+class QuoteCheck:
+    """一张卡片（或一条边）的证据校验结果。"""
+
+    ok: bool
+    kind: str                 # exact | normalized | rewritten | fabricated | missing
+    similarity: float = 0.0   # 与正文最相似片段的重合度（0-1）
+    origin: str = ""          # native | ocr | mixed | ""（未知）
+    quote_chars: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"ok": self.ok, "kind": self.kind,
+                               "similarity": round(self.similarity, 3),
+                               "quoteChars": self.quote_chars}
+        if self.origin:
+            out["textOrigin"] = self.origin
+        return out
+
+
+def check_quote(quote: str, text: str, *, origin: str = "") -> QuoteCheck:
+    """引用能否在正文里找到（先空白归一，再模糊判定改写/编造）。"""
+    raw_q = (quote or "").strip()
+    if not raw_q:
+        return QuoteCheck(ok=False, kind="missing", origin=origin, quote_chars=0)
+    q = _squeeze(raw_q)
+    body = _squeeze(text or "")
+    if not q or not body:
+        return QuoteCheck(ok=False, kind="fabricated", origin=origin,
+                          quote_chars=len(raw_q))
+    if q in body:
+        # 逐字可回溯。再区分"正文里就是连续子串"与"仅空白/换行不同"
+        kind = "exact" if raw_q in (text or "") else "normalized"
+        return QuoteCheck(ok=True, kind=kind, similarity=1.0, origin=origin,
+                          quote_chars=len(raw_q))
+    # 找不到 → 判"改写"还是"编造"。
+    # ⚠️ 用 find_longest_match 只看**一个**块会把"改写"误判成"编造"
+    #    （改写往往有多段连续重合：`索引是加速` + `的数据结构`）→ 这里**累加**所有匹配块。
+    #    忽略长度 1 的块（单字偶然重合没有信息量）。
+    sm = difflib.SequenceMatcher(None, q, body, autojunk=False)
+    matched = sum(b.size for b in sm.get_matching_blocks() if b.size >= 2)
+    ratio = (matched / len(q)) if q else 0.0
+    kind = "rewritten" if ratio >= QUOTE_REWRITE_RATIO else "fabricated"
+    return QuoteCheck(ok=False, kind=kind, similarity=ratio, origin=origin,
+                      quote_chars=len(raw_q))
+
+
+def unit_origin(pu: "units_mod.PickedUnit", origin_pages: dict[str, str] | None,
+                fallback: str = "") -> str:
+    """由**逐页来源表 + 单元 span** 推导本单元来源：``native``/``ocr``/``mixed``/``""``。
+
+    为什么由 worker 推导：Node 只需把 ``documents.meta.text_origin_pages`` **转发**进来
+    （不必自己按 span 算）；worker 有 span，join 天然在这里做。
+    """
+    if isinstance(origin_pages, dict) and pu.span.kind == "page":
+        pages = [str(p) for p in range(int(pu.span.start), int(pu.span.end) + 1)]
+        seen = {str(origin_pages.get(p) or "").lower() for p in pages}
+        seen.discard("")
+        if seen:
+            if seen == {"ocr"}:
+                return "ocr"
+            if seen == {"native"}:
+                return "native"
+            return "mixed"
+    return (fallback or "").lower()
+
+
+def audit_cards(pu: "units_mod.PickedUnit", cards: Sequence[Card], *,
+                origin: str = "") -> list[dict[str, Any]]:
+    """逐卡片校验 evidence_quote → 审计条目（含原因分类）。"""
+    out: list[dict[str, Any]] = []
+    for c in cards:
+        chk = check_quote(c.evidence_quote, pu.text, origin=origin)
+        entry = {"cardId": c.id, "name": c.name, **chk.to_dict()}
+        out.append(entry)
+    return out
+
+
+def audit_edges(pu: "units_mod.PickedUnit", edges: Sequence[Edge], *,
+                origin: str = "") -> list[dict[str, Any]]:
+    """逐边校验 evidence_text（与卡片同一套判据）。"""
+    out: list[dict[str, Any]] = []
+    for e in edges:
+        chk = check_quote(getattr(e, "evidence_text", "") or "", pu.text, origin=origin)
+        out.append({"edgeId": getattr(e, "id", ""), "src": getattr(e, "src", ""),
+                    "dst": getattr(e, "dst", ""), **chk.to_dict()})
+    return out
+
+
+#: 审计结果的计数器后缀（stats 用）
+_QUOTE_STAT_KEYS = ("exact", "normalized", "rewritten", "fabricated", "missing")
+
+
+def record_quote_audit(outcome: "ExtractOutcome", pu: "units_mod.PickedUnit",
+                       cards: Sequence[Card], edges: Sequence[Edge], *,
+                       origin: str = "", warn_limit: int = 20) -> None:
+    """把审计结果记进 ``stats`` + ``warnings``（**不丢卡片** —— 见下）。"""
+    card_audit = audit_cards(pu, cards, origin=origin)
+    edge_audit = audit_edges(pu, edges, origin=origin)
+    outcome.stats.setdefault("quoteAudit", [])
+    for entry in card_audit + edge_audit:
+        key = f"quote_{entry['kind']}"
+        outcome.stats[key] = int(outcome.stats.get(key) or 0) + 1
+    if card_audit or edge_audit:
+        outcome.stats["quoteAudit"].extend(card_audit)
+        outcome.stats["quoteAudit"].extend(edge_audit)
+    outcome.stats["cards_evidence_ok"] = int(outcome.stats.get("cards_evidence_ok") or 0) + sum(
+        1 for a in card_audit if a["ok"])
+    outcome.stats["cards_evidence_bad"] = int(outcome.stats.get("cards_evidence_bad") or 0) + sum(
+        1 for a in card_audit if not a["ok"])
+    # ★ 只**告警**不丢卡片：卡片内容可能仍然正确，丢掉的代价是信息永久消失；
+    #   而"引用不可回溯"必须被调用方看见（UI 标记 + stats 计数 + warnings）。
+    #   若将来要求"证据不可回溯就不入库"，改这里一行即可（但必须同时给出统计口径）。
+    for entry in card_audit + edge_audit:
+        if entry["ok"] or len(outcome.warnings) >= warn_limit:
+            continue
+        kind = entry["kind"]
+        why = {
+            "missing": "**没有给引用**（evidence_quote 为空）",
+            "fabricated": "引用**在正文里找不到**，且与正文没有明显重合 → 疑似**编造**",
+            "rewritten": "引用**在正文里找不到**，但与正文某段高度重合 → 疑似**改写/润色**"
+                         "（如把 OCR 错字'顺手修正'了）",
+        }.get(kind, kind)
+        origin_note = {"ocr": "；该单元正文来自 **OCR**（更应逐字抄，不要修正）",
+                       "mixed": "；该单元跨原生/OCR 页（mixed）"}.get(entry.get("textOrigin", ""), "")
+        outcome.warnings.append({
+            "code": "W_EVIDENCE_NOT_VERBATIM",
+            "unit_id": pu.unit_id,
+            "title": pu.title,
+            "target": entry.get("cardId") or entry.get("edgeId") or "",
+            "name": entry.get("name") or f"{entry.get('src','')}→{entry.get('dst','')}",
+            "quote_kind": kind,
+            "similarity": entry["similarity"],
+            "text_origin": entry.get("textOrigin", ""),
+            "msg": f"证据不可逐字回溯：{why}（相似度 {entry['similarity']:.2f}）{origin_note}",
+        })
+
+
 def build_cards(doc_id: str, pu: "units_mod.PickedUnit", raw_cards: Sequence[dict]) -> list[Card]:
     """模型输出 → :class:`Card` 列表（非法枚举**丢弃并记日志**，不炸整篇）。"""
     out: list[Card] = []
@@ -685,6 +867,11 @@ def _emit(emit: EmitFn | None, event: dict[str, Any]) -> None:
 def extract_units(
     *,
     doc_id: str,
+    #: 逐页来源表（`documents.meta.text_origin_pages`，Node 原样转发即可）：
+    #: ``{"30": "ocr", "1": "native"}`` → worker 按 unit span 推导每单元来源
+    text_origin_pages: dict[str, str] | None = None,
+    #: 文档级兜底来源（没有逐页表时用，如整份扫描件 ``"ocr"``）
+    text_origin: str = "",
     units: Sequence[Unit],
     llm: LLMClient,
     source_name: str = "课程资料",
@@ -825,6 +1012,9 @@ def extract_units(
         if not cards:
             note_no_cards(outcome, pu, raw_cards, data.get("section") or {})
         graph = build_graph(doc_id, pu, data)
+        # ★ 证据逐字校验（wiki-architect 请求 ②）：把"必须逐字摘录"变成**可断言的事实**
+        record_quote_audit(outcome, pu, cards, graph.edges,
+                           origin=unit_origin(pu, text_origin_pages, text_origin))
         outcome.cards.extend(cards)
         outcome.entities.extend(graph.entities)
         outcome.edges.extend(graph.edges)
@@ -902,6 +1092,9 @@ def extract_units(
 def plan_prompts(
     *,
     units: Sequence[Unit],
+    #: 逐页来源表（documents.meta.text_origin_pages）→ worker 按 span 推导每单元来源
+    text_origin_pages: dict[str, str] | None = None,
+    text_origin: str = "",
     source_name: str = "课程资料",
     max_pages: int = units_mod.MAX_PAGES_PER_UNIT,
     pages_total: int = 0,
@@ -932,6 +1125,9 @@ def plan_prompts(
                 #   （`key` 里含 unit_id；若 Node 在 plan 与 convert 之间换了
                 #     doc_id/合成规则，用 unit_key 匹配即可 —— 实测踩过这个坑）
                 "unit_key": f"{ord_by_id.get(pu.unit_id, 0)}#{pu.span.kind}:{pu.span.start}-{pu.span.end}",
+                #: ★ 本单元来源（native/ocr/mixed）—— 供 Node 落库/前端标注；
+                #: 提示词用的是**一条通用约束**（不按来源分身），所以这不是提示词开关
+                "text_origin": unit_origin(pu, text_origin_pages, text_origin),
                 "unit_ord": ord_by_id.get(pu.unit_id, 0),
                 "unit_id": pu.unit_id,
                 "title": pu.title,
@@ -961,6 +1157,8 @@ def convert_payloads(
     *,
     doc_id: str,
     units: Sequence[Unit],
+    text_origin_pages: dict[str, str] | None = None,
+    text_origin: str = "",
     payloads: Sequence[dict[str, Any]],
     max_pages: int = units_mod.MAX_PAGES_PER_UNIT,
     pages_total: int = 0,
@@ -1027,6 +1225,8 @@ def convert_payloads(
         if not cards:
             note_no_cards(outcome, pu, raw_cards, (data or {}).get("section") or {})
         graph = build_graph(doc_id, pu, data or {})
+        record_quote_audit(outcome, pu, cards, graph.edges,
+                           origin=unit_origin(pu, text_origin_pages, text_origin))
         outcome.cards.extend(cards)
         outcome.entities.extend(graph.entities)
         outcome.edges.extend(graph.edges)

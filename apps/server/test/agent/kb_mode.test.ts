@@ -138,8 +138,8 @@ async function run(connOpts: Record<string, unknown>, promptMsg: Record<string, 
 // 1. 模式
 // ---------------------------------------------------------------------------
 
-test('★ 契约帧表：11 种（含 context / retrieval）', () => {
-  assert.equal(AGENT_FRAME_TYPES.length, 11);
+test('★ 契约帧表：12 种（含 context / retrieval / history）', () => {
+  assert.equal(AGENT_FRAME_TYPES.length, 12);
   assert.ok(AGENT_FRAME_TYPES.includes('context'));
   assert.ok(AGENT_FRAME_TYPES.includes('retrieval'));
 });
