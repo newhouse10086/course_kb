@@ -134,6 +134,16 @@ export interface Extractor {
 // worker + provider 组合实现（A1）
 // ═══════════════════════════════════════════════════════════════════════
 
+/**
+ * ★ **抽取的结构化输出预算**（8192）。
+ *
+ * 为什么是 8192 而不是 4096：端点是**推理模型**，推理 token **计入 `max_tokens`**
+ * （实测 8 字回复用 54 reasoning token）；一个单元要产出多张卡片的 JSON，
+ * 4096 很容易被推理吃光 → 空 content / 截断 JSON（与 `PROBE_MAX_TOKENS` 的假绿同机制）。
+ * worker 侧契约对结构化输出的建议是 ≥2000，这里是"结构化 + 推理开销"的取值。
+ */
+export const EXTRACT_MAX_TOKENS = 8192;
+
 export interface WorkerExtractorDeps {
   runner: WorkerRunnerWithRaw;
   completeJson: CompleteJsonFn;
@@ -282,6 +292,15 @@ export function createWorkerExtractor(deps: WorkerExtractorDeps): Extractor {
             // ★ plan 给的是裸 schema → 补 name（provider 层要 {name, schema}）
             schema: { name: schemaName, schema: rawSchema },
             temperature: 0,
+            /**
+             * ★ **显式传输出预算**（坑 24：`maxTokens` 原先"只有声明、没有调用方" → 抽取恒用 provider 默认 4096）。
+             *
+             * 为什么必须显式且要大：本端点是**推理模型**，**推理 token 计入 `max_tokens`**
+             * （实测 8 字回复用 54 reasoning token）→ 长单元的结构化输出（多张卡片 JSON）
+             * 在 4096 下很容易被推理吃光 → 空 content / 截断 JSON。
+             * 与 `PROBE_MAX_TOKENS` 的假绿是**同一机制**（预算被推理吃光）。
+             */
+            maxTokens: EXTRACT_MAX_TOKENS,
             ...(req.signal ? { signal: req.signal } : {}),
           });
           payloads.push({ key, data: res.data });

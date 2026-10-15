@@ -104,18 +104,64 @@ export interface OpenAiCompatibleOptions {
  */
 export const PROBE_MAX_TOKENS = 512;
 
+/**
+ * ★ **单请求超时**（原为**硬编码** `120_000` —— 坑 24「死旋钮」）。
+ *
+ * ## 为什么必须可配（实测证据）
+ * 真跑抽取时 5 次调用耗时 `[120009, 125886, 127592, 127590, 130213]` —— **全部贴着 120s 上限**：
+ * 这是**撞天花板**（超时），不是"模型慢"（慢模型会给出**分散**的耗时）。
+ * 而本项目的端点是**推理模型**（推理 token 计入 `max_tokens`），长单元的结构化输出天然更慢 →
+ * **运维必须能调大**，否则慢模型上抽取**必然失败**且无从调整。
+ *
+ * ## 优先级（`extra` > env > 默认）
+ * 1. `OpenAiCompatibleOptions.extra.timeoutMs` —— 契约里**已承诺**（原实现从不读 → 死旋钮）
+ * 2. 环境变量 `LLM_TIMEOUT_MS`
+ * 3. 本默认值
+ *
+ * ⚠️ 原错误写法：`setTimeout(() => ctrl.abort(...), 120_000)`（字面量，无任何读取）。
+ * **"能配"和"真的会生效"是两件事** —— 断言必须打在**请求行为**上（给极小值→立刻超时）。
+ */
+export const DEFAULT_LLM_TIMEOUT_MS = 120_000;
+
+/** ★ 超时重试的**总预算**（防止 `120s × N` 让任务耗时翻倍）。env：`LLM_RETRY_BUDGET_MS`。 */
+export const DEFAULT_LLM_RETRY_BUDGET_MS = 240_000;
+
+/** 解析单请求超时（`extra` > env > 默认；非法/非正值一律忽略，**不静默变 0**）。 */
+export function resolveLlmTimeoutMs(extra?: Record<string, unknown>): number {
+  const fromExtra = extra?.timeoutMs;
+  if (typeof fromExtra === 'number' && Number.isFinite(fromExtra) && fromExtra > 0) return fromExtra;
+  const fromEnv = Number(process.env.LLM_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return DEFAULT_LLM_TIMEOUT_MS;
+}
+
+/** 解析重试总预算（`extra.retryBudgetMs` > env `LLM_RETRY_BUDGET_MS` > 默认）。 */
+export function resolveLlmRetryBudgetMs(extra?: Record<string, unknown>): number {
+  const fromExtra = extra?.retryBudgetMs;
+  if (typeof fromExtra === 'number' && Number.isFinite(fromExtra) && fromExtra > 0) return fromExtra;
+  const fromEnv = Number(process.env.LLM_RETRY_BUDGET_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return DEFAULT_LLM_RETRY_BUDGET_MS;
+}
+
 export class OpenAiCompatibleLlm implements Provider {
   readonly info: ProviderInfo;
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly model: string;
   private readonly secrets: string[];
+  /** ★ 单请求超时（已解析；`extra` > env > 默认） */
+  private readonly timeoutMs: number;
+  /** ★ 超时重试总预算 */
+  private readonly retryBudgetMs: number;
 
   constructor(o: OpenAiCompatibleOptions) {
     this.baseUrl = o.baseUrl.replace(/\/+$/, '');
     this.apiKey = o.apiKey;
     this.model = o.model;
     this.secrets = [o.apiKey];
+    this.timeoutMs = resolveLlmTimeoutMs(o.extra);
+    this.retryBudgetMs = resolveLlmRetryBudgetMs(o.extra);
     this.info = {
       id: o.id ?? 'openai-compatible',
       kind: 'llm',
@@ -249,10 +295,32 @@ export class OpenAiCompatibleLlm implements Provider {
           },
         },
       };
-      const resp = (await this.post(body, req.signal)) as {
+      /**
+       * ★ **超时重试一次**（坑 24 的配套修复）。
+       *
+       * ## 为什么只重试 `E_TIMEOUT`
+       * 结构化输出（`json_schema` + `strict`）是**幂等**的：同样的 messages 再问一次不会产生副作用
+       * （不像"下单/写库"那类操作）→ 重试安全。其它错误（`E_LLM` 4xx/5xx、非 JSON）**不重试**：
+       * 那多半是配置/额度/模型问题，重试只会浪费时间与额度。
+       *
+       * ## 为什么必须有**总预算**
+       * 否则"重试一次"会让单次任务实际耗时变成 `120s × 2` —— 用户看到的是任务卡住更久。
+       * 规则：`已用 + 单次超时 <= retryBudgetMs` 才允许重试，且**第二次的超时收窄到剩余预算**。
+       */
+      const startedAt = Date.now();
+      let resp: {
         choices?: { message?: { content?: string } }[];
         usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
+      try {
+        resp = (await this.post(body, req.signal)) as typeof resp;
+      } catch (e) {
+        const isTimeout = e instanceof ProviderError && e.code === 'E_TIMEOUT';
+        const elapsed = Date.now() - startedAt;
+        const remaining = this.retryBudgetMs - elapsed;
+        if (!isTimeout || remaining < this.timeoutMs) throw e;
+        resp = (await this.post(body, req.signal, remaining)) as typeof resp;
+      }
       const raw = resp.choices?.[0]?.message?.content ?? '';
       if (!raw) {
         throw new ProviderError('E_LLM', `${this.info.id} 返回空内容`, '模型无输出，可能是上下文过长或触发审查');
@@ -283,9 +351,12 @@ export class OpenAiCompatibleLlm implements Provider {
   // HTTP
   // ─────────────────────────────────────────────
 
-  private async post(body: unknown, signal?: AbortSignal): Promise<unknown> {
+  private async post(body: unknown, signal?: AbortSignal, timeoutOverrideMs?: number): Promise<unknown> {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error('timeout')), 120_000);
+    // ★ 不再硬编码：`extra.timeoutMs` > `LLM_TIMEOUT_MS` > 默认（见 `resolveLlmTimeoutMs`）。
+    //   重试时可用 `timeoutOverrideMs` 收窄到"剩余预算"，避免单次重试又跑满 120s。
+    const timeoutMs = timeoutOverrideMs && timeoutOverrideMs > 0 ? timeoutOverrideMs : this.timeoutMs;
+    const timer = setTimeout(() => ctrl.abort(new Error('timeout')), timeoutMs);
     const onAbort = () => ctrl.abort(signal?.reason);
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
