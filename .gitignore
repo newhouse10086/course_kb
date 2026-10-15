@@ -48,3 +48,6 @@ apps/web/test/screenshots/*.png
 *.tmp
 # ⚠️ 不要用 _*.py：它会匹配 __init__.py，导致包标记不被跟踪、clone 后 worker 直接坏掉（真实踩过）
 _scratch_*.py
+
+# ASR 探测残留（video-pipeline 的临时产物）
+asr-probe-*.wav
