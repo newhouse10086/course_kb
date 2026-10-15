@@ -543,3 +543,34 @@ def test_engines_report_json_roundtrip_keeps_shape() -> None:
     assert sqlite["capabilities"]["transactions"]["cross_call"] is False
     assert sqlite["available"] is True
 
+def test_dialect_hints_follow_target_engine() -> None:
+    """★ 方言提示必须按**目标引擎方言**分派。
+
+    原错误写法：`dialect_hints(sql)` 无条件给"MySQL 的 NOW() 应写成 datetime('now')"——
+    在**真 MySQL** 引擎上，学生写的 `NOW()` 本来就是对的，这条提示是**反向误导**。
+    """
+    from worker.sandbox.guard import dialect_hints
+
+    sql = "SELECT NOW()"
+    assert dialect_hints(sql, "sqlite"), "sqlite 目标应给出 MySQL→SQLite 提示"
+    assert dialect_hints(sql, "mysql") == [], "MySQL 目标不许给 SQLite 建议（反向误导）"
+    assert dialect_hints(sql, "postgres") == []
+    # 默认仍是 sqlite（向后兼容）
+    assert dialect_hints(sql) == dialect_hints(sql, "sqlite")
+
+
+def test_exec_result_hints_match_target_dialect() -> None:
+    """端到端：底层 execute 的 hints 字段随 target_dialect 变。"""
+    import tempfile
+
+    from worker.sandbox import exec as exec_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "h.sqlite3"
+        out_sqlite = exec_mod.execute(db_path=db, sql="SELECT NOW()", root=tmp,
+                                      record_history=False)
+        assert out_sqlite["hints"], out_sqlite["hints"]
+        out_mysql = exec_mod.execute(db_path=db, sql="SELECT NOW()", root=tmp,
+                                     engine_id="mysql", target_dialect="mysql",
+                                     record_history=False)
+        assert out_mysql["hints"] == [], out_mysql["hints"]

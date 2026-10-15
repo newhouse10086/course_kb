@@ -622,7 +622,7 @@ worker 外壳统一保证协议格式与退出码。
 | PostgreSQL 真实执行 | 同上 | `LAB_PG_PASSWORD='…' bash scripts/deploy-lab-db.sh postgres -y` → `sandbox.schema`/`sandbox.exec` 同断言（`engine:"postgres"`） | **高** |
 | openGauss 真实执行 | 官方只支持 openEuler/CentOS；本机 Ubuntu + WSL | 在 openEuler 虚机/容器里 `bash scripts/deploy-lab-db.sh opengauss --check --host <host> --port 5432`；再跑同一批 `sandbox.exec` | 中 |
 | 服务器引擎上的**危险语句负例**（ATTACH / `load_extension` / 多语句 / GRANT） | 无 DB → 现在只会得到 `E_ENGINE_UNAVAILABLE`，**验不到**闸在真引擎上的行为 | 装好后跑 §10.2 那批负例 → 期望 `E_SQL_FORBIDDEN` / `E_SQL_MULTI`（**不是** `E_ENGINE_UNAVAILABLE`） | 中 |
-| 方言差异（`AUTO_INCREMENT` / `NOW()` / `LIMIT` 写法） | 无 DB | 用 MySQL 方言 SQL 打 `sandbox.exec`（engine=mysql）→ 期望引擎**原生**错误，且 `hints` **不再**给"MySQL 的 NOW() 应写成 `datetime('now')`"这类**反向**提示（提示目前由 `dialect_hints()` 按 SQLite 目标生成，接 MySQL 后需要按目标方言分派） | 中 |
+| 方言差异（`AUTO_INCREMENT` / `NOW()` / `LIMIT` 写法）的**引擎原生报错文案** | 无 DB（`hints` 的反向误导**已在 worker 侧修掉并断言**：`dialect_hints(sql, target_dialect)` 只对 sqlite 目标给 SQLite 建议） | 用 MySQL 方言 SQL 打 `sandbox.exec`（engine=mysql）→ 期望引擎**原生**错误文案（不是 SQLite 语法错），且 `hints == []` | 中 |
 | 跨调用事务拒绝在 server 引擎上同样生效 | 无 DB（逻辑在 `exec.py`，与引擎无关，但未在真 server 引擎上跑过） | 装好后单发 `{"engine":"mysql","sql":"BEGIN"}` → 期望 `E_SQL_UNSUPPORTED` + `who:"rules"` | 低 |
 | L2/L3 日志（slow log / `pg_stat_statements`） | adapter 未接入 + 无 DB | 按 `docs/LAB_DB_DEPLOY.md §8` 接 adapter → `sandbox.logs` 期望 `layers` 含 L2/L3、`status:"ok"`；`boundary` 不再说"该引擎没有 L2/L3" | 中 |
 | `--check` 的**真连通**（客户端在 + 服务在跑） | 本机无客户端 → 现在只验到"找不到客户端"这一层 | 装好后 `bash scripts/deploy-lab-db.sh mysql --check` → 期望 **exit 0** + 真查询回读（不是只看客户端存在） | 中 |

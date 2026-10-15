@@ -361,10 +361,25 @@ def check_one(sql: str, *, max_length: int = 20_000) -> Verdict:
     return Verdict(True, kind=kind, statement=original, hints=dialect_hints(raw))
 
 
-def dialect_hints(sql: str) -> list[str]:
-    """MySQL → SQLite 方言提示（非致命，随结果一起返回）。"""
+#: 目前只有"MySQL 写法 → SQLite 目标"这一张提示表。
+#: ⚠️ **原错误写法**：`dialect_hints(sql)` 不看目标引擎，无条件给 SQLite 建议 ——
+#: 一旦真接 MySQL 引擎，学生写 `NOW()`（在 MySQL 里**完全正确**）会收到
+#: "MySQL 的 NOW() 在 SQLite 写成 datetime('now')" 这种**反向误导**。
+#: 现在按**目标方言**分派：只有目标是 sqlite 时才给这张表。
+DIALECT_HINTS_BY_TARGET: dict[str, tuple[tuple[Any, str], ...]] = {
+    "sqlite": DIALECT_HINTS,
+}
+
+
+def dialect_hints(sql: str, target_dialect: str = "sqlite") -> list[str]:
+    """方言提示（非致命，随结果一起返回）。
+
+    :param target_dialect: **实际执行引擎**的方言。只对该方言有把握的提示才会给出；
+        没有对应表 → 返回空（宁可不说，也不给反向建议）。
+    """
+    table = DIALECT_HINTS_BY_TARGET.get((target_dialect or "").lower(), ())
     out: list[str] = []
-    for pattern, message in DIALECT_HINTS:
+    for pattern, message in table:
         if pattern.search(sql or "") and message not in out:
             out.append(message)
     return out

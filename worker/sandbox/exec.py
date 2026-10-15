@@ -55,7 +55,7 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
             timeout_ms: int = 5_000, user_id: str = "", session_id: str = "",
             allow_multi: bool = False, root: str | Path | None = None,
             max_db_bytes: int | None = None, record_history: bool = True,
-            engine_id: str = "sqlite") -> dict[str, Any]:
+            engine_id: str = "sqlite", target_dialect: str = "sqlite") -> dict[str, Any]:
     """执行一条（或一批显式分隔的）SQL，返回 ``ExecResult`` 形状的字典。
 
     结果里有两个**给人看**的额外字段（S4 答疑要用）：
@@ -68,7 +68,8 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     """
     roots = SandboxRoots.resolve(root)
     path = roots.validate(db_path)
-    hints = dialect_hints(sql)
+    # ★ 方言提示按**目标引擎方言**分派：对 MySQL 目标不能给 SQLite 建议
+    hints = dialect_hints(sql, target_dialect=target_dialect)
 
     # ① 词法闸（第一道）—— 不通过就不执行，并且**仍然记审计**（学生试过什么很重要）
     verdict = check_sql(sql, allow_multi=allow_multi)
@@ -204,7 +205,11 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     # ★ 标签以**父进程传入的 engine_id 为准**（原错误写法：setdefault("engine","sqlite")）
     #   子进程（runner）不设这个字段，所以 setdefault 会让 MySQL 的结果写着 sqlite
     result["engine"] = engine_id
-    result["hints"] = hints or result.get("hints") or []
+    # ★ 方言提示也以**父进程**为准（只有它知道目标方言）。
+    #   ⚠️ 原写法 `hints or result.get("hints") or []` 有坑：**空列表是有意义的**
+    #   （"该目标方言没有提示"），`or` 把它当"缺失"→ 回落到子进程按 **SQLite** 算的提示
+    #   → MySQL 目标又收到 SQLite 建议（反向误导）。判"缺失"要用 `is None`。
+    result["hints"] = hints if hints is not None else (result.get("hints") or [])
     result.setdefault("elapsedMs", elapsed_ms)
     if proc.returncode not in (0,) and not result.get("error"):
         result["error"] = {

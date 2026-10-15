@@ -310,6 +310,8 @@ class SQLiteEngine:
             # ★ 结果里的 engine 标签只能来自**真正执行的引擎**
             #   （原错误写法：exec.py 里硬编码 "sqlite" → 接 MySQL 后标签会撒谎）
             engine_id=self.info.id,
+            # 方言提示也要按**本引擎的方言**分派（不是写死 sqlite）
+            target_dialect=self.info.dialect,
         )
 
     def list_datasets(self) -> list[dict[str, Any]]:
