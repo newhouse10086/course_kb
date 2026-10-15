@@ -1,4 +1,4 @@
-﻿/**
+/**
  * REST 客户端 —— 契约 docs/API_PROTOCOL.md §5（字段唯一权威）
  *
  * 设计要点：
@@ -252,15 +252,21 @@ export const api = {
   /** §6 SSE 进度流地址 */
   taskEventsUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/events`,
   /** §7.2 对话 WebSocket（同源派生，测试可用 ?ws= 覆盖；参数在 hash query 里也能读到） */
-  chatWsUrl: (sessionId: string) => {
-    if (typeof location === 'undefined') return `ws://127.0.0.1:8787/api/v1/chat/${sessionId}`
+    /**
+   * §7.2 对话 WS。★ **模式是连接级参数**（backend-api 实测）：
+   * `?mode=chat|agent` —— pi 把 mode 编进会话 key，**工具集在建会话时确定**；
+   * 帧里带 `mode` 只做一致性校验。所以**切模式必须重连**（会丢上下文，这是有意取舍）。
+   */
+  chatWsUrl: (sessionId: string, mode?: 'chat' | 'agent') => {
+    const q = mode ? `?mode=${mode}` : ''
+    if (typeof location === 'undefined') return `ws://127.0.0.1:8787/api/v1/chat/${sessionId}${q}`
     const h = location.hash || ''
     const i = h.indexOf('?')
     const hashParams = i >= 0 ? new URLSearchParams(h.slice(i + 1)) : null
     const override = new URLSearchParams(location.search).get('ws') || hashParams?.get('ws')
-    if (override) return `${override.replace(/\/$/, '')}/${sessionId}`
+    if (override) return `${override.replace(/\/$/, '')}/${sessionId}${q}`
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    return `${proto}//${location.host}/api/v1/chat/${sessionId}`
+    return `${proto}//${location.host}/api/v1/chat/${sessionId}${q}`
   },
 }
 

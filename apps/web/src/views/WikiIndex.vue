@@ -12,6 +12,7 @@
  *
  * 无头断言见 `?selftest=1`：把真实点击的结果写进 `#selftest-report`。
  */
+import { setAssistantContext } from '../composables/useAssistantContext'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client'
@@ -342,6 +343,15 @@ const _fmtSpan = fmtSpan
 const _linkify = linkify
 
 watch(() => route.query.doc, (v, old) => {
+// ★ 小助手上下文：**只传 id**（doc + 当前这一节 unit）
+watch([() => route.query.doc, unitId], () => {
+  const d = String(route.query.doc || '')
+  const u = String(unitId.value || '')
+  setAssistantContext(
+    { ...(d ? { doc_id: d } : {}), ...(u ? { unit_id: u } : {}) },
+    [d ? '当前文档' : '', u ? '当前章节' : ''].filter(Boolean).join(' / '),
+  )
+}, { immediate: true })
   if (v && v !== old) {
     // ⚠️ 换文档时**必须清掉上一次的检索结果**：页面不会重载，旧命中会留在屏幕上，
     //    看起来像"在新文档里搜到了"，其实是另一份文档的结果（对着真后端实测踩到）

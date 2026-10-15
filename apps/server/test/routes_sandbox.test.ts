@@ -672,6 +672,22 @@ test('/capabilities 的 sandbox 段：真探测（engine 可用 + 逐引擎原�
     assert.equal(seg.transactions_cross_call, false, '必须如实标注"跨调用事务不支持"');
     assert.match(String(seg.transactions_note), /独立进程/);
     assert.match(String(seg.transactions_note), /multi:true/);
+
+    // ★ 对话模式自述（Lead 裁定）：前端据此渲染模式选择器，**不按 roles 推断**
+    const cm = caps.body.chat_modes as Record<string, unknown>;
+    assert.ok(cm, '必须有 chat_modes 段');
+    assert.deepEqual(cm.modes, ['chat', 'agent'], '必须如实列出两种模式');
+    assert.equal(cm.default, 'chat', '默认必须是 chat（无工具）');
+    assert.deepEqual(cm.tools, { chat: [], agent: ['kb_search', 'kb_get'] }, '各模式的工具必须如实列出');
+    assert.deepEqual(
+      (cm.allowed_roles as Record<string, string[]>).agent,
+      ['admin', 'teacher', 'student'],
+      '★ agent 允许的角色必须含 student（Lead 裁定：答疑的主体是学生，只读工具风险画像不同）',
+    );
+    const kbSeg = cm.kb as Record<string, unknown>;
+    assert.equal(kbSeg.available, true, '只读知识库查询必须已接入（否则 agent 模式会降级）');
+    assert.equal(kbSeg.readonly, true, '★ 必须如实标"只读"');
+    assert.equal(kbSeg.scoped_by, 'userId', '★ 必须说明按 userId 过滤可见性');
   } finally {
     await live.built.close();
   }

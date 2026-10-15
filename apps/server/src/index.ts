@@ -42,6 +42,7 @@ import { registerSearchRoutes } from './routes/search.ts';
 import { registerTaskRoutes } from './routes/tasks.ts';
 import { registerChatRoute } from './routes/chat.ts';
 import { registerSandboxRoutes, DEFAULT_LIMITS, ownerOfSession, readCrossCallTx } from './routes/sandbox.ts';
+import { createKbQuery } from './store/kb-query.ts';
 import { registerAuthRoutes } from './routes/auth.ts';
 import { registerRbacRoutes } from './routes/rbac.ts';
 import { installAuth } from './auth/middleware.ts';
@@ -254,6 +255,22 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   }
 
   /**
+   * ★ **只读知识库查询**（agent 模式的 `kb_search`/`kb_get` 用它）。
+   *
+   * 为什么在这里构造而不是让 agent 层自己查库：
+   * 可见性过滤必须复用 RBAC 的 `docScopeSql()` —— **agent 工具不能成为绕过 RBAC 的后门**
+   * （否则学生用 `kb_get('crd_xxx')` 就能读别人/未发布的草稿）。
+   * 模块里只有 SELECT，没有写/删/执行 SQL 的入口（工具的能力边界 = 该模块的导出）。
+   *
+   * ⚠️ **必须早于 agent 会话管理器构造**：`kb` 要注入 `AgentSessionManager`
+   * （`kb_search`/`kb_get` 的注册在那一层）。我第一版只把它放在**每次连接**的选项里 →
+   * 实测 `ready.tools=[]` + `tools_source=kb-readonly`：**代码以为开了 kb 工具，实际没注册**
+   * （模型回"当前会话没有这两个工具"）—— 正是"看起来成功"那类坑。
+   */
+  const kb: AppDeps['kb'] = createKbQuery({ db, repo });
+  process.stderr.write('[kb] 只读知识库查询已接入（kb_search/kb_get；按 userId 过滤可见性）\n');
+
+  /**
    * 物化后的 pi 会话管理器（`agentDir` = `data/pi-agent/`）。
    * **chat 与 /sandbox/ask 必须共用同一个** —— 否则答疑走 pi 的默认会话 → 全局默认模型 + 失效 key → 403。
    */
@@ -287,6 +304,9 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
             //   "No API key found for <provider>"；而 auth.json 形状不对时更糟 —— **静默挂死**（180s 零帧）。
             agentDir: piModels.agentDir,
             model: piModels.modelRef,
+            // ★ 只读知识库工具（`kb_search`/`kb_get`）—— **必须在建管理器时注入**，
+            //   否则 `ready.tools` 会是 `[]`（代码以为开了、实际没注册）
+            kb,
           });
           agentManager = manager;
           chatFactory = (connOpts) => createConn({ ...connOpts, manager } as never);
@@ -372,6 +392,11 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   const retrievalMod = await tryImport<{
     createRetrievalFacade?: (opts: { db: Db; repo: Repo; edgeTypes?: string[] }) => NonNullable<AppDeps['retrieval']>;
   }>('./retrieval/index.ts');
+  /**
+   * ★ **只读知识库查询**（agent 模式的 `kb_search`/`kb_get` 用它；**构造在上面**，因为要注入会话管理器）。
+   * 这里只做接线说明，不再重复构造（避免两处真相）。
+   */
+
   let retrieval: AppDeps['retrieval'] = null;
   if (typeof retrievalMod.mod?.createRetrievalFacade === 'function') {
     try {
@@ -542,6 +567,8 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     agentError,
     chatFactory,
     retrieval,
+    // ★ 只读知识库查询（agent 模式的 kb_search/kb_get；已按 userId 过滤可见性）
+    kb,
     sandboxAsk,
     // 沙箱限制：**实时**取自 settings.json（热重载改了立刻生效）；未接入 → DEFAULT_LIMITS 兜底
     sandboxLimits: () => {

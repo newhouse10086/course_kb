@@ -7,6 +7,7 @@
  *   · 节点大小 ∝ degree；点击节点看它的边与证据
  *   · `?focus=<ent_id>` 深链定位；`?selftest=1` 把真实筛选/点击结果写进报告
  */
+import { setAssistantContext } from '../composables/useAssistantContext'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useCaps } from '../composables/useCaps'
@@ -269,6 +270,11 @@ async function runSelftest() {
   if (box) box.textContent = report.ok ? '自检通过' : `自检未通过：${failed.join(', ')}`
   return report
 }
+
+// ★ 小助手上下文：doc（图聚焦节点不是后端认识的 id，暂不传 —— 不传自由文本）
+watch(() => route.query.doc, (d) => {
+  setAssistantContext(d ? { doc_id: String(d) } : {}, d ? '当前文档（图谱）' : '')
+}, { immediate: true })
 
 onMounted(boot)
 // 换文档不重挂载（见 App.vue 的 RouterView key 说明）→ 自己监听 query.doc 重新加载

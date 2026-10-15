@@ -496,6 +496,64 @@ def main() -> int:
             ok("wiki：why 里是可读的命中原因（bigram 命中「索引」）", "bigram 命中" in why_dom, "why 未显示可读原因")
             ok("wiki：命中项带 title/score", "聚簇索引" in why_dom and "score" in why_dom)
 
+        # ============ 9c. 模式选择器（chat / agent）—— 用户需求，两个正交控件 ============
+        def check_mode_switch() -> None:
+            dom = dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)
+            ok("模式分段控件存在（chat / agent）",
+               'data-testid="mode-select"' in dom and 'data-testid="mode-chat"' in dom and 'data-testid="mode-agent"' in dom)
+            ok("说清两者差异（快/能翻原文）", 'data-testid="mode-explain"' in dom and "kb_search" in dom)
+            ok("检索与模式是**两个独立控件**",
+               'data-testid="retrieval-select"' in dom and 'data-testid="mode-select"' in dom)
+            # 发一轮（chat 默认）→ 后端回显 agent_mode=chat 且 tools 为空
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='聚簇索引是什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("document.querySelector('[data-testid=\"backend-mode\"]')?.dataset.backendMode === 'chat'",
+                               timeout=60, interval=0.2)
+            chat_dom = driver.ch.outer_html()
+            ok("chat：后端回显 agent_mode=chat（不是自己选的）", 'data-backend-mode="chat"' in chat_dom)
+            ok("chat：**没有** kb 工具帧（chat 不读原文）", 'data-testid="retrieval-tool"' not in chat_dom)
+            # 切到 agent → 再发一轮 → 应有 kb_search/kb_get 工具帧 + tools 真值
+            driver.ch.evaluate("document.querySelector('[data-testid=\"mode-agent\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"mode-note\"]')", timeout=20, interval=0.2)
+            note = driver.ch.evaluate("document.querySelector('[data-testid=\"mode-note\"]').textContent")
+            ok("切模式如实提示上下文会重新开始", "上下文会重新开始" in str(note), str(note)[:120])
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='再讲一次聚簇索引'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"retrieval-tool\"]').length >= 2",
+                               timeout=60, interval=0.2)
+            agent_dom = driver.ch.outer_html()
+            ok("agent：后端回显 agent_mode=agent", 'data-backend-mode="agent"' in agent_dom)
+            ok("agent：真调用 kb_search", 'data-tool="kb_search"' in agent_dom)
+            ok("agent：真调用 kb_get（读原文）", 'data-tool="kb_get"' in agent_dom)
+            tools = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.tools || ''")
+            src = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.source || ''")
+            ok("agent：ready.tools 真值含 kb_search/kb_get",
+               "kb_search" in str(tools) and "kb_get" in str(tools), f"tools={tools}")
+            ok("agent：tools_source=kb-readonly", str(src) == "kb-readonly", f"source={src}")
+            ok("agent：不含 bash/read（不是全能 agent）",
+               "bash" not in str(tools) and "read" not in str(tools), f"tools={tools}")
+            ok("agent：工具卡显示读了哪张卡片（result_text）", "unt_0001" in agent_dom or "3.1 聚簇索引" in agent_dom)
+
+        run_view("模式选择器 / chat ⇄ agent（工具真值）", check_mode_switch)
+
+        # ============ 9d. context 帧：服务端解析出的真实标题 + dropped 如实显示 ============
+        def check_context_frame() -> None:
+            # 带一个**不存在**的 unit_id → 后端应丢进 dropped 并如实显示
+            dump_dom(driver, url(normal, "chat?selftest=0&doc=" + DOC_PDF + "&unit=unt_not_exist_zzz"), READY_VIEW)
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='这一节讲什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"context-used\"]')", timeout=60, interval=0.2)
+            dom = driver.ch.outer_html()
+            ok("context 帧：显示服务端解析出的**真实标题**（不是客户端 id）",
+               'data-testid="context-used"' in dom and "MySQL 26.7 Reference Manual" in dom, "未显示 doc_title")
+            ok("context 帧：解析不到的 unit_id 如实进 dropped（不静默）",
+               'data-testid="context-dropped"' in dom and "未找到或无权访问" in dom, "dropped 未显示")
+
+        run_view("context 帧 / 真实标题 + dropped 如实显示", check_context_frame)
+
         run_view("检索徽标 / wiki（命中 3 条）", check_retrieval_wiki)
 
         def check_retrieval_none() -> None:

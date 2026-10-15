@@ -6,8 +6,9 @@
  *   · 长任务必须能"看到进度"，而不是转圈等（C4 断点在服务端，前端负责可见）
  *   · 删除走 DELETE（级联）
  */
-import { computed, nextTick, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { setAssistantContext } from '../composables/useAssistantContext'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client'
 import { TaskStream } from '../api/sse'
 import { useDocuments } from '../composables/useCorpus'
@@ -15,6 +16,7 @@ import { fmtBytes, fmtMs } from '../utils/text'
 import { testBarrier, testBarrierDone, writeReport } from '../utils/report'
 import type { DocumentInfo } from '../api/types'
 
+const route = useRoute()
 const router = useRouter()
 const docsApi = useDocuments()
 const busy = ref(false)
@@ -107,6 +109,11 @@ async function remove(d: DocumentInfo) {
 function openDoc(d: DocumentInfo, view: 'wiki' | 'graph' | 'video') {
   void router.push({ path: `/${view}`, query: { doc: d.id } })
 }
+
+// ★ 小助手上下文：当前选中的 doc
+watch(() => route.query.doc, (d: unknown) => {
+  setAssistantContext(d ? { doc_id: String(d) } : {}, d ? '当前文档' : '')
+}, { immediate: true })
 
 onMounted(async () => {
   testBarrier()

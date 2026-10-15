@@ -7,6 +7,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import AssistantDock from './components/AssistantDock.vue'
 import CapabilityBanner from './components/CapabilityBanner.vue'
 import { useCaps } from './composables/useCaps'
 import { useDocuments } from './composables/useCorpus'
@@ -221,6 +222,10 @@ function toggleTheme() {
   只按 path 做 key：换文档不再重挂载，视图内部各自 watch `route.query.doc` 重新加载。
 -->
   <RouterView :key="route.path" />
+
+  <!-- ★ 全局 chat 小助手（用户需求："每个页面都要加一个 chat 小助手"）：
+       浮动入口 + 抽屉，带当前页上下文；与 /chat 整页共用同一个组件 -->
+  <AssistantDock />
 </template>
 
 

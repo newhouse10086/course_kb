@@ -16,8 +16,22 @@ import { useCaps } from '../composables/useCaps'
 import { esc } from '../utils/text'
 import { queryFlag, testBarrier, testBarrierDone, writeReport } from '../utils/report'
 
-interface ToolCall { id: string; tool: string; args?: unknown; partial?: string; ok?: boolean; duration_ms?: number; done: boolean }
+interface ToolCall { id: string; tool: string; args?: unknown; partial?: string; ok?: boolean; duration_ms?: number; done: boolean; result_text?: string }
 interface Msg { role: 'user' | 'assistant' | 'system'; text: string; thinking: string; tools: ToolCall[]; error?: { code?: string; msg?: string } }
+
+/**
+ * ★ 本组件是**共用的对话组件**（Lead 要求：整页与全局小助手**不写两套**）：
+ *   · `/chat` 整页 → `<Chat />`（默认 variant="page"，带自检 / 报告 / 同步屏障）
+ *   · 全局小助手抽屉 → `<Chat embedded :context="ctx" />`
+ *     `embedded` 时**跳过页面级副作用**（report / barrier / selftest），只做对话。
+ */
+const props = withDefaults(defineProps<{
+  embedded?: boolean
+  /** 页面上下文（**只传 id**；由 useAssistantContext 提供） */
+  context?: Record<string, string | number>
+  /** 抽屉标题（如"小助手 · 知识库"） */
+  title?: string
+}>(), { embedded: false, context: () => ({}), title: 'pi AI 助教' })
 
 const { caps, error: capsError } = useCaps()
 const sessionId = `web-${Math.random().toString(36).slice(2, 10)}`
@@ -67,10 +81,68 @@ function foldToolMarkers(text: string): { text: string; folded: number } {
 const retrieval = ref<RetrievalState | null>(null)
 /** 本轮会话**实际可用**的工具（`ready.tools` 真值）与其来源标签（pi-bridge 三态） */
 const sessionTools = ref<string[]>([])
+/**
+ * ★ chat / agent 模式（用户需求）—— 与 `retrieval` **正交**：
+ *   · mode=chat  → 快，只用检索摘要（`ready.tools = []`）
+ *   · mode=agent → 能调用 `kb_search`/`kb_get` **读知识库原文**，慢一些（**仍无** bash/read 主机工具）
+ * ⚠️ pi-bridge 契约：模式回显字段是 **`ready.agent_mode`**（`ready.mode` 是执行模式，恒 'sdk'）；
+ *    切换模式 = **新上下文**（后端会重发一帧 ready）。
+ */
+const chatMode = ref<'chat' | 'agent'>('chat')
+/** 后端**实际**给的模式（不信自己选的） */
+const backendMode = ref('')
+const modeNote = ref('')
+/**
+ * ★ `/capabilities.chat_modes` —— **服务端权威清单**（backend-api 实测）：
+ *   `{modes, default, tools:{chat:[],agent:['kb_search','kb_get']}, allowed_roles:{agent:['admin','teacher']}, kb:{available,readonly,scoped_by}, note}`
+ * ⚠️ **不按 `user.roles` 推断**（这轮已经因为"按预期形状读"吃过亏）—— 只读这个字段。
+ */
+const chatModes = computed(() => ((caps.value?.raw as any)?.chat_modes || {}) as {
+  modes?: string[]; default?: string
+  tools?: Record<string, string[]>
+  allowed_roles?: Record<string, string[]>
+  kb?: { available?: boolean; readonly?: boolean; scoped_by?: string }
+  note?: string
+})
+/** 我当前的角色（用来判断某模式是否被允许 —— 角色清单仍来自服务端字段） */
+const myRoles = computed<string[]>(() => {
+  const raw = (caps.value?.raw as any) || {}
+  return raw.user?.roles || raw.roles || []
+})
+/** 某模式是否被服务端允许（allowed_roles 缺省 = 不限制） */
+function modeAllowed(m: 'chat' | 'agent'): boolean {
+  const allowed = chatModes.value.allowed_roles?.[m]
+  if (!allowed || !allowed.length) return true
+  if (!myRoles.value.length) return true          // 角色未上报 → 不擅自禁用（让后端拒）
+  return myRoles.value.some((r) => allowed.includes(r))
+}
+const agentAllowed = computed(() => modeAllowed('agent'))
+const agentBlockReason = computed(() => agentAllowed.value ? ''
+  : `你的角色（${myRoles.value.join(', ') || '未上报'}）不在 agent 允许清单（${(chatModes.value.allowed_roles?.agent || []).join('/')}）—— 只读 chat`)
+/** 知识库为空：agent 必然 0 命中 → 如实提示"先上传并抽取"（别让它看起来像检索坏了） */
+const kbEmpty = computed(() => !!((caps.value?.raw as any)?.retrieval?.summary?.empty_kb))
+const kbEmptyHint = computed(() => String(((caps.value?.raw as any)?.retrieval?.summary?.hint) || '知识库当前为空（未抽取）→ 先上传资料并跑抽取，否则任何检索都必然 0 命中'))
+
+/** 检索选择（与 mode 正交的第二个控件；缺省 none = 不检索） */
+const retrievalChoice = ref<'none' | 'wiki' | 'kg' | 'rag'>('none')
+/**
+ * 页面上下文（Lead 2026-10-15 裁定）：**只传 id**，服务端解析成真实标题/正文。
+ * 本组件由页面通过 props 注入（整页对话传空；小助手传当前页上下文）。
+ */
+const pageContext = ref<Record<string, string | number>>({ ...props.context })
+// 上下文变化（页面切换 / 小助手打开时）→ 下一轮带上
+watch(() => props.context, (v) => { pageContext.value = { ...(v || {}) } }, { deep: true })
+
+/** 服务端**实际用了**哪些上下文（第 11 种帧 `context`）—— 显示"正在参考：…" */
+const contextResolved = ref<{ doc_title?: string; unit_title?: string }>({})
+const contextDropped = ref<Array<{ field: string; value?: string; reason?: string }>>([])
+const contextUsed = ref<Record<string, unknown>>({})
 const toolsSource = ref('')
 const TOOLS_SOURCE_LABEL: Record<string, string> = {
   'disabled-by-role': '按角色/缺省关闭（无工具 —— **这是正确的安全状态**）',
   explicit: '显式白名单',
+  // pi-bridge 新增：agent 模式的工具来源（只读知识库工具）
+  'kb-readonly': '知识库**只读**工具（kb_search / kb_get）',
   'dangerous-opt-in': '⚠️ 有人在服务端显式开启了危险工具',
 }
 const toolsSourceLabel = computed(() => TOOLS_SOURCE_LABEL[toolsSource.value] || (toolsSource.value || '未上报'))
@@ -189,6 +261,15 @@ function onEvent(e: ChatServerEvent) {
       //   **不用匹配枚举值，直接看有没有** —— 有就显示成醒目横幅（等价于"能把服务器 shell 交给浏览器用户"）
       const w = String((e as any).tools_warning || '')
       if (w) toolsWarningFromFrame.value = w
+      // ★ 模式回显：`agent_mode`（不是 `mode`）——把自己选的与后端给的**分开显示**
+      backendMode.value = String((e as any).agent_mode || '')
+      modeNote.value = ''
+      if (backendMode.value && backendMode.value !== chatMode.value) {
+        modeNote.value = `你选的是 ${chatMode.value}，后端实际按 ${backendMode.value} 执行`
+      } else if (chatMode.value === 'agent' && !sessionTools.value.includes('kb_search')) {
+        // 知识库未接入 / 角色限制：**如实说"没有可用工具"**，不假装 agent 生效
+        modeNote.value = `你选了 agent，但后端本会话没有给知识库工具${toolsWarning.value ? `：${toolsWarning.value}` : ''}`
+      }
       break
     case 'text_delta':
       updateLast((m) => { m.text += String((e as any).delta || '') })
@@ -210,7 +291,11 @@ function onEvent(e: ChatServerEvent) {
     case 'tool_end':
       updateLast((m) => {
         const t = m.tools.find((x) => x.id === (e as any).id)
-        if (t) { t.done = true; t.ok = (e as any).ok !== false; t.duration_ms = (e as any).duration_ms }
+        if (t) {
+          t.done = true; t.ok = (e as any).ok !== false; t.duration_ms = (e as any).duration_ms
+          // pi-bridge：`tool_end.result_text` 是工具返回文本（他会**截断**，正文不整篇下发）
+          if ((e as any).result_text != null) t.result_text = String((e as any).result_text).slice(0, 400)
+        }
       })
       roundTools.value = roundTools.value.map((x) => (x.id === String((e as any).id)
         ? { ...x, done: true, ok: (e as any).ok !== false } : x))
@@ -221,6 +306,16 @@ function onEvent(e: ChatServerEvent) {
      *   形状按 `Retrieved`：`{mode, items[], elapsedMs, available, reason?}`；
      *   帧可能把整块放在 `retrieval` 字段里（我两种都吃，等 pi-bridge 确认后收敛成一种）。
      */
+    /**
+     * ★ 第 11 种帧 `context`（Lead 裁定）：服务端实际用了哪些上下文。
+     *   与 retrieval 正交（retrieval:'none' 时 context 仍在）；`resolved` 是**服务端解析出的真实标题**。
+     *   `dropped` 非空必须**如实显示**（不许静默）——否则用户会以为"它看到了我这一节"。
+     */
+    case 'context':
+      contextResolved.value = ((e as any).resolved || {}) as any
+      contextDropped.value = Array.isArray((e as any).dropped) ? (e as any).dropped : []
+      contextUsed.value = ((e as any).used || {}) as any
+      break
     case 'retrieval':
       // 每轮恰好一帧（pi-bridge 保证）→ 开新的一轮，工具帧归到这一轮
       retrieval.value = normalizeRetrieval(e)
@@ -252,7 +347,12 @@ function send() {
   msgs.value = [...msgs.value, { role: 'user', text, thinking: '', tools: [] }]
   newAssistant()
   busy.value = true
-  socket?.prompt(text)
+  socket?.prompt(text, false, {
+    mode: chatMode.value,
+    retrieval: retrievalChoice.value,
+    // 只传 id（服务端解析；不可信输入不进提示词）
+    context: Object.keys(pageContext.value).length ? (pageContext.value as any) : undefined,
+  })
 }
 function steer() {
   if (!input.value.trim() || !busy.value) return
@@ -264,6 +364,36 @@ function abort() {
   socket?.abort()
   msgs.value = [...msgs.value, { role: 'system', text: '已发送中断请求（等 settled 才认为结束）', thinking: '', tools: [] }]
 }
+/**
+ * 切模式（chat ⇄ agent）：pi-bridge 契约是**切换 = 切上下文**（两个独立会话），后端会重发 `ready`。
+ * 这里**如实提示"上下文会重新开始"**，不假装无缝。
+ */
+function setMode(m: 'chat' | 'agent') {
+  if (m === chatMode.value) return
+  if (!modeAllowed(m)) { modeNote.value = agentBlockReason.value; return }
+  chatMode.value = m
+  backendMode.value = ''
+  // ★ backend-api 实测：**模式是连接级参数**（pi 把 mode 编进会话 key，工具集建会话时确定）
+  //   → 切模式必须**重连**；会丢上下文，这是有意取舍（UI 要如实说）
+  modeNote.value = (m === 'agent'
+    ? '已切到 agent：可调用知识库工具读原文（kb_search/kb_get）。'
+    : '已切回 chat：只用检索摘要（更快）。')
+    + '**模式是会话级的 → 已重新连接，上下文重新开始。**'
+  reconnect()
+}
+
+/** 用当前模式重连（保留 chatSessionId；上下文按后端语义重新开始） */
+function reconnect() {
+  try { socket?.close() } catch { /* ignore */ }
+  msgs.value = []
+  retrieval.value = null
+  roundTools.value = []
+  contextResolved.value = {}
+  contextDropped.value = []
+  state.value = 'connecting'
+  startSocket()
+}
+
 function newSession() {
   socket?.newSession()
   msgs.value = []
@@ -271,6 +401,13 @@ function newSession() {
 }
 
 onMounted(async () => {
+  // 抽屉里的实例**不做页面级副作用**（不写 report、不同步屏障、不跑自检）
+  if (props.embedded) {
+    const { reload } = useCaps()
+    void reload()
+    startSocket()
+    return
+  }
   testBarrier()
   /**
    * ★ Lead 裁定（2026-10-15）：**慢的能力探测不该阻塞可用功能**。
@@ -283,18 +420,16 @@ onMounted(async () => {
    */
   const { reload } = useCaps()
   void reload()                       // 后台预热（命中 15s 缓存后后续毫秒级）
-  socket = new ChatSocket(sessionId)
-  socket.onState((s, info) => { state.value = s; if (info) stateNote.value = info })
-  socket.on('*', onEvent)
+  startSocket()
   writeReport('chat-report', {
-    ok: true, gated: false, caps_pending: capsPending.value, session: sessionId, url: socket.url,
-    pi_available: piOk.value, model_available: modelOk.value,
+    ok: true, gated: false, caps_pending: capsPending.value, session: sessionId, url: socket?.url || '',
+    mode: chatMode.value, pi_available: piOk.value, model_available: modelOk.value,
   })
   // caps 到达后**重写报告**（连 WS 不等 caps，但报告必须反映"能力到达后的真值"）
   watch(caps, () => {
     if (!socket) return
     writeReport('chat-report', {
-      ok: true, gated: gated.value, caps_pending: capsPending.value, session: sessionId, url: socket.url,
+      ok: true, gated: gated.value, caps_pending: capsPending.value, session: sessionId, url: socket?.url || '', mode: chatMode.value,
       pi_available: piOk.value, model_available: modelOk.value,
       pi_reason: piReason.value, model_reason: modelReason.value || piModelNote.value,
     })
@@ -302,6 +437,13 @@ onMounted(async () => {
   if (queryFlag('selftest')) await runSelftest(gated.value)
   await testBarrierDone()
 })
+
+/** 建连（模式走 URL 查询参数） */
+function startSocket() {
+  socket = new ChatSocket(sessionId, undefined, chatMode.value)
+  socket.onState((s, info) => { state.value = s; if (info) stateNote.value = info })
+  socket.on('*', onEvent)
+}
 
 onBeforeUnmount(() => socket?.close())
 
@@ -398,6 +540,52 @@ void _esc
         </span>
         <span class="right" />
         <button type="button" data-testid="chat-newsession" @click="newSession">新会话</button>
+      </div>
+
+      <!-- ★ 两个**正交**控件（Lead 要求别混成一个下拉）：
+           ① 模式：能不能读原文（chat 只用摘要 / agent 可调 kb_search+kb_get）
+           ② 检索：查不查、怎么查（none/wiki/kg/rag） -->
+      <div class="mode-row" data-testid="mode-row">
+        <div class="seg" data-testid="mode-select" :data-mode="chatMode">
+          <button type="button" :class="{ on: chatMode === 'chat' }" data-testid="mode-chat" @click="setMode('chat')">chat</button>
+          <button type="button" :class="{ on: chatMode === 'agent' }" data-testid="mode-agent"
+                  :disabled="!agentAllowed" :title="agentAllowed ? '' : agentBlockReason"
+                  @click="setMode('agent')">agent</button>
+        </div>
+        <span class="small faint" data-testid="mode-explain">
+          chat：快，只用检索摘要 ｜ agent：能翻知识库原文（kb_search/kb_get），慢一些
+        </span>
+        <label class="small" data-testid="retrieval-select-label">检索
+          <select v-model="retrievalChoice" data-testid="retrieval-select">
+            <option value="none">none（不检索）</option>
+            <option value="wiki">wiki（词法/bigram）</option>
+            <option value="kg">kg（图谱遍历）</option>
+            <option value="rag">rag（向量）</option>
+          </select>
+        </label>
+        <!-- 后端实际给的模式（不信自己选的） -->
+        <span class="pill" :class="backendMode === chatMode ? 'ok' : 'warn'" data-testid="backend-mode"
+              :data-backend-mode="backendMode">
+          后端：{{ backendMode || '未上报' }}
+        </span>
+      </div>
+      <div v-if="modeNote" class="note warn" style="margin-top: 6px" data-testid="mode-note">{{ modeNote }}</div>
+      <div v-if="!agentAllowed" class="small faint" style="margin-top: 4px" data-testid="agent-blocked">{{ agentBlockReason }}</div>
+      <!-- ★ 知识库为空：agent 必然 0 命中 → 如实提示"先上传并抽取"，别让它看起来像检索坏了 -->
+      <div v-if="kbEmpty" class="note warn" style="margin-top: 6px" data-testid="kb-empty">
+        <b>知识库为空</b>：{{ kbEmptyHint }}
+      </div>
+
+      <!-- ★ 正在参考什么（服务端解析出的**真实标题**，不是客户端传来的 id） -->
+      <div v-if="contextResolved.doc_title || contextResolved.unit_title || contextDropped.length"
+           class="small ctx-bar" data-testid="context-used"
+           :data-doc="contextResolved.doc_title || ''" :data-unit="contextResolved.unit_title || ''">
+        <b>正在参考：</b>
+        <span>{{ contextResolved.doc_title || '（未解析到文档）' }}</span>
+        <span v-if="contextResolved.unit_title"> › {{ contextResolved.unit_title }}</span>
+        <span v-if="contextDropped.length" class="bad-text" data-testid="context-dropped">
+          ｜已忽略：{{ contextDropped.map((d) => `${d.field}（${d.reason || '未找到或无权访问'}）`).join('、') }}
+        </span>
       </div>
       <!-- ★ 工具回落警告：非 null 表示会话工具回落到 pi 默认全集（**能执行命令**） -->
       <div v-if="toolsWarning" class="note bad" style="margin-top: 8px" data-testid="tools-warning">
@@ -510,6 +698,13 @@ void _esc
 </template>
 
 <style scoped>
+.mode-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.seg { display: inline-flex; border: var(--hair) solid var(--rule-strong); border-radius: var(--r-sm); overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 2px 10px; font-size: 12px; cursor: pointer; color: var(--ink-2); }
+.seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
+.ctx-bar { margin-top: 6px; padding-top: 5px; border-top: var(--hair) dotted var(--rule); }
+.bad-text { color: var(--warn); }
+
 .tools-danger { color: var(--bad); font-weight: 700; }
 
 /* 检索徽标：四种模式颜色不同；none（没查库）=灰虚线，empty（查了没命中）=橙，hit=绿，unavailable=灰 */

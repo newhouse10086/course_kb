@@ -41,6 +41,31 @@ export interface ChatConnectionLike {
   close(code?: number, reason?: string): Promise<void>;
 }
 
+/**
+ * 只读知识库查询的**结构类型**（不 import `store/kb-query.ts` 的实现，
+ * 便于测试注入替身、也避免 agent 层反向依赖 store）。
+ * 语义见 `store/kb-query.ts`：**已按 userId 过滤可见性**，只读。
+ */
+export interface KbQueryLike {
+  search(args: { userId: string; query: string; docId?: string; limit?: number }): Array<{
+    kind: 'card' | 'unit';
+    ref_id: string;
+    title: string;
+    score: number;
+    snippet: string;
+    doc_id?: string;
+  }>;
+  get(args: { userId: string; refId: string }): {
+    kind: 'card' | 'unit';
+    ref_id: string;
+    title: string;
+    text: string;
+    doc_id: string;
+    truncated?: boolean;
+    evidence?: { span: { kind: string; start: number; end: number }; quote: string };
+  } | null;
+}
+
 export type ChatConnectionFactory = (opts: {
   sessionId: string;
   send: (frame: unknown) => void | Promise<void>;
@@ -63,6 +88,22 @@ export type ChatConnectionFactory = (opts: {
    * 显式布尔 + 断言，才不会再退化。
    */
   allowTools?: boolean;
+  /**
+   * ★ **对话模式**（Lead 裁定）：`'chat'`（纯问答，无工具）/ `'agent'`（只读知识库工具）。
+   *
+   * 由 `routes/chat.ts` **服务端校验**（只接受这两个值；未知值 → 明确报错，**不静默降级**），
+   * 并与角色判定合并成一条规则：`mode==='agent'` **且** 角色允许 → 只读知识库工具；否则 `[]`。
+   * ⚠️ `agent` 模式**不等于**放开主机工具（`read`/`bash`/`edit`/`write` 仍被 agent 层剔除）。
+   */
+  mode?: 'chat' | 'agent';
+  /**
+   * ★ **只读知识库查询**（`store/kb-query.ts`）—— agent 模式的 `kb_search`/`kb_get` 用它。
+   *
+   * ⚠️ 传入前已按 `userId` 做过**可见性过滤**（复用 `docScopeSql()`）：
+   * 工具调用方**不需要**再判权限，只需把服务端身份里的 userId 传进来。
+   * 未接入 → `undefined`（agent 层应**如实报"知识库工具不可用"**，不许假装有结果）。
+   */
+  kb?: KbQueryLike | null;
   /**
    * 每轮回答的审计回调（三档引用校验：cited/forged/missing + 检索状态）。
    * 我这边落到 `audit_log`（action=`chat`），教学场景要留痕。
@@ -135,6 +176,13 @@ export interface AppDeps {
    * 用结构类型（不 import 对方文件）→ 对方未交付时服务照常启动。
    */
   retrieval?: RetrievalHook | null;
+  /**
+   * ★ **只读知识库查询**（`store/kb-query.ts`）—— agent 模式的 `kb_search`/`kb_get` 用它。
+   *
+   * ⚠️ **已按 `userId` 过滤可见性**（复用 `docScopeSql()`）：工具调用方不必再判权限。
+   * 未接入 → `undefined`（agent 层应**如实报"知识库工具不可用"**，不许假装有结果）。
+   */
+  kb?: KbQueryLike | null;
   /**
    * 抽取能力真探测（结果有缓存）。`POST /documents/:id/extract` 入队前用它：
    * 不可用 → **如实 503 + reason**，绝不排一个注定产出 0 张卡片的"成功"任务。

@@ -299,6 +299,121 @@ function connect(url: string, opts: { send?: string; sendSeq?: string[]; timeout
   return { frames, raw, closed };
 }
 
+/**
+ * ★ 对话模式的服务端校验（Lead 裁定）：只接受 `chat`/`agent`；**未知值 → 明确报错**（不静默降级）。
+ * 覆盖：URL `?mode=` 非法（建连接时就拒）+ 帧里 `mode` 非法/不一致（拒且**不转发**给 agent）。
+ */
+test('★ 模式校验：?mode=agent 合法；未知 mode → 明确报错并关闭（不静默降级）', async () => {
+  const seenModes: unknown[] = [];
+  const spyFactory: ChatConnectionFactory = async (opts) => {
+    seenModes.push(opts.mode);
+    return {
+      async handleClientMessage() {
+        /* noop */
+      },
+      async close() {
+        /* noop */
+      },
+    };
+  };
+  const built = await makeApp(spyFactory);
+  const wsBase = await listen(built);
+  /**
+   * ⚠️ 不等"服务端关连接"：stub 工厂不会主动关 → 等**帧到齐**（有界轮询）后自己收尾。
+   * （上次那条测试就是这么红的：断言要盯要验证的那件事，别顺带依赖无关副作用。）
+   */
+  const connectRaw = async (
+    base: string,
+    path: string,
+    send?: string,
+    waitMs = 1500,
+  ): Promise<{ frames: Record<string, unknown>[]; closed: boolean }> => {
+    const ws = new WebSocket(`${base}${path}`, { headers: { cookie: authCookie! } });
+    const frames: Record<string, unknown>[] = [];
+    let closed = false;
+    ws.addEventListener('message', (ev) => {
+      try {
+        frames.push(JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)));
+      } catch {
+        /* ignore */
+      }
+    });
+    ws.addEventListener('close', () => {
+      closed = true;
+    });
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener('open', () => {
+        if (send) ws.send(send);
+        resolve();
+      });
+      ws.addEventListener('error', () => reject(new Error('WS 连接失败')));
+      setTimeout(() => resolve(), 8000);
+    });
+    // 有界等待：等到"出现 error 帧"或"被关闭"或超时（合法连接不会被关闭 → 走超时分支）
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline && !closed && !frames.some((f) => f.type === 'error')) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+    return { frames, closed };
+  };
+  try {
+    // ① 缺省 → chat（无工具模式）
+    const dflt = await connectRaw(wsBase, '/api/v1/chat/mode-dflt');
+    assert.equal(seenModes.at(-1), 'chat', '缺省必须是 chat');
+    assert.deepEqual(dflt.frames, [], '正常连接不该收到 error 帧');
+
+    // ② ?mode=agent 合法（模式传到工厂 —— 工具集在建会话时定）
+    const agent = await connectRaw(wsBase, '/api/v1/chat/mode-agent?mode=agent');
+    assert.equal(seenModes.at(-1), 'agent', '?mode=agent 必须传到工厂');
+    assert.deepEqual(agent.frames, [], 'agent 模式正常连接不该收到 error 帧');
+
+    // ③ ★ 未知 mode → **明确报错**（E_BADREQUEST + hint 指向合法值），且**不建连接**
+    const before = seenModes.length;
+    const bad = await connectRaw(wsBase, '/api/v1/chat/mode-bad?mode=tool');
+    assert.equal(seenModes.length, before, '★ 非法 mode 不许建连接（不能静默降级成 chat）');
+    const err = bad.frames.find((f) => f.type === 'error');
+    assert.ok(err, `★ 必须发 error 帧：${JSON.stringify(bad.frames)}`);
+    assert.equal(err.code, 'E_BADREQUEST');
+    assert.match(String(err.msg), /tool/, '错误信息要带上收到的非法值');
+    assert.match(String(err.hint), /chat/, 'hint 要指出合法取值');
+    assert.equal(bad.closed, true, '策略违规应主动关闭连接');
+  } finally {
+    await built.close();
+  }
+
+  // ④ ★ 帧里 mode 与连接不一致 → 明确报错，且**不转发**给 agent 层
+  const forwarded: string[] = [];
+  const strictFactory: ChatConnectionFactory = async () => ({
+    async handleClientMessage(raw) {
+      forwarded.push(String(raw)); // 记录"有没有被转发"
+    },
+    async close() {
+      /* noop */
+    },
+  });
+  const built2 = await makeApp(strictFactory);
+  const wsBase2 = await listen(built2);
+  try {
+    const c = await connectRaw(
+      wsBase2,
+      '/api/v1/chat/mode-mismatch',
+      JSON.stringify({ type: 'prompt', message: 'hi', mode: 'agent' }),
+    );
+    const err2 = c.frames.find((f) => f.type === 'error');
+    assert.ok(err2, `★ 不一致必须报错：${JSON.stringify(c.frames)}`);
+    assert.equal(err2.code, 'E_BADREQUEST');
+    assert.match(String(err2.hint), /会话级|重连/, 'hint 要解释"模式是会话级的"');
+    assert.deepEqual(forwarded, [], '★ 不一致的帧**不许转发**给 agent 层（否则它会按错误模式跑）');
+  } finally {
+    await built2.close();
+  }
+});
+
 before(() => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ckb-chat-'));
 });

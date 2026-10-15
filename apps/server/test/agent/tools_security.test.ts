@@ -93,7 +93,7 @@ test('★★★ 真集成：学生连 chat → 请求的 tools 是 []，且 read
   manager.closeAll();
 });
 
-test('★ toolsFor：只有 admin 按策略给，teacher/student 一律空', async () => {
+test('★★ 三角色（含 admin）默认都没有工具：toolsFor 不再单独发放', async () => {
   const { sdk, captured } = capturingSdk();
   const manager = new AgentSessionManager({ sessionDir: null, persist: false, sdkLoader: async () => sdk });
   const policy = (u: { roles?: string[] }): string[] => (u.roles?.includes('admin') ? ['kb_read'] : []);
@@ -101,7 +101,7 @@ test('★ toolsFor：只有 admin 按策略给，teacher/student 一律空', asy
   for (const [id, roles, expect] of [
     ['u-student', ['student'], []],
     ['u-teacher', ['teacher'], []],
-    ['u-admin', ['admin'], ['kb_read']],
+    ['u-admin', ['admin'], []],
   ] as const) {
     const frames: AgentFrame[] = [];
     const conn = await createChatConnection({
@@ -114,17 +114,14 @@ test('★ toolsFor：只有 admin 按策略给，teacher/student 一律空', asy
       toolsFor: policy,
     });
     const ready = frames.find((f) => f.type === 'ready') as ReadyFrame;
-    if (expect.length === 0) {
-      // 安全方向（学生/教师无工具）双证：ready 帧 + 真正传给 pi 的 options
-      assert.deepEqual(ready.tools, [], `${id}(${roles.join('/')}) 的 ready.tools`);
-    }
-    // ⚠️ admin 那次 ready.tools 来自**假 pi 会话**的 getActiveToolNames（假实现恒返回 []），
-    //    所以白名单是否真的传下去要看 `captured`（下面统一断言）。
+    // ★ 新契约：`toolsFor` 只在危险开关下生效 → 三个角色**都**是空集
+    //   （admin 也不例外：lead 裁定"管理员不等于可以借浏览器执行主机命令"）
+    assert.deepEqual(ready.tools, [], `${id}(${roles.join('/')}) 的 ready.tools`);
+    assert.equal(ready.tools_source, 'disabled-by-role', `${id} 的来源标注`);
     await conn.close();
   }
-  // admin 那次真的把白名单传下去了
   const passed = captured.map((c) => c.tools);
-  assert.deepEqual(passed, [[], [], ['kb_read']], '★ 真正传给 createAgentSession 的工具集');
+  assert.deepEqual(passed, [[], [], []], '★ 真正传给 createAgentSession 的工具集（三角色全空）');
   manager.closeAll();
 });
 
@@ -273,10 +270,20 @@ test('★★ 通道层三态策略：disabled-by-role / explicit / dangerous-opt
   const c2 = await probe({ allowTools: true, user: { id: 'a1', roles: ['admin'] } }, null);
   assert.deepEqual(c2.passedTools, [], '管理器配了什么都不能让 admin 悄悄拿到全集');
 
-  // ④ admin + 显式白名单 → explicit 且下传
+  // ④ ★ 新契约：要只读知识库工具走 **mode:'agent'**（不是靠通用 `tools` 白名单）
+  const kbMode = await probe({ mode: 'agent', user: { id: 'a1', roles: ['admin'] } });
+  assert.deepEqual(kbMode.passedTools, ['kb_search', 'kb_get'], 'agent 模式 → 只给只读 kb 工具');
+  assert.equal(kbMode.ready.tools_source, 'kb-readonly');
+  assert.deepEqual(
+    (kbMode.passedTools ?? []).filter((t) => ['bash', 'read', 'edit', 'write'].includes(t)),
+    [],
+    '★ agent 模式绝不含危险内置工具',
+  );
+
+  // ④' 通用白名单不再能单独发放工具（没有危险开关就不生效）
   const d = await probe({ allowTools: true, tools: ['kb_read'], user: { id: 'a1', roles: ['admin'] } });
-  assert.deepEqual(d.passedTools, ['kb_read']);
-  assert.equal(d.ready.tools_source, 'explicit');
+  assert.deepEqual(d.passedTools, [], '没有 dangerousTools 开关时，通用白名单不生效');
+  assert.equal(d.ready.tools_source, 'disabled-by-role');
 
   // ⑤ ★ 危险 opt-in 必须**独立开关**（不来自角色）→ 才允许落到 pi 默认
   const g = await probe({ dangerousTools: true, user: { id: 'a1', roles: ['admin'] } });
@@ -287,19 +294,24 @@ test('★★ 通道层三态策略：disabled-by-role / explicit / dangerous-opt
   assert.match(String(g.ready.tools_warning), /演示|共享账号|浏览器/);
   // 安全状态下不能有这条警告（否则成噪音、失去警示作用）
   assert.equal(a.ready.tools_warning, undefined, '默认（无工具）不该有危险警告');
-  assert.equal(d.ready.tools_warning, undefined, 'explicit 白名单也不该有危险警告');
+  assert.equal(kbMode.ready.tools_warning, undefined, 'kb-readonly 不是危险状态，不该有危险警告');
 
-  // ⑤' 危险 opt-in + 白名单 → explicit
+  // ⑤' 危险 opt-in + 白名单 → 白名单生效（仍在危险策略下）
   const g2 = await probe({ dangerousTools: true, tools: ['kb_read'] });
   assert.deepEqual(g2.passedTools, ['kb_read']);
 
-  // ⑥ toolsFor 优先（按角色自定义）
+  // ⑥ toolsFor 只在危险开关下生效（避免"按角色自定义"绕过安全边界）
   const e = await probe({
+    dangerousTools: true,
     toolsFor: (u: { roles?: string[] }) => (u.roles?.includes('admin') ? ['kb_read'] : []),
     user: { id: 'a1', roles: ['admin'] },
   });
   assert.deepEqual(e.passedTools, ['kb_read']);
-  assert.equal(e.ready.tools_source, 'explicit');
+  const eNoSwitch = await probe({
+    toolsFor: (u: { roles?: string[] }) => (u.roles?.includes('admin') ? ['kb_read'] : []),
+    user: { id: 'a1', roles: ['admin'] },
+  });
+  assert.deepEqual(eNoSwitch.passedTools, [], '没有危险开关时，toolsFor 也不发放工具');
   const f = await probe({
     toolsFor: (u: { roles?: string[] }) => (u.roles?.includes('admin') ? ['kb_read'] : []),
     user: { id: 's1', roles: ['student'] },

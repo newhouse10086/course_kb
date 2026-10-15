@@ -22,6 +22,80 @@ interface WsLike {
 }
 
 /**
+ * ★ 对话模式的**服务端校验**（Lead 裁定）。
+ *
+ * ## 为什么模式必须在**建连接时**就定下来（而不是只在 prompt 帧里）
+ * `tools` 只能在建会话时确定（pi 的会话把 mode 编进会话 key：`<sessionId>#agent`）。
+ * 所以模式从 **URL 查询参数** `?mode=` 读；prompt 帧里的 `mode` 只做**一致性校验**。
+ *
+ * ## 规则（唯一一条）
+ * - 缺省 / `'chat'` → `chat`（无工具）
+ * - `'agent'` → `agent`（只读知识库工具；**危险工具仍被 agent 层剔除**）
+ * - **其它任何值 → 明确报错**（`E_BADREQUEST`），**绝不静默降级**：
+ *   静默降级会让前端显示 agent 却拿不到工具 —— 正是"看起来成功"那类坑。
+ */
+export const CHAT_MODES = ['chat', 'agent'] as const;
+export type ChatMode = (typeof CHAT_MODES)[number];
+
+/**
+ * ★ `agent` 模式允许的角色（**服务端权威**，与 `/capabilities.chat_modes.allowed_roles.agent` 同源）。
+ *
+ * Lead 裁定（2026-10-15）：**含 `student`** —— 答疑的主体是学生，不给学生开等于功能对主要场景无效；
+ * `kb_search`/`kb_get` 是**只读**、按 `userId` 过滤、无主机工具、无 SQL 执行（与 `bash` 风险画像完全不同）。
+ * 且它是**安全的正向收益**：给模型一个受控出口读原文，比"想读却没工具 → tool 调用退化成正文乱码"更好。
+ */
+export const AGENT_ALLOWED_ROLES = ['admin', 'teacher', 'student'] as const;
+
+export function canUseAgentMode(roles: string[] | undefined | null): boolean {
+  if (!Array.isArray(roles)) return false;
+  return roles.some((r) => (AGENT_ALLOWED_ROLES as readonly string[]).includes(r));
+}
+
+export function validateMode(raw: unknown): { ok: true; mode: ChatMode } | { ok: false; got: unknown } {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, mode: 'chat' };
+  if (typeof raw === 'string' && (CHAT_MODES as readonly string[]).includes(raw)) {
+    return { ok: true, mode: raw as ChatMode };
+  }
+  return { ok: false, got: raw };
+}
+
+/**
+ * 校验**帧里**的 `mode`（若带）：返回 `null` = 通过；否则返回要下发的 error 帧。
+ *
+ * 只对 `prompt` 帧生效（其它帧不带 mode）。**解析失败不算 mode 问题** ——
+ * 非法 JSON 交给 agent 层按它自己的协议错误处理（不越权替它判）。
+ */
+export function checkFrameMode(payload: string, sessionMode: ChatMode): Record<string, unknown> | null {
+  let frame: Record<string, unknown>;
+  try {
+    frame = JSON.parse(payload) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!frame || typeof frame !== 'object' || frame.type !== 'prompt' || !('mode' in frame)) return null;
+  const check = validateMode(frame.mode);
+  if (!check.ok) {
+    return {
+      type: 'error',
+      code: 'E_BADREQUEST',
+      msg: `未知的对话模式：${JSON.stringify(check.got)}`,
+      hint: `mode 只接受 ${CHAT_MODES.map((m) => `'${m}'`).join(' | ')}`,
+    };
+  }
+  if (check.mode !== sessionMode) {
+    return {
+      type: 'error',
+      code: 'E_BADREQUEST',
+      msg: `模式不一致：本连接是 '${sessionMode}'，帧里是 '${check.mode}'`,
+      hint:
+        '模式是**会话级**的（agent 模式的工具集在建会话时就确定了，切模式会丢上下文），' +
+        `请用 ?mode=${check.mode} 重新连接`,
+    };
+  }
+  return null;
+}
+
+/**
  * 注册 `/api/v1/chat/:sessionId`。
  * 返回 false = agent 模块未就绪（调用方据此在 `/capabilities` 里如实说明）。
  */
@@ -38,6 +112,47 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
     const { sessionId } = req.params as { sessionId: string };
     // RBAC：WS 握手同样过 401 闸门 → 这里 req.user 必然存在（未登录根本连不上）
     const user = req.user;
+
+    // ★ 模式：从查询参数读（建连接时就要定，见 `validateMode` 注释）
+    const modeRaw = (req.query as Record<string, unknown> | undefined)?.mode;
+    const modeCheck = validateMode(modeRaw);
+    if (!modeCheck.ok) {
+      // **明确报错**（不静默降级成 chat）：前端能立刻看到"你传的 mode 不合法"
+      try {
+        socket.send(
+          safeJsonStringify({
+            type: 'error',
+            code: 'E_BADREQUEST',
+            msg: `未知的对话模式：${JSON.stringify(modeCheck.got)}`,
+            hint: `mode 只接受 ${CHAT_MODES.map((m) => `'${m}'`).join(' | ')}；缺省 = 'chat'。` +
+              '注意模式是**会话级**的（工具在建会话时确定），请用 ?mode=… 重连',
+          }),
+        );
+        socket.close(1008, 'invalid mode');
+      } catch {
+        /* 已断开 */
+      }
+      return;
+    }
+    const mode = modeCheck.mode;
+
+    // ★ 角色策略：`agent` 模式需要允许的角色（**服务端判定**，客户端无法影响）
+    if (mode === 'agent' && !canUseAgentMode(user?.roles)) {
+      try {
+        socket.send(
+          safeJsonStringify({
+            type: 'error',
+            code: 'E_FORBIDDEN',
+            msg: `当前角色不允许 agent 模式（roles=${JSON.stringify(user?.roles ?? [])}）`,
+            hint: `agent 模式允许的角色：${AGENT_ALLOWED_ROLES.join(', ')}；chat 模式对所有登录用户开放`,
+          }),
+        );
+        socket.close(1008, 'agent mode forbidden');
+      } catch {
+        /* 已断开 */
+      }
+      return;
+    }
 
     let chat: ChatConnectionLike | null = null;
     let closed = false;
@@ -58,6 +173,21 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
 
     socket.on('message', (raw: unknown) => {
       const payload = toPayload(raw);
+      /**
+       * ★ 帧级 `mode` 校验（服务端权威）：
+       * - 未知值 → 明确报错（不静默降级）
+       * - 与本连接的模式**不一致** → 明确报错并提示"模式是会话级的，请用 ?mode=… 重连"
+       *   （否则会出现"前端以为切到 agent，实际还是 chat 的 tools"这种**看起来成功**的假象）
+       */
+      const modeIssue = checkFrameMode(payload, mode);
+      if (modeIssue) {
+        try {
+          socket.send(safeJsonStringify(modeIssue));
+        } catch {
+          /* 已断开 */
+        }
+        return; // **不转发**给 agent 层（避免它按错误的模式继续跑）
+      }
       if (!chat) {
         earlyFrames.push(payload); // 连接还没建好 → 排队（**不丢**）
         return;
@@ -118,6 +248,19 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
          * `teacher`/`student` → `false`；`admin` → `true`（管理员本来就有服务器权限，工具不扩大其权力）。
          */
         allowTools: Array.isArray(user?.roles) && user.roles.includes('admin'),
+        /**
+         * ★ **对话模式**（Lead 裁定）：`chat`（默认，无工具）/ `agent`（只读知识库工具）。
+         *
+         * ## 一条规则（清楚到能背）
+         * `mode === 'agent'` **且** 角色允许 → 只读知识库工具（`kb_search`/`kb_get`）；否则 `[]`。
+         * - **危险工具永远剔除**（`read`/`bash`/`edit`/`write` 由 agent 层 `sanitizeToolList` 处理）——
+         *   `agent` 模式**不等于**放开主机工具，安全边界不松。
+         * - 非法 `mode` → **明确报错**（见 `validateMode`），**不静默降级**：
+         *   "静默降级成 chat"会让前端显示 agent 却拿不到工具，正是"看起来成功"那类坑。
+         */
+        mode: mode ?? 'chat',
+        // ★ 只读知识库查询（**已按 userId 过滤可见性**）—— agent 模式的工具用它
+        kb: deps.kb ?? null,
         // 每轮回答的审计（教学场景留痕）：三档引用校验 + 检索状态
         onAnswerAudit: (a) => {
           try {

@@ -9,8 +9,17 @@
  */
 import { api } from './client'
 
+/** 页面上下文（**只传 id**；服务端解析 → 不可信输入不进提示词） */
+export interface PromptContext {
+  doc_id?: string
+  unit_id?: string
+  /** 沙箱会话 id（Lab 页；服务端按 userId 校验归属） */
+  session_id?: string
+  page?: number
+}
+
 export type ChatClientMessage =
-  | { type: 'prompt'; message: string; steer?: boolean }
+  | { type: 'prompt'; message: string; steer?: boolean; mode?: 'chat' | 'agent'; retrieval?: 'none' | 'wiki' | 'kg' | 'rag' }
   | { type: 'steer'; message: string }
   | { type: 'abort' }
   | { type: 'set_model'; model: string }
@@ -24,6 +33,13 @@ export type ChatServerEvent =
   | { type: 'tool_update'; id: string; partial?: string }
   | { type: 'tool_end'; id: string; ok?: boolean; duration_ms?: number }
   | { type: 'message_end'; message?: unknown; role?: string }
+  /**
+   * ★ 第 11 种帧（Lead 2026-10-15 裁定）：服务端**实际用了哪些上下文**。
+   *   与 `retrieval` **正交**（`retrieval:'none'` 时 context 依然存在），所以单开一帧。
+   *   `resolved` 是服务端用知识库解析出的**真实标题**（客户端传的 id 不可信）；
+   *   `dropped` 非空 → 前端**必须如实显示**（"未找到你当前章节，已忽略"），不许静默。
+   */
+  | { type: 'context'; used?: PromptContext; resolved?: { doc_title?: string; unit_title?: string; unit_span?: unknown }; dropped?: Array<{ field: string; value?: string; reason?: string }>; note?: string }
   | { type: 'settled'; aborted?: boolean; abort_source?: string }
   | { type: 'error'; code?: string; msg?: string; hint?: string }
   | { type: string; [k: string]: unknown }
@@ -41,9 +57,10 @@ export class ChatSocket {
   private stateHandlers: Array<(s: ChatState, info?: string) => void> = []
   private queue: ChatClientMessage[] = []
 
-  constructor(sessionId: string, url?: string) {
+  constructor(sessionId: string, url?: string, mode?: 'chat' | 'agent') {
     this.sessionId = sessionId
-    this.url = url || api.chatWsUrl(sessionId)
+    // 模式是**连接级**参数（`?mode=`）；不传 = 后端缺省 chat
+    this.url = url || api.chatWsUrl(sessionId, mode)
     try {
       this.ws = new WebSocket(this.url)
     } catch (e) {
@@ -103,7 +120,26 @@ export class ChatSocket {
     this.ws.send(JSON.stringify(msg))
   }
 
-  prompt(message: string, steer = false) { this.send({ type: 'prompt', message, steer }) }
+  /**
+   * 发一轮提示。
+   * ⚠️ 字段是 **`message`**（不是 `text`）；`mode`/`retrieval` 都是**可选**（pi-bridge 契约）：
+   *   · `mode:'chat'|'agent'` 缺省 = chat（agent 才能调用 kb_search/kb_get 读原文）
+   *   · `retrieval:'none'|'wiki'|'kg'|'rag'` 缺省 = none
+   * 两者**正交**：`retrieval` 决定"查不查、怎么查"，`mode` 决定"能不能读原文"。
+   */
+  prompt(message: string, steer = false, opts?: {
+    mode?: 'chat' | 'agent'
+    retrieval?: 'none' | 'wiki' | 'kg' | 'rag'
+    /** 页面上下文（Lead 2026-10-15 裁定）：**只接受 id**，服务端负责解析成真实标题/正文 */
+    context?: PromptContext
+  }) {
+    this.send({
+      type: 'prompt', message, steer,
+      ...(opts?.mode ? { mode: opts.mode } : {}),
+      ...(opts?.retrieval ? { retrieval: opts.retrieval } : {}),
+      ...(opts?.context && Object.keys(opts.context).length ? { context: opts.context } : {}),
+    })
+  }
   steer(message: string) { this.send({ type: 'steer', message }) }
   abort() { this.send({ type: 'abort' }) }
   setModel(model: string) { this.send({ type: 'set_model', model }) }

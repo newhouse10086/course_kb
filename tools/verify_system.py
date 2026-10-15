@@ -870,17 +870,20 @@ def group_static_pitfalls(admin_user=None, admin_pass=None, student_cred=None):
 
     # ★ 必须**按角色分别验**：只验 admin 不能推出 student 安全（策略本来就可能按角色不同）。
     #   契约/裁定：student/teacher/admin **默认都无工具**，危险工具需两道非角色开关。
+    # ⚠️ 端口必须用**当前实际端口**（`BASE` 里那个），不能用模块级 PORT 常量 ——
+    #    --live 时 PORT 是 8791 而服务在 8787，探针会连错端口而静默跳过（我第一版就这么漏了学生侧）。
+    cur_port = BASE.rsplit(":", 1)[-1]
     if probe.exists() and ws_entry.exists():
-        p("     运行时检查 agent tools（各角色是否拿到 bash/read/edit/write）…")
+        p("     运行时检查 agent tools（各角色是否拿到 bash/read/edit/write），port=%s…" % cur_port)
         if student_cred:
             sup, spw = student_cred
-            si = probe_tools(PORT, sup, spw)
+            si = probe_tools(cur_port, sup, spw)
             if si and not si.get("error"):
                 st_tools = si.get("tools") or []
                 check("security", f"★ 学生({sup}) chat 无执行类工具",
                       not any(t in ("bash", "read", "edit", "write") for t in st_tools),
                       "tools=[]", f"tools={st_tools} source={si.get('tools_source')}",
-                      "critical", f"node data/verify/_ws_tools_probe.mjs {PORT} {sup} ***",
+                      "critical", f"node data/verify/_ws_tools_probe.mjs {cur_port} {sup} ***",
                       "本轮 critical 发现：学生曾真执行 shell 并读到 win.ini")
                 check("security", f"★ 学生({sup}) 发『执行 bash』不产生 tool_start",
                       si.get("ranShell") is False and (si.get("toolStarts") or 0) == 0,
@@ -893,13 +896,13 @@ def group_static_pitfalls(admin_user=None, admin_pass=None, student_cred=None):
             p("     未提供学生凭据 → 学生侧未验证（**如实记录，不当作通过**）")
 
         if admin_user and admin_pass:
-            ai = probe_tools(PORT, admin_user, admin_pass)
+            ai = probe_tools(cur_port, admin_user, admin_pass)
             if ai and not ai.get("error"):
                 a_tools = ai.get("tools") or []
                 check("security", "★ admin chat 无执行类工具（角色不授予主机执行）",
                       not any(t in ("bash", "read", "edit", "write") for t in a_tools),
                       "tools=[]", f"tools={a_tools} source={ai.get('tools_source')}",
-                      "critical", f"node data/verify/_ws_tools_probe.mjs {PORT} {admin_user} ***",
+                      "critical", f"node data/verify/_ws_tools_probe.mjs {cur_port} {admin_user} ***",
                       "lead 裁定：『管理员』不等于『可借浏览器执行主机命令』")
                 check("security", "★ admin 发『执行 bash』不产生 tool_start",
                       ai.get("ranShell") is False and (ai.get("toolStarts") or 0) == 0,

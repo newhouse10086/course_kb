@@ -178,6 +178,8 @@ const CACHEABLE_FIELDS = [
   'schema',
   'pipeline',
   'paths',
+  // `chat_modes`：模式/工具/允许角色都是启动期静态策略（`kb.available` 也是装配期定）
+  'chat_modes',
 ] as const;
 
 /** 缓存命中时**必须实时重算**的字段（都很便宜）。 */
@@ -334,6 +336,29 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
         //   （见 `CACHEABLE_FIELDS` / `LIVE_FIELDS`）→ 两条路径的语义不会漂。
         //   历史：`bootstrap` 曾在组装期算一次 → 建号后仍报 `not_initialized`（已修，并加了结构级守卫）。
         ...(await liveFields()),
+        /**
+         * ★ 对话模式自述（Lead 裁定）：前端据此渲染模式选择器，**不必自己按 roles 推断**
+         * （上次 `user.roles` 推断的教训：前端猜权限迟早与后端不一致）。
+         *
+         * - `chat`：无工具（默认）；`agent`：**只读**知识库工具 `kb_search`/`kb_get`
+         * - 危险工具 `read`/`bash`/`edit`/`write` **永远剔除**（agent 模式 ≠ 放开主机工具）
+         * - `allowed_roles`：`agent` 允许的角色（**服务端权威**）
+         *   ★ Lead 裁定（2026-10-15）：**加 `student`** —— 答疑的主体是学生，不给学生开等于
+         *   这个功能对主要场景无效；且风险画像与 `bash` 完全不同（只读 + 按 userId 过滤 +
+         *   无主机工具 + 无 SQL 执行）。它还是**安全的正向收益**：给模型一个受控出口去读原文，
+         *   比"想读却没工具 → 把 tool 调用退化成正文乱码"更好。
+         * - `kb`：只读查询是否接入（未接入 → agent 模式**如实降级**，不假装有结果）
+         */
+        chat_modes: {
+          modes: ['chat', 'agent'],
+          default: 'chat',
+          tools: { chat: [], agent: ['kb_search', 'kb_get'] },
+          allowed_roles: { agent: ['admin', 'teacher', 'student'] },
+          kb: deps.kb
+            ? { available: true, readonly: true, scoped_by: 'userId' }
+            : { available: false, reason: '只读知识库查询未接入（store/kb-query.ts）→ agent 模式如实降级' },
+          note: '模式是**会话级**的（工具集在建会话时确定）：请用 `?mode=agent` 连接；未知 mode → 明确报错',
+        },
         // ④ 学生 SQL 沙箱：**真探测**（逐引擎 + 不可用必给 reason）——
         //    `sqlite` 永远可用；MySQL/PostgreSQL/openGauss 未部署 → 如实 false + 指向部署文档
         sandbox: sandbox,

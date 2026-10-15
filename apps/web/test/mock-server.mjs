@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 契约 mock server（无头 DOM 断言 + 前端开发用）
  *
  * 为什么不是"几行假 JSON"：数据来自上游**冻结产物**
@@ -345,6 +345,25 @@ export function capabilitiesPayload(degraded = false) {
     ffmpeg: { available: true, version: 'N-124868' },
     // 真后端 15s TTL 缓存（backend-api 2026-10-15 实测 17079ms → 7ms）：如实标注，不假装实时
     cached: true, cached_age_ms: 6, cache_ttl_ms: 15000,
+    /**
+     * ★ `/capabilities.chat_modes`（backend-api 实测）：**服务端权威清单** ——
+     * 前端只读它，**不按 user.roles 推断**（本轮已因"按预期形状读"吃过亏）。
+     * 模式是**会话级**的（工具集在建会话时确定）→ 切模式要 `?mode=` 重连。
+     */
+    chat_modes: {
+      modes: ['chat', 'agent'], default: 'chat',
+      tools: { chat: [], agent: ['kb_search', 'kb_get'] },
+      allowed_roles: { agent: CFG.agent_roles },
+      kb: { available: true, readonly: true, scoped_by: 'userId' },
+      note: '模式是会话级的：请用 ?mode=agent 连接；未知 mode → 明确报错',
+    },
+    retrieval: {
+      modes: ['none', 'wiki', 'kg', 'rag'], default: 'none',
+      summary: {
+        any_available: true, any_data: !CFG.empty_kb, empty_kb: CFG.empty_kb,
+        hint: '检索能力已就绪，但知识库当前为空（未抽取）→ 先上传资料并跑抽取，否则任何检索都必然 0 命中',
+      },
+    },
     sandbox: {
       available: true,
       defaultEngine: 'sqlite',
@@ -449,7 +468,11 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
   const F = buildFixture()
   const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [], role: 'teacher', running_llm: true,
     /** 检索帧用哪种模式（none/wiki/kg/rag）；kg_hit=1 时 kg 才有命中（默认 kg = 查了 0 命中） */
-    retrieval: 'wiki', kg_hit: false }
+    retrieval: 'wiki', kg_hit: false,
+    /** agent 模式允许的角色（服务端权威；默认 admin+teacher，student 只给 chat） */
+    agent_roles: ['admin', 'teacher'],
+    /** 知识库为空（agent 必然 0 命中 → 前端要如实提示"先上传并抽取"） */
+    empty_kb: false }
   /** 模型/设置/sandbox 的运行期状态（真后端在 settings.json + SQLite 里） */
   const STATE = {
     activeModel: 'deepseek-v4.1-flash',
@@ -554,6 +577,8 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         if (q.has('role')) CFG.role = q.get('role')
         if (q.has('maxrows')) { STATE.sandbox.limits.maxRows = Math.max(1, Number(q.get('maxrows')) || 200); if (STATE.db) STATE.db.maxRows = STATE.sandbox.limits.maxRows }
         if (q.has('retrieval')) CFG.retrieval = q.get('retrieval')
+        if (q.has('agent_roles')) CFG.agent_roles = String(q.get('agent_roles')).split(',').filter(Boolean)
+        if (q.has('empty_kb')) CFG.empty_kb = ['1', 'true'].includes(q.get('empty_kb'))
         if (q.has('kg_hit')) CFG.kg_hit = ['1', 'true'].includes(q.get('kg_hit'))
         if (q.has('running_llm')) { CFG.running_llm = ['1', 'true', 'yes'].includes(q.get('running_llm')); STATE.runningLlmTask = CFG.running_llm }
         return json({ config: { ...CFG, uploads: CFG.uploads.length } })
@@ -1025,7 +1050,20 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     wss.handleUpgrade(req, socket, head, (ws) => {
       const sessionId = u.pathname.split('/').pop()
       const send = (obj) => { try { ws.send(JSON.stringify(obj)) } catch { /* ignore */ } }
-      send({ type: 'ready', session_id: sessionId, model: 'deepseek-v4.1-flash', tools: ['read', 'bash'] })
+      // ★ 模式是**连接级**参数（backend-api 实测：pi 把 mode 编进会话 key，工具集建会话时确定）
+      const rawMode = u.searchParams.get('mode')
+      const connMode = rawMode === null || rawMode === '' ? 'chat' : rawMode
+      if (!['chat', 'agent'].includes(connMode)) {
+        // 未知 mode → 建连即拒（不静默降级），并 close(1008)
+        send({ type: 'error', code: 'E_BADREQUEST', msg: `未知的对话模式："${connMode}"`,
+          hint: "mode 只接受 'chat' | 'agent'；缺省 = 'chat'。模式是会话级的，请用 ?mode=… 重连" })
+        try { ws.close(1008, 'bad mode') } catch { /* ignore */ }
+        return
+      }
+      const isAgent = connMode === 'agent'
+      send({ type: 'ready', session_id: sessionId, model: 'deepseek-v4.1-flash', mode: 'sdk', agent_mode: connMode,
+        tools: isAgent ? ['kb_search', 'kb_get'] : [],
+        tools_source: isAgent ? 'kb-readonly' : 'disabled-by-role' })
       let timer = null
       const clear = () => { if (timer) { clearTimeout(timer); timer = null } }
       ws.on('message', (raw) => {
@@ -1033,6 +1071,29 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         try { msg = JSON.parse(String(raw)) } catch { return }
         if (msg.type === 'prompt' || msg.type === 'steer') {
           clear()
+          // 契约：`message`（不是 text）+ 可选 mode/retrieval/context
+          const frameMode = msg.mode === undefined ? connMode : String(msg.mode)
+          const retr = String(msg.retrieval || 'none')
+          const ctx = (msg.context && typeof msg.context === 'object') ? msg.context : {}
+          if (msg.type === 'prompt' && frameMode !== connMode) {
+            // 帧里 mode 与连接不一致 → 报错且**不转发**（否则会按错模式跑）
+            send({ type: 'error', code: 'E_BADREQUEST', msg: `帧里的 mode="${frameMode}" 与连接模式 "${connMode}" 不一致`,
+              hint: `模式是会话级的：请用 ?mode=${frameMode} 重连` })
+            send({ type: 'settled', aborted: false })
+            return
+          }
+          const agentMode = isAgent
+          // 第 11 种帧：服务端**实际用了**哪些上下文（resolved 是服务端解析出的真实标题）
+          const dropped = []
+          const resolved = {}
+          if (ctx.doc_id) resolved.doc_title = 'MySQL 26.7 Reference Manual（上游真实产物 · mock）'
+          else dropped.push({ field: 'doc_id', value: '', reason: '未提供' })
+          if (ctx.unit_id) {
+            const u = F.units.get(String(ctx.unit_id))
+            if (u) resolved.unit_title = u.title
+            else dropped.push({ field: 'unit_id', value: String(ctx.unit_id), reason: '未找到或无权访问' })
+          }
+          send({ type: 'context', used: ctx, resolved, dropped, note: '' })
           const text = '聚簇索引把整行数据放在 B+ 树的叶子节点上，因此按主键范围扫描非常快；二级索引只存主键值，查询非索引列时要"回表"。'
           const chunks = msg.type === 'steer' ? ['（插话）', '好的，', '换个更短的例子。'] : text.match(/[\s\S]{1,6}/g)
           let i = 0
@@ -1045,7 +1106,7 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
            *   {type,mode,status,available,hits,elapsedMs,why[],reason,sources[{kind,ref_id,title,score}]}
            * status ∈ none|ok|empty|unavailable|error（**判色以 status 为准**）
            */
-          const rmode = String(CFG.retrieval || 'wiki')
+          const rmode = String(retr !== 'none' ? retr : (CFG.retrieval || 'wiki'))
           const RFRAMES = {
             none: { status: 'none', available: true, hits: 0, elapsedMs: null,
               why: ['用户选择了不使用知识库检索（none）'], reason: '', sources: [] },
@@ -1063,6 +1124,16 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
               reason: '未配置 embedding provider（providers.embedding 为空）', sources: [] },
           }
           send({ type: 'retrieval', mode: rmode, ...(RFRAMES[rmode] || RFRAMES.wiki) })
+          // ★ agent 模式：真的"去翻知识库"（kb_search → kb_get ×1），chat 模式不调工具
+          if (agentMode && msg.type === 'prompt') {
+            send({ type: 'tool_start', id: 'kb_1', tool: 'kb_search', args: { query: '聚簇索引', limit: 5 } })
+            send({ type: 'tool_update', id: 'kb_1', partial: '命中 2 条：3.1 聚簇索引 / 3.2 覆盖索引' })
+            send({ type: 'tool_end', id: 'kb_1', tool: 'kb_search', ok: true, duration_ms: 18,
+              result_text: '命中 2 条：3.1 聚簇索引（unt_0001）/ 3.2 覆盖索引（unt_0002）' })
+            send({ type: 'tool_start', id: 'kb_2', tool: 'kb_get', args: { ref_id: 'unt_0001' } })
+            send({ type: 'tool_end', id: 'kb_2', tool: 'kb_get', ok: true, duration_ms: 9,
+              result_text: '已读取单元 unt_0001《3.1 聚簇索引》原文（截断显示，正文不下发）' })
+          }
           const step = () => {
             if (i < chunks.length) {
               send({ type: 'text_delta', delta: chunks[i++] })

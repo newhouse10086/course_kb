@@ -39,6 +39,7 @@ import type { AgentSession, CreateAgentSessionOptions } from '@earendil-works/pi
 
 import { AGENT_ERROR_CODES, HINT_SDK_OK, agentError, classifyFailure, sdkUnavailableError } from './errors.ts';
 import { composeMessageWithContext, sanitizeUntrusted } from './guards.ts';
+import { KB_TOOL_NAMES, type KbProvider } from './kb_tools.ts';
 import { loadSdk, type SdkLoadResult } from './sdk.ts';
 import {
   beginRound,
@@ -139,6 +140,16 @@ export interface AgentManagerOptions {
   modelRuntime?: unknown;
   /** 解析模型用的 pi 模型目录（`models.json`；默认走 agentDir） */
   modelsPath?: string;
+  /**
+   * ★ 知识库**只读**查询能力（`agent` 模式的 `kb_search`/`kb_get` 用它；`context` 帧解析 id 也用它）。
+   *
+   * **内部必须已按 `userId` 过滤可见性**（backend-api 的 `kbQuery` 走 `docScopeSql()`）；
+   * 工具这边只透传**服务端身份**，绝不接受客户端给的 userId。
+   * 缺省 = kb 工具不可用 → `agent` 模式如实降级（工具集为空 + 可读原因）。
+   */
+  kb?: KbProvider | null;
+  /** 单条原文下发到工具/上下文的上限（默认 4000 字；超出截断并**如实标注**） */
+  kbMaxTextChars?: number;
   /**
    * **替换** pi 默认的系统提示词（不设置就用 pi 默认的 coding-agent 提示词）。
    *
@@ -515,6 +526,7 @@ export class ManagedAgentSession implements ChatSessionLike {
   private _restoredMessages = 0;
   private _resumeReason = '';
   private _modelSource: SessionInit['modelSource'] = 'pi-global-fallback';
+  private _kbToolsWarning: string | undefined;
   private _modelWarning: string | undefined;
   /** 本轮是否被看门狗判超时（之后丢弃迟到事件，避免第二条 settled） */
   private timedOutRound = false;
@@ -972,7 +984,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   }
 
   /** 造一个 SDK 会话（真路径）。测试可注入 `sessionFactory` 完全绕过。 */
-  async createInit(sessionId: string, perSessionTools?: string[] | null): Promise<SessionInit> {
+  async createInit(sessionId: string, perSessionTools?: string[] | null, kbUserId?: string): Promise<SessionInit> {
     if (!isValidSessionId(sessionId)) {
       throw new Error(`非法 session id：${sessionId}`);
     }
@@ -998,6 +1010,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     }
 
     const persistence: 'native' | 'ephemeral' = this.sessionDir ? 'native' : 'ephemeral';
+    let kbToolsWarning: string | null = null;
     let persistenceReason: string;
     let sessionManager: unknown;
     if (this.sessionDir) {
@@ -1097,7 +1110,38 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       typeof this.opts.systemPrompt === 'string' ||
       (this.opts.appendSystemPrompt?.length ?? 0) > 0 ||
       this.opts.noContextFiles === true;
-    if (wantsCustomPrompt) {
+
+    // ★ 知识库只读工具（`agent` 模式）：走 pi 的**扩展工厂**注册（`pi.registerTool`）。
+    //   只有真的在白名单里、且 provider 可用时才注册 —— 否则如实不注册（别让学生看到"有工具却查不到"）。
+    let kbExtension: ((pi: unknown) => void) | null = null;
+    let kbToolsUnavailable: string | null = null;
+    const wantsKbTools = effectiveTools !== null && effectiveTools.some((t) => (KB_TOOL_NAMES as readonly string[]).includes(t));
+    if (wantsKbTools) {
+      if (!this.opts.kb) {
+        kbToolsUnavailable = '知识库查询能力未接入（AgentSessionManager 未提供 kb provider）';
+      } else if (!kbUserId) {
+        kbToolsUnavailable = '缺少服务端用户身份，无法按权限过滤知识库（拒绝注册工具，避免越权读取）';
+      } else {
+        try {
+          const mod = await import('./kb_tools.ts');
+          kbExtension = mod.createKbExtension({
+            provider: this.opts.kb,
+            userId: kbUserId,
+            ...(this.opts.kbMaxTextChars !== undefined ? { maxTextChars: this.opts.kbMaxTextChars } : {}),
+            onDiagnostic: (m) => this.diagnostic(`[kb] ${m}`),
+          }) as (pi: unknown) => void;
+        } catch (err) {
+          kbToolsUnavailable = `kb 工具模块加载失败：${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      if (kbToolsUnavailable) {
+        // ★ 如实降级：**把工具从白名单里去掉**（不留一个"注册不了却有名字"的假工具）
+        options.tools = effectiveTools!.filter((t) => !(KB_TOOL_NAMES as readonly string[]).includes(t));
+        this.diagnostic(`知识库工具不可用 → 已从白名单移除：${kbToolsUnavailable}`);
+      }
+    }
+
+    if (wantsCustomPrompt || kbExtension) {
       const Loader = sdk.DefaultResourceLoader;
       const agentDir = this.agentDir ?? sdk.getAgentDir?.();
       if (typeof Loader === 'function' && agentDir) {
@@ -1107,7 +1151,10 @@ export class AgentSessionManager implements ChatSessionManagerLike {
             agentDir,
             ...(typeof this.opts.systemPrompt === 'string' ? { systemPrompt: this.opts.systemPrompt } : {}),
             ...(this.opts.appendSystemPrompt?.length ? { appendSystemPrompt: this.opts.appendSystemPrompt } : {}),
-            // 教学答疑不需要扩展/skill/模板/主题；关掉既快又少一类注入面
+            // ★ 内联扩展工厂（kb 只读工具）。`noExtensions: true` 只关**磁盘/配置里**的扩展，
+            //   不影响这里显式传入的内联工厂（实测：kb 工具能出现在 getActiveToolNames 里）。
+            ...(kbExtension ? { extensionFactories: [kbExtension] } : {}),
+            // 教学答疑不需要其它扩展/skill/模板/主题；关掉既快又少一类注入面
             noExtensions: true,
             noSkills: true,
             noPromptTemplates: true,
@@ -1118,15 +1165,16 @@ export class AgentSessionManager implements ChatSessionManagerLike {
           options.resourceLoader = loader as CreateAgentSessionOptions['resourceLoader'];
         } catch (err) {
           this.diagnostic(
-            `自定义系统提示词设置失败（降级为默认提示词 + 用户消息说明）：${err instanceof Error ? err.message : String(err)}`,
+            `资源加载器构造失败（降级）：${err instanceof Error ? err.message : String(err)}`,
           );
         }
       } else {
         this.diagnostic(
-          `SDK 未提供 DefaultResourceLoader/getAgentDir，无法替换系统提示词（降级为默认提示词 + 用户消息说明）`,
+          `SDK 未提供 DefaultResourceLoader/getAgentDir，无法设置自定义提示词/注册 kb 工具（降级）`,
         );
       }
     }
+    kbToolsWarning = kbToolsUnavailable;
 
     let created: { session: AgentSession; modelFallbackMessage?: string };
     try {
@@ -1168,7 +1216,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
   }
 
   /** 取会话（同 id 复用；已 dispose 则重建）。 */
-  async getOrCreate(sessionId: string, init?: { tools?: string[] }): Promise<ManagedAgentSession> {
+  async getOrCreate(sessionId: string, init?: { tools?: string[]; kbUserId?: string }): Promise<ManagedAgentSession> {
     const existing = this.sessions.get(sessionId);
     if (existing && !existing.disposed) {
       // 已存在的会话保持原有工具集（避免半个会话中途换工具）。若请求的不同，记诊断说明**没生效**。
@@ -1190,7 +1238,7 @@ export class AgentSessionManager implements ChatSessionManagerLike {
     }
     const effectiveTools: string[] | null = perTools ? perTools.tools : this.toolsConfig;
     this.lastToolsFor.set(sessionId, effectiveTools);
-    const created = await this.createInit(sessionId, effectiveTools);
+    const created = await this.createInit(sessionId, effectiveTools, init?.kbUserId);
     const session = new ManagedAgentSession(sessionId, this, created);
     this.sessions.set(sessionId, session);
     return session;
