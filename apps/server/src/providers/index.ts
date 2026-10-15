@@ -32,6 +32,7 @@ import { createOpenAiCompatible } from './llm/openai_compatible.ts';
 import { createAsrProvider, type WorkerRunner } from './asr/index.ts';
 import { DEFAULT_DB_GLOSSARY, createTranslateProvider } from './translate/index.ts';
 import { createTtsProvider } from './tts/index.ts';
+import { createOpenRouterAsr, createOpenRouterTts } from './openrouter_audio.ts';
 import { createOcrProvider } from './ocr/index.ts';
 
 // ─────────────────────────────────────────────────────────────
@@ -331,6 +332,9 @@ export function createProviderLayer(opts: CreateProviderLayerOptions): ProviderL
       aliyun_nls: (e) => createAsrProvider(e, { runWorker }),
       tencent_asr: (e) => createAsrProvider(e, { runWorker }),
       openai_asr: (e) => createAsrProvider(e, { runWorker }),
+      // ★ OpenRouter ASR（可选备选；本地 faster-whisper 仍首选 —— policy.asr: local-first）
+      //   模型 `mistralai/voxtral-small-24b-2507`（专用语音理解，最便宜档）
+      openrouter_asr: createOpenRouterAsr,
       // 翻译
       llm: (e) => createTranslateProvider(e, { glossary }),
       deepl: (e) => createTranslateProvider(e, { glossary }),
@@ -338,6 +342,9 @@ export function createProviderLayer(opts: CreateProviderLayerOptions): ProviderL
       aliyun_nls_tts: createTtsProvider,
       tencent_tts: createTtsProvider,
       openai_tts: createTtsProvider,
+      // ★ OpenRouter TTS（唯一可用路径：`openai/gpt-audio-mini`，必须 stream + pcm16）
+      //   ⚠️ 不要换成 `openai/gpt-audio`（音频输出贵 53 倍）；`lyria-3:free` 是音乐生成不是 TTS
+      openrouter_tts: createOpenRouterTts,
       local_sapi: createTtsProvider,
       // OCR
       baidu_ocr: createOcrProvider,

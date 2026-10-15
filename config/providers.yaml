@@ -47,6 +47,18 @@ providers:
       access_key_secret: ${ALIYUN_SK}
       app_key: ${ALIYUN_APPKEY}
       priority: 2
+    # ★ OpenRouter ASR（**可选备选**；本地 faster-whisper 仍是首选 —— policy.asr: local-first）
+    #   实测可用：mistralai/voxtral-small-24b-2507（专用语音理解，in $0.1/M · out $0.3/M，最便宜档）
+    #   ⚠️ 免费音频模型**实测不可用**（403 agentic-only / 502），不要加进来
+    - id: openrouter-asr
+      type: openrouter_asr
+      label: OpenRouter ASR（voxtral-small）
+      vendor: OpenRouter
+      runtime: cloud
+      base_url: https://openrouter.ai/api/v1
+      api_key: ${OPENROUTER_KEY}
+      model: mistralai/voxtral-small-24b-2507
+      priority: 3
 
   # ── TTS ────────────────────────────────────────────────────────────
   tts:
@@ -60,6 +72,22 @@ providers:
       app_key: ${ALIYUN_APPKEY}
       voice: zhixiaobai
       priority: 1
+    # ★ OpenRouter TTS（**唯一实测可用路径**；Lead 实测三条硬约束见 src/providers/openrouter_audio.ts）
+    #   模型只用 openai/gpt-audio-mini（音频输出 $0.6/M）；
+    #   ⚠️ 不要换 openai/gpt-audio（$32/M 音频输出，贵 53 倍）；lyria-3:free 是音乐生成不是 TTS
+    #   ⚠️ 必须 stream + pcm16（否则 400）；目标格式由本地 ffmpeg 转
+    - id: openrouter-tts
+      type: openrouter_tts
+      label: OpenRouter TTS（gpt-audio-mini）
+      vendor: OpenRouter
+      runtime: cloud
+      base_url: https://openrouter.ai/api/v1
+      api_key: ${OPENROUTER_KEY}
+      model: openai/gpt-audio-mini
+      voice: alloy
+      max_chars_per_request: 1024
+      formats: [wav, mp3]
+      priority: 2
 
   # ── 翻译（LLM 带术语表优先）─────────────────────────────────────────
   #
