@@ -34,6 +34,7 @@ import { DEFAULT_DB_GLOSSARY, createTranslateProvider } from './translate/index.
 import { createTtsProvider } from './tts/index.ts';
 import { createOpenRouterAsr, createOpenRouterTts } from './openrouter_audio.ts';
 import { createOcrProvider } from './ocr/index.ts';
+import { createOpenRouterOcr } from './openrouter_ocr.ts';
 
 // ─────────────────────────────────────────────────────────────
 // 重导出
@@ -352,6 +353,9 @@ export function createProviderLayer(opts: CreateProviderLayerOptions): ProviderL
       tencent_ocr: createOcrProvider,
       local_tesseract: createOcrProvider,
       local_paddle: createOcrProvider,
+      // ★ OpenRouter 视觉 LLM OCR（首选 glm-5.3-flash / 备选 gemini-2.5-flash-lite）
+      //   ⚠️ 禁用清单写死在 openrouter_ocr.ts（`gemma-3-4b-it` 实测会编造原文没有的文字）
+      openrouter_ocr: createOpenRouterOcr,
     },
   });
 

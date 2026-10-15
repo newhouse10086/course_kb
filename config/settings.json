@@ -2,10 +2,10 @@
   "$schema": "./settings.schema.json",
   "version": 1,
   "llm": {
-    "active": "kimi-k3",
+    "active": "deepseek-v4.1-flash",
     "fallbacks": [
-      "glm-5.3",
-      "kimi-k3"
+      "deepseek-v4-flash-0731",
+      "glm-5.3-flash"
     ],
     "temperature": 0,
     "maxTokens": 16384,

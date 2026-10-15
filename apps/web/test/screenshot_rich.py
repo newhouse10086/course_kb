@@ -66,6 +66,14 @@ def main() -> int:
                 ch.screenshot(str(p), full_page=True)
                 print(f"  ✓ {p.name}（{p.stat().st_size // 1024} KB）")
                 shots += 1
+                # ③ 代码高亮特写（Lead 验收要求：把代码块滚到视口中央再截）
+                ch.evaluate("(() => { const b=document.querySelector('[data-testid=\"code-block\"]');"
+                            " if (b) b.scrollIntoView({block:'center'}); return 1 })()")
+                time.sleep(0.6)
+                p3 = OUT / f"rich-code-highlight-{theme}.png"
+                ch.screenshot(str(p3), full_page=False)
+                print(f"  ✓ {p3.name}（{p3.stat().st_size // 1024} KB）")
+                shots += 1
                 # ② 思维导图（视频页）
                 ch.navigate(f"{base}/#/video?doc={docs['video']}&theme={theme}", timeout=120)
                 ch.wait_for("!!document.querySelector('[data-testid=\"mindmap\"]')", timeout=180, interval=0.3)
@@ -75,8 +83,8 @@ def main() -> int:
                 print(f"  ✓ {p2.name}（{p2.stat().st_size // 1024} KB）")
                 shots += 1
                 ch.navigate("about:blank", timeout=30)
-        print(f"\n{'✓' if shots == 4 else '✗'} 三种渲染截图 {shots}/4 张 → {OUT}")
-        return 0 if shots == 4 else 1
+        print(f"\n{'✓' if shots == 6 else '✗'} 渲染截图 {shots}/6 张 → {OUT}")
+        return 0 if shots == 6 else 1
     finally:
         mock.terminate()
         try:

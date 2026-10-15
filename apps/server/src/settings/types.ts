@@ -115,7 +115,10 @@ export function defaultSettings(): Settings {
     version: 1,
     llm: {
       active: 'deepseek-v4.1-flash',
-      fallbacks: ['glm-5.3', 'kimi-k3'],
+      // ⚠️ **兜底链必须也是低价模型** —— 原为 `['glm-5.3','kimi-k3']`：
+      //    主模型失败时会**静默切到贵模型**（用户实测 kimi 太贵）。
+      //    **改默认值不能只改 active，兜底链同样会烧钱。**
+      fallbacks: ['deepseek-v4-flash-0731', 'glm-5.3-flash'],
       temperature: 0,
       maxTokens: 16_384,
       structured: { jsonSchemaStrict: true },

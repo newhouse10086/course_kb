@@ -126,3 +126,28 @@ providers:
       api_key: ${BAIDU_OCR_KEY}
       secret_key: ${BAIDU_OCR_SECRET}
       priority: 1
+    # ★ OpenRouter 视觉 LLM OCR（Lead 实测 5 个视觉模型后的方案）
+    #   首选 z-ai/glm-5.3-flash（3.8s，快且准）→ 备选 google/gemini-2.5-flash-lite（5.5s，最准）
+    #   ⚠️ 不要换 google/gemma-3-4b-it（实测**编造原文没有的文字**）—— 禁用清单写死在 openrouter_ocr.ts
+    #   ⚠️ 本链**没有版面坐标**（不伪造 box / 不编 confidence），`degradedReason` 会明说；
+    #      需要真坐标请用百度 OCR（priority 1，有凭据时自动优先）
+    - id: openrouter-ocr-glm
+      type: openrouter_ocr
+      label: OpenRouter OCR（glm-5.3-flash）
+      vendor: OpenRouter
+      runtime: cloud
+      base_url: https://openrouter.ai/api/v1
+      api_key: ${OPENROUTER_KEY}
+      model: z-ai/glm-5.3-flash
+      max_image_width: 1600
+      priority: 2
+    - id: openrouter-ocr-gemini
+      type: openrouter_ocr
+      label: OpenRouter OCR（gemini-2.5-flash-lite，备选）
+      vendor: OpenRouter
+      runtime: cloud
+      base_url: https://openrouter.ai/api/v1
+      api_key: ${OPENROUTER_KEY}
+      model: google/gemini-2.5-flash-lite
+      max_image_width: 1600
+      priority: 3

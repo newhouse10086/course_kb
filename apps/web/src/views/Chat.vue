@@ -117,7 +117,14 @@ const resumeReason = ref('')
 const restarted = ref(false)
 /** agent 模式但 kb 工具装不上时，后端给的原因原文（`kb_tools_warning`） */
 const kbToolsWarning = ref('')
+/** 瞬时提示（后端回显差异等，会被下一帧 ready 更新） */
 const modeNote = ref('')
+/**
+ * ★ **持久**提示：切模式/切入口 = 新上下文（对话会被清空）。
+ *   原写法只在点击那一刻写 `modeNote`，而重连后的 `ready` 会把它清掉 ——
+ *   正好在用户看到"对话没了"的那一刻**没有任何解释**（实测踩到）。
+ */
+const modeSwitchNotice = ref('')
 /**
  * ★ `/capabilities.chat_modes` —— **服务端权威清单**（backend-api 实测）：
  *   `{modes, default, tools:{chat:[],agent:['kb_search','kb_get']}, allowed_roles:{agent:['admin','teacher']}, kb:{available,readonly,scoped_by}, note}`
@@ -492,10 +499,12 @@ function setMode(m: 'chat' | 'agent') {
   backendMode.value = ''
   // ★ backend-api 实测：**模式是连接级参数**（pi 把 mode 编进会话 key，工具集建会话时确定）
   //   → 切模式必须**重连**；会丢上下文，这是有意取舍（UI 要如实说）
-  modeNote.value = (m === 'agent'
+  const msg = (m === 'agent'
     ? '已切到 agent：可调用知识库工具读原文（kb_search/kb_get）。'
     : '已切回 chat：只用检索摘要（更快）。')
     + '**模式是会话级的 → 已重新连接，上下文重新开始。**'
+  modeNote.value = msg
+  modeSwitchNotice.value = msg      // 持久：重连后仍然告诉用户"为什么对话清空了"
   reconnect()
 }
 
@@ -514,6 +523,7 @@ function reconnect() {
 function newSession() {
   socket?.newSession()
   msgs.value = []
+  modeSwitchNotice.value = ''
   msgs.value.push({ role: 'system', text: '已请求新建会话', thinking: '', tools: [] })
 }
 
@@ -725,6 +735,10 @@ void _esc
         </span>
       </div>
       <div v-if="modeNote" class="note warn" style="margin-top: 6px" data-testid="mode-note">{{ modeNote }}</div>
+      <!-- ★ 持久提示：重连后仍解释"对话为什么清空了" -->
+      <div v-if="modeSwitchNotice" class="small faint" style="margin-top: 4px" data-testid="mode-switch-notice">
+        {{ modeSwitchNotice }}
+      </div>
       <!-- ★ pi-bridge 新字段：模型来源回落 / 会话恢复 / 自动重启 / kb 工具装不上 —— 都如实说 -->
       <div v-if="modelWarning || (modelSource && modelSource !== 'explicit')" class="small faint" style="margin-top: 4px"
            data-testid="model-source" :data-model-source="modelSource">

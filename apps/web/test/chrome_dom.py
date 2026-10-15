@@ -531,6 +531,25 @@ def main() -> int:
             ok("代码块：未闭合围栏**照样按代码块渲染**并标注（不整段崩成纯文本）",
                'data-unclosed="1"' in dom and "代码围栏未闭合" in dom, "未闭合容错未生效")
             ok("代码块：有复制按钮 + 行数", 'data-testid="code-copy"' in dom and "data-lines=" in dom)
+            # ★ 语法高亮（Lead 裁定：highlight.js 按需语言 + 设计 token 配色）
+            ok("代码块：sql 真的有高亮（hljs-* 类名）",
+               'data-hl="1"' in dom and "hljs-keyword" in dom, "未见 hljs 类名")
+            ok("代码块：高亮状态如实标注（已高亮/未标语言）",
+               'data-testid="code-hl-ok"' in dom or 'data-testid="code-no-hl"' in dom)
+            # 未标语言的代码块**不高亮**（不猜语言）
+            unlabeled = driver.ch.evaluate("(() => { const b=Array.from(document.querySelectorAll('[data-testid=\"code-block\"]'))"
+                                           ".find(x => x.dataset.lang === '');"
+                                           " return b ? JSON.stringify({hl:b.dataset.hl, hasHljs: !!b.querySelector('[class*=hljs-]')}) : 'none' })()")
+            ok("代码块：未标语言 → 不高亮（data-hl=0 且无 hljs 类名）",
+               str(unlabeled) == 'none' or ('"hl":"0"' in str(unlabeled) and '"hasHljs":false' in str(unlabeled)), str(unlabeled))
+            # ★ XSS：喂一段含 <script> 的代码 → DOM 里不能出现真的 script 元素，且文本原样
+            danger = driver.ch.evaluate("(() => { const blocks=document.querySelectorAll('[data-testid=\"code-block\"]');"
+                                        " const n=document.querySelectorAll('[data-testid=\"assistant-text\"] script').length;"
+                                        " const t=Array.from(blocks).map(b=>b.textContent).join(' ');"
+                                        " return JSON.stringify({script:n, hasAngle: t.includes('&lt;') || t.includes('<'),"
+                                        " blocks: blocks.length}) })()")
+            ok("代码块路径：无真的 script 元素（highlight.js 输出已转义）",
+               '"script":0' in str(danger), str(danger))
             # 注入安全：模型输出里的 HTML 必须被转义（不能出现可执行标签）
             driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
                                " t.value='<img src=x onerror=alert(1)>'; t.dispatchEvent(new Event('input',{bubbles:true})); return 1 })()")
@@ -678,9 +697,10 @@ def main() -> int:
             ok("chat：**没有** kb 工具帧（chat 不读原文）", 'data-testid="retrieval-tool"' not in chat_dom)
             # 切到 agent → 再发一轮 → 应有 kb_search/kb_get 工具帧 + tools 真值
             driver.ch.evaluate("document.querySelector('[data-testid=\"mode-agent\"]').click()")
-            driver.ch.wait_for("!!document.querySelector('[data-testid=\"mode-note\"]')", timeout=20, interval=0.2)
-            note = driver.ch.evaluate("document.querySelector('[data-testid=\"mode-note\"]').textContent")
-            ok("切模式如实提示上下文重新开始", "上下文重新开始" in str(note), str(note)[:120])
+            # ★ 断言**持久**提示（瞬时 mode-note 会被重连后的 ready 清掉 —— 那正是用户需要解释的时刻）
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"mode-switch-notice\"]')", timeout=30, interval=0.2)
+            note = driver.ch.evaluate("document.querySelector('[data-testid=\"mode-switch-notice\"]').textContent")
+            ok("切模式如实提示上下文重新开始（重连后仍在）", "上下文重新开始" in str(note), str(note)[:120])
             driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
                                " t.value='再讲一次聚簇索引'; t.dispatchEvent(new Event('input',{bubbles:true}));"
                                " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
