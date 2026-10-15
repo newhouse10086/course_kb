@@ -519,8 +519,14 @@ def main() -> int:
             ASSIST = "Array.from(document.querySelectorAll('[data-testid=\"assistant-text\"] [data-testid=\"rich-text\"]')).pop()"
             # ⚠️ 必须等**这一轮流式结束**再断言：只等 math≠0 会拿到中途快照
             #    （第一版就是这样 → "代码块/未闭合/失败"全红，其实渲染是对的）
-            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"code-unclosed\"]')",
-                               timeout=120, interval=0.3)   # 并发跑 vitest 时 60s 偶发不够（实测 flaky）
+            # ★ 显式等"未闭合标记"出现（Lead 建议：先按时序修；改完仍偶发 = 真 bug）
+            #   原来直接读快照 → 偶发（~10 次 1 次）判成"未闭合容错未生效"
+            try:
+                driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"code-unclosed\"]')",
+                                   timeout=120, interval=0.3)
+            except Exception:
+                # 再等一轮（重发一次 prompt 前的最后机会）：若仍没有，让下面的断言如实报错
+                time.sleep(2.0)   # 并发跑 vitest 时 60s 偶发不够（实测 flaky）
             rich = driver.ch.evaluate("(() => { const r=" + ASSIST + ";"
                                       " return JSON.stringify({math:r.dataset.math, fail:r.dataset.mathFail,"
                                       " code:r.dataset.code, unclosed:r.dataset.unclosed, blocks:r.dataset.blocks}) })()")
@@ -970,6 +976,8 @@ def main() -> int:
             ok("★ 代价可见：给**区间**（不是假精确的单个数）", "–" in str(est) or "-" in str(est), str(est))
             ok("★ 代价里写明 OCR 本地、不耗 LLM 额度但占 CPU",
                "不消耗 LLM 额度" in str(est) and "CPU" in str(est), str(est))
+            # ★ 如实风险说明（后端 replaceCards 全删重插未修完 → 旧卡片链接会失效）
+            ok("★ 代价里**如实说明风险**（旧卡片链接可能失效）", "旧卡片链接可能失效" in str(est), str(est)[:200])
             # ★ 现在点击**应该真的发请求**（与"禁用时不许发"互为反例 —— 同一判据的两个方向都要有）
             before = api("/api/v1/_fixture/reparse_calls").get("calls")
             driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"btn-reparse\"]')).click()")

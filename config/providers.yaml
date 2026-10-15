@@ -10,10 +10,17 @@ policy:
   #    「policy='explicit' 但未提供 explicitId」，抽取**静默产出 0 张卡片**。
   #    quality = 按注册顺序选（只有一个 amr 时就是它）。
   llm: quality
-  asr: local-first        # local-first | cloud-first | cost | quality | explicit
+  # ★★ 2026-10-16 用户裁定：**ASR 与 OCR 都走 OpenRouter API**（原话："ASR我要的也是调用API的方式请求openrouter"·"OCR同理"）
+  #    ⚠️ 但**真正的行为不在 policy 里**：`handlers.ts` 的 `asrViaOpenRouter` / `ocrViaOpenRouter`
+  #    **按 id 直接构造 provider、绕过 policy 降级链** —— 那样做是**有意的**：
+  #      ① policy 链里 `local-fw` / 本地 rapidocr 排在前面，走链就可能"悄悄回退本地"（违背用户裁定）
+  #      ② 按 id 直连 ⟹ **"回退本地"在结构上不可能**（不是靠"记得别回退"）
+  #    ⟹ policy 值只影响**其它调用方**（如手动选 provider）；这里改成 cloud-first 是为了
+  #      **不再对外声称"本地优先"**（坑 21：自述字段与实际生效值必须同源）。
+  asr: cloud-first        # local-first | cloud-first | cost | quality | explicit
   tts: cloud-first
   translate: cloud-first
-  ocr: local-first
+  ocr: cloud-first
   embedding: cost
 
 providers:
@@ -29,7 +36,10 @@ providers:
       model: ${LLM_MODEL}
       priority: 1
 
-  # ── ASR（本地 faster-whisper 优先；云端如实报未配置）──────────────────
+  # ── ASR（★ 默认走 OpenRouter；本地 faster-whisper 保留但**不是默认路径**）──────
+  #   ★ 用户 2026-10-16 裁定："ASR我要的也是调用API的方式请求openrouter"
+  #   ⚠️ 实际调用路径：`handlers.ts::asrViaOpenRouter` **按 id 直连 openrouter-asr**（绕过 policy）
+  #      ⟹ 本文件里的顺序/priority **不决定** ASR 走哪条路；改行为请改那段代码。
   asr:
     - id: local-fw
       type: local_worker          # → Python worker（worker/video/asr.py）
@@ -47,8 +57,11 @@ providers:
       access_key_secret: ${ALIYUN_SK}
       app_key: ${ALIYUN_APPKEY}
       priority: 2
-    # ★ OpenRouter ASR（**可选备选**；本地 faster-whisper 仍是首选 —— policy.asr: local-first）
-    #   实测可用：mistralai/voxtral-small-24b-2507（专用语音理解，in $0.1/M · out $0.3/M，最便宜档）
+    # ★ OpenRouter ASR（**用户裁定后的默认路径** —— 见上方 policy 注释）
+    #   实测可用：mistralai/voxtral-small-24b-2507（专用语音理解，**按音频 token 计费**）
+    #   ★ `[实测]` 30.0s 音频 → usage.cost=0.0030593 ⟹ **$0.00612/分钟 ≈ $0.367/小时**
+    #     口径：1 audio token = 1 秒音频；音频费占 98%（不是"按次"、不是"按字数"）
+    #     ⟹ 60 分钟视频 ≈ **$0.37**；速度 **6.28× 实时**（60 分钟视频 ≈ 9.6 分钟墙钟）
     #   ⚠️ 免费音频模型**实测不可用**（403 agentic-only / 502），不要加进来
     - id: openrouter-asr
       type: openrouter_asr
@@ -73,8 +86,11 @@ providers:
       voice: zhixiaobai
       priority: 1
     # ★ OpenRouter TTS（**唯一实测可用路径**；Lead 实测三条硬约束见 src/providers/openrouter_audio.ts）
-    #   模型只用 openai/gpt-audio-mini（音频输出 $0.6/M）；
-    #   ⚠️ 不要换 openai/gpt-audio（$32/M 音频输出，贵 53 倍）；lyria-3:free 是音乐生成不是 TTS
+    #   模型只用 openai/gpt-audio-mini（音频**输出** $2.4/M）；
+    #   ⚠️ 不要换 openai/gpt-audio —— ★ **2026-10-16 按 /api/v1/models 权威字段更正**：
+    #      $32/M 是它的**音频输入**价，**输出是 $64/M**；mini 输出 $2.4/M ⟹ 真实倍数 **26.7×**（原注释写"53 倍"是记混了字段）
+    #      （守卫已写进代码：`assertAudioModelAffordable` 单价超阈值直接抛 —— 注释拦不住人，代码能）
+    #   lyria-3:free 是音乐生成不是 TTS
     #   ⚠️ 必须 stream + pcm16（否则 400）；目标格式由本地 ffmpeg 转
     - id: openrouter-tts
       type: openrouter_tts
@@ -126,28 +142,34 @@ providers:
       api_key: ${BAIDU_OCR_KEY}
       secret_key: ${BAIDU_OCR_SECRET}
       priority: 1
-    # ★ OpenRouter 视觉 LLM OCR（Lead 实测 5 个视觉模型后的方案）
-    #   首选 z-ai/glm-5.3-flash（3.8s，快且准）→ 备选 google/gemini-2.5-flash-lite（5.5s，最准）
+    # ★ OpenRouter 视觉 LLM OCR —— ★★ 2026-10-16 **换成国产模型**（用户原话："ocr哪个模型不太可以哦。最好换成一个国产的"）
+    #   `[实测]` 真端点探测（434 页扫描件第 30 页 + 空白图）:
+    #     主 **qwen/qwen3-vl-235b-a22b-instruct** → 954 字符（教材正文，无编造）· **1211ms** · 空白图 `""`（诚实）
+    #     备 **qwen/qwen3-vl-30b-a3b-instruct**  → 921 字符（同上）        · **1344ms** · 空白图 `[看不清]`（诚实）
+    #   ⟹ ★ 比原 z-ai/glm-5.3-flash（3821ms）**快约 3 倍**；434 页 ≈ **9 分钟**（不是 27.6 分钟）
+    #   ★ 计费口径（实测 token）: in $0.21/M · out $1.90/M ⟹ **$0.00132/页** ⟹ 434 页 ≈ **$0.57**
     #   ⚠️ 不要换 google/gemma-3-4b-it（实测**编造原文没有的文字**）—— 禁用清单写死在 openrouter_ocr.ts
     #   ⚠️ 本链**没有版面坐标**（不伪造 box / 不编 confidence），`degradedReason` 会明说；
     #      需要真坐标请用百度 OCR（priority 1，有凭据时自动优先）
-    - id: openrouter-ocr-glm
+    #   ⚠️ ⚠️ **本文件的 `model:` 会覆盖 `openrouter_ocr.ts` 的代码默认值**（`optStr(o,'model',PRIMARY)`）——
+    #      ⟹ **改模型必须同时改这里**，否则"代码换了、生产还是旧的"（Lead 2026-10-16 实测踩到）。
+    - id: openrouter-ocr-qwen-main
       type: openrouter_ocr
-      label: OpenRouter OCR（glm-5.3-flash）
+      label: OpenRouter OCR（qwen3-vl-235b，国产·主）
       vendor: OpenRouter
       runtime: cloud
       base_url: https://openrouter.ai/api/v1
       api_key: ${OPENROUTER_KEY}
-      model: z-ai/glm-5.3-flash
+      model: qwen/qwen3-vl-235b-a22b-instruct
       max_image_width: 1600
       priority: 2
-    - id: openrouter-ocr-gemini
+    - id: openrouter-ocr-qwen-fallback
       type: openrouter_ocr
-      label: OpenRouter OCR（gemini-2.5-flash-lite，备选）
+      label: OpenRouter OCR（qwen3-vl-30b，国产·备）
       vendor: OpenRouter
       runtime: cloud
       base_url: https://openrouter.ai/api/v1
       api_key: ${OPENROUTER_KEY}
-      model: google/gemini-2.5-flash-lite
+      model: qwen/qwen3-vl-30b-a3b-instruct
       max_image_width: 1600
       priority: 3

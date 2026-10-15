@@ -36,6 +36,43 @@ import { intParam, pageParams, requireDoc, sendError, strParam, supportedFormats
 const SUPPORTED_EXTS = Object.keys(EXT_TO_KIND);
 
 /**
+ * ★★ **云端 OCR 代价估算的单一真相**（本文件与 worker 侧共用同一口径）。
+ *
+ * `[实测]` 2026-10-16 真端点（`qwen/qwen3-vl-235b-a22b-instruct`，真实教材页 150 DPI）：
+ * ```
+ * 1211 ms/页 · 1457 prompt + 533 completion tokens
+ * in $0.21/M · out $1.90/M
+ * ⟹ $0.000306 + $0.001013 = **$0.00132/页**
+ * ```
+ *
+ * ⚠️ **今晚上过当**：我最初只按"一个单价 × 总量"估 → **$0.087/434 页（错 6.5 倍）**。
+ * 真因：**输出单价是输入的 9 倍**，输出只占 27% token 却贡献 77% 费用。
+ * ⟹ 算 token 成本**必须输入/输出分开**（这一条已写进 worker 侧常量注释）。
+ *
+ * ## 为什么速度给**区间**
+ * `est_minutes` 的契约是 `[lo, hi]`；且 1.21s 只是**一次探测**而非分布 ——
+ * 单值是在声称我们没有的精度（与"$0.087 看着精确但其实撒谎"同一族）。
+ *
+ * ## ★ 与 worker 侧的一致性
+ * worker 侧同名口径在 `worker/adapters/pdf.py`（`CLOUD_OCR_*`）。
+ * 由 `test/ocr_estimate_consistency.test.ts` **跨语言断言两者一致** ——
+ * **改一处忘另一处 → 测试必红**（这是"两处真相"的守卫，不是靠记得改）。
+ */
+export const OCR_CLOUD_EST = {
+  /** 乐观侧（实测 1.21s/页 略下留） */
+  secsPerPageLo: 1.0,
+  /** 保守侧（含网络余量；与 worker `CLOUD_OCR_SECS_PER_PAGE_EST` 一致） */
+  secsPerPageHi: 1.5,
+  /** 每页美元（实测口径） */
+  usdPerPage: 0.00132,
+  /** 每页 token（实测）—— 供跨语言一致性断言核对口径 */
+  promptTokensPerPage: 1457,
+  completionTokensPerPage: 533,
+  usdPerMInput: 0.21,
+  usdPerMOutput: 1.9,
+} as const;
+
+/**
  * ★ 文档级授权的**唯一入口**（RBAC §2/§4/§6）。
  *
  * 语义（**刻意区分 404 与 403**）：
@@ -738,28 +775,40 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
        *
        * `[实测]` 2026-10-16 真端点（`qwen/qwen3-vl-235b-a22b-instruct`，真实教材页）：
        * 每页 1211ms · 1457 prompt + 533 completion tokens · in $0.21/M · out $1.90/M
-       * ⟹ 约 **$0.00132/页**（434 页 ≈ **$0.57** / **~9 分钟**）。
+       * ⟹ 约 **$0.00132/页**（434 页 ≈ **$0.57** / **~7–11 分钟**）。
+       *
+       * ## ★ 为什么 `est_minutes` 保持**区间** `[lo, hi]`（Lead 裁定 b）
+       * 1. **契约就是区间** —— 改成标量是接口变更（前端读它会坏）；
+       * 2. ★ **区间比单值更诚实**：云端速度会随网络/负载/页面复杂度波动，
+       *    单值 `9` 是在**声称一个我们没有的精度** ——
+       *    那正是今晚反复在修的"看起来精确但其实撒谎的数字"；
+       * 3. 1.21s/页 只是**一次探测**，**不是分布** ⟹ 上下留余量。
+       *
+       * ## ★ 单一真相（解决"两处真相"）
+       * 速度常量取自 `OCR_CLOUD_EST`（本文件顶部导出），
+       * 并由 `test/ocr_estimate_consistency.test.ts` **与 worker 侧常量交叉断言** ——
+       * 改一处忘另一处 → **测试必红**。
        */
-      const OCR_SECS_PER_PAGE = 1.21; // 实测（qwen3-vl-235b；旧本地值 11s/页 已废弃）
-      const OCR_USD_PER_PAGE = 0.00132; // 实测口径：1457 in×$0.21/M + 533 out×$1.90/M
-      const estSecs = pages * OCR_SECS_PER_PAGE;
-      const estUsd = pages * OCR_USD_PER_PAGE;
+      const estLo = pages > 0 ? Math.max(1, Math.round((pages * OCR_CLOUD_EST.secsPerPageLo) / 60)) : null;
+      const estHi = pages > 0 ? Math.max(1, Math.round((pages * OCR_CLOUD_EST.secsPerPageHi) / 60)) : null;
+      const estUsd = pages > 0 ? Math.round(pages * OCR_CLOUD_EST.usdPerPage * 10000) / 10000 : null;
       const cost = needsOcr
         ? {
             needs_ocr: true,
             ocr_mode: 'cloud',
             ocr_provider: 'openrouter',
-            est_minutes: pages > 0 ? Math.max(1, Math.round(estSecs / 60)) : null,
-            est_usd: pages > 0 ? Math.round(estUsd * 10000) / 10000 : null,
+            // ★ 区间（契约形状不变）；页数未知 → null（**不假装知道**，坑 22：空 ≠ 缺失）
+            est_minutes: estLo !== null && estHi !== null ? ([estLo, estHi] as [number, number]) : null,
+            est_usd: estUsd,
             cost_note:
               pages > 0
                 ? `该文档正文为空（图片型）→ 重跑会走**云端 OCR（OpenRouter 视觉模型）**，约 ${pages} 页；` +
-                  `预计 **${Math.max(1, Math.round(estSecs / 60))} 分钟**，费用约 **$${(Math.round(estUsd * 10000) / 10000).toFixed(4)}**` +
+                  `预计 **${estLo}–${estHi} 分钟**，费用约 **$${(estUsd ?? 0).toFixed(4)}**` +
                   `（按 token 计费，实测口径；**以 OpenRouter 账单为准**）。` +
                   '解析完成后会自动抽取（那一步消耗 LLM 额度）。'
                 : '该文档正文为空（图片型）→ 重跑会走云端 OCR（OpenRouter）。页数未知，耗时与费用随页数增长。',
           }
-        : { needs_ocr: false, cost_note: '重跑会重新解析并在完成后自动抽取（抽取会消耗 LLM 额度）。' };
+        : { needs_ocr: false, est_minutes: null, est_usd: null, cost_note: '重跑会重新解析并在完成后自动抽取（抽取会消耗 LLM 额度）。' };
 
       const taskId = queue.enqueue({
         docId: id,

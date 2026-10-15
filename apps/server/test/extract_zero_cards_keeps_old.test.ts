@@ -160,12 +160,46 @@ test('① ★★ 0 卡片 + 有失败 → **不覆盖**旧卡片（机制 1）+ 
 
 test('② ★ 0 卡片 + **无失败**（worker `done_empty`）→ 照常替换（不是失败，别误伤）', async () => {
   const before = seedOldCards(2);
-  convertResult = { cards: [], entities: [], edges: [], sections: {}, status: 'done_empty', ok: true, error_count: 0 };
+  // ★ 关键：**明确说空**（`cards_key: 'empty'`）—— 这是 Lead 裁定里「允许替换成 0」的前提；
+  //   若省略该警告（= `missing`），按裁定必须**保留旧卡**（见 ③ 用例）。
+  convertResult = {
+    cards: [], entities: [], edges: [], sections: {}, status: 'done_empty', ok: true, error_count: 0,
+    warnings: [{ code: 'W_NO_CARDS', cards_key: 'empty', msg: '模型明确返回空数组' }],
+  };
   const t = await runExtract();
   assert.ok(['done', 'done_empty'].includes(t?.status ?? ''), `内容确实没有知识点 → 不该 failed（实际 ${t?.status}）`);
   assert.equal(cardsOf().total, 0, '★ 这一条**应该**替换成 0 卡片（否则"确实没有知识点"的文档会永远显示旧卡）');
   assert.equal(meta().extract_status, 'done_empty', '★ 如实标 done_empty（不许报 done）');
   assert.ok(before.length === 2, '前置无误');
+});
+
+test('★★ ③ 0 卡片 + 无失败 + `cards_key="missing"`（模型省略）→ **保留旧卡 + 如实警告**（"不知道" ≠ "没有"）', async () => {
+  // 前置：先正常产出 2 张卡（★ 用本文件已有的 `seedOldCards`，别引入不存在的辅助）
+  const beforeIds = seedOldCards(2);
+  const before = cardsOf().total;
+  assert.equal(before, 2, `前置：应有 2 张旧卡（实际 ${before}）`);
+  void beforeIds;
+  assert.ok(before > 0, `前置：应有卡片（实际 ${before}）`);
+
+  // ★ 这一轮：0 卡片、**无失败**，但模型**没有给 `cards` 键**（`missing` —— 可能被截断/偷懒）
+  convertResult = {
+    cards: [], entities: [], edges: [], sections: {}, status: 'done_empty', ok: true, error_count: 0,
+    warnings: [{ code: 'W_NO_CARDS', cards_key: 'missing', msg: '模型未给出 cards 键（可能被截断）' }],
+  };
+  const t = await runExtract();
+  assert.ok(['done', 'done_empty'].includes(t?.status ?? ''), `不该 failed（实际 ${t?.status}）`);
+  assert.equal(
+    cardsOf().total,
+    before,
+    `★★ \`cards_key="missing"\` 时**一张都不许删**：${before} → ${cardsOf().total}` +
+      `（"模型没说" ≠ "模型说没有" —— 可能只是被截断，删了就是数据丢失）`,
+  );
+  // 如实警告（不许静默）
+  const warnings = (meta().extract_warnings ?? []) as { code?: string; cards_key?: string }[];
+  assert.ok(
+    warnings.some((w) => w.code === 'W_NO_CARDS' && w.cards_key === 'missing'),
+    `★ 必须如实带上 W_NO_CARDS(cards_key=missing) 警告（实际 ${JSON.stringify(warnings).slice(0, 200)}）`,
+  );
 });
 
 test('③ ★ 有卡片 + 有失败（partial）→ 照常入库（已产出的是真进度）', async () => {

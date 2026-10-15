@@ -726,11 +726,190 @@ export class Repo {
 
   // ── cards ──────────────────────────────────────────────────────────
 
-  /** 全量替换某文档的 cards（抽取结果整体覆盖）。 */
-  replaceCards(docId: string, drafts: CardDraft[]): string[] {
+  /**
+   * ★★ 替换某文档的 cards —— **键命中且内容相同才复用 id，只删"不再存在"的**。
+   *
+   * ## 原错误写法（真实数据丢失 + 用户可见 404）
+   * ```ts
+   * replaceCards(docId, drafts) {
+   *   this.db.tx(() => {
+   *     this.db.run('DELETE FROM cards WHERE doc_id = ?', docId);  // ← 全删
+   *     return this.insertCardsNoTx(docId, drafts);                // ← 全部新 id
+   *   });
+   * }
+   * ```
+   * 真机实测：抽取 10 张 → reparse 后 8 张，**旧 id 保留 0/10**
+   * （★ 数量变化把"全量替换"伪装成"小幅减少"）⟹ `GET /cards/<旧id>` → **404**；
+   * `notes.card_id`（纯 TEXT 无 FK）→ 用户笔记**静默悬空**。
+   * ★ **第二条独立机制（更危险）**：`drafts` 为空（抽取失败/零产出）时**无条件全删** →
+   *   "reparse 前 3 张、之后 0 张"—— 与 `replaceUnits` 的"失败不清库"守卫**同形，但这里缺了**。
+   *
+   * ## 复用判据（**只有一条**，改动前先读）
+   * ```
+   * 键 = (unit_id, name_key)   且   **内容指纹完全相同**  → 保留旧 id（不 UPDATE、不换 id）
+   * 否则 → 新 id（★ 内容真的变了就换 id —— "永远复用"会把旧内容钉住，让重抽白跑）
+   * ```
+   * ★ 指纹覆盖**全部内容列**（name/kind/one_line/purpose/usage_mode/operational_role/lifecycle/
+   *   example/example_explained/prerequisites/cautions/evidence_quote/span/confidence），
+   *   与 `insertCardsNoTx` 的取值口径**逐字一致**（否则"内容没变"会被误判成变了）。
+   *
+   * ★ `drafts` 为空 → **一个都不许删**（零产出 = 抽取失败，不是"用户删光了卡片"）。
+   */
+  replaceCards(
+    docId: string,
+    drafts: CardDraft[],
+    opts: { emptyMeans?: 'keep' | 'clear' } = {},
+  ): string[] {
+    return this.replaceCardsWithPlan(docId, drafts, opts).ids;
+  }
+
+  /** 同上，但**额外返回账目**（复用/新增/删除/命中数）—— 调用方可写进 meta 做可观测。 */
+  replaceCardsWithPlan(
+    docId: string,
+    drafts: CardDraft[],
+    opts: { emptyMeans?: 'keep' | 'clear' } = {},
+  ): { ids: string[]; reused: number; inserted: number; deleted: string[] } {
     return this.db.tx(() => {
-      this.db.run('DELETE FROM cards WHERE doc_id = ?', docId);
-      return this.insertCardsNoTx(docId, drafts);
+      /**
+       * ★★ **空草稿的语义分三种**（Lead 裁定；坑 22「空 ≠ 缺失」）：
+       * ```
+       * ① 0 卡 + **有失败**           → `emptyMeans` 由调用方传 'keep'（**失败不清库**）
+       * ② 0 卡 + 无失败 + cards: []  → 调用方传 'clear'（模型**明确说空** → 诚实替换成 0）
+       * ③ 0 卡 + 无失败 + cards 缺失 → 调用方传 'keep'（**"不知道" ≠ "没有"** —— 别删用户数据）
+       * ```
+       * ⚠️ **默认 'keep'**：安全侧默认（不知道就保留）。要清空必须**显式**说 `emptyMeans: 'clear'`。
+       */
+      if (drafts.length === 0) {
+        if (opts.emptyMeans !== 'clear') return { ids: [], reused: 0, inserted: 0, deleted: [] };
+        const all = this.db.all<{ id: string }>('SELECT id FROM cards WHERE doc_id = ?', docId).map((r) => r.id);
+        if (all.length > 0) {
+          const ph = all.map(() => '?').join(',');
+          this.db.run(`DELETE FROM cards WHERE doc_id = ? AND id IN (${ph})`, docId, ...all);
+        }
+        return { ids: [], reused: 0, inserted: 0, deleted: all };
+      }
+
+      /** 内容指纹（★ 与 `insertCardsNoTx` 的取值口径逐字一致） */
+      const fp = (c: CardDraft): string => {
+        const span = c.evidence_span;
+        return JSON.stringify([
+          c.name,
+          c.kind,
+          c.one_line ?? '',
+          c.purpose ?? '',
+          c.usage_mode ?? 'unknown',
+          c.operational_role ?? 'unknown',
+          c.lifecycle ?? 'unknown',
+          c.example ?? null,
+          c.example_explained ?? null,
+          JSON.stringify(c.prerequisites ?? []),
+          JSON.stringify(c.cautions ?? []),
+          c.evidence_quote ?? '',
+          span?.kind ?? '',
+          span?.start ?? 0,
+          span?.end ?? 0,
+          c.confidence ?? 0,
+        ]);
+      };
+      const rowFp = (r: {
+        name: string;
+        kind: string;
+        one_line: string;
+        purpose: string;
+        usage_mode: string;
+        operational_role: string;
+        lifecycle: string;
+        example: string | null;
+        example_explained: string | null;
+        prerequisites_json: string;
+        cautions_json: string;
+        evidence_quote: string;
+        span_kind: string;
+        span_start: number;
+        span_end: number;
+        confidence: number;
+      }): string =>
+        JSON.stringify([
+          r.name,
+          r.kind,
+          r.one_line ?? '',
+          r.purpose ?? '',
+          r.usage_mode ?? 'unknown',
+          r.operational_role ?? 'unknown',
+          r.lifecycle ?? 'unknown',
+          r.example ?? null,
+          r.example_explained ?? null,
+          r.prerequisites_json ?? '[]',
+          r.cautions_json ?? '[]',
+          r.evidence_quote ?? '',
+          r.span_kind ?? '',
+          r.span_start ?? 0,
+          r.span_end ?? 0,
+          r.confidence ?? 0,
+        ]);
+
+      const existing = this.db.all<Parameters<typeof rowFp>[0] & { id: string; unit_id: string; name_key: string }>(
+        `SELECT id, unit_id, name_key, name, kind, one_line, purpose, usage_mode, operational_role,
+                lifecycle, example, example_explained, prerequisites_json, cautions_json,
+                evidence_quote, span_kind, span_start, span_end, confidence
+           FROM cards WHERE doc_id = ? ORDER BY unit_id ASC, id ASC`,
+        docId,
+      );
+      // 键 → 未消费的旧行（**同键多行**也要各自匹配一次）
+      const byKey = new Map<string, { id: string; fp: string }[]>();
+      for (const r of existing) {
+        const k = `${r.unit_id}\u0000${r.name_key}`;
+        byKey.set(k, [...(byKey.get(k) ?? []), { id: r.id, fp: rowFp(r) }]);
+      }
+      const existingIds = new Set(existing.map((r) => r.id));
+      const used = new Set<string>();
+
+      // ② 定 id：**键 + 内容都命中** → 复用；显式 id（属于本文档且未用）→ 采用；否则新建
+      let reused = 0;
+      const ids = drafts.map((c) => {
+        const k = `${c.unit_id}\u0000${nameKey(c.name)}`;
+        const want = fp(c);
+        const hit = (byKey.get(k) ?? []).find((x) => !used.has(x.id) && x.fp === want);
+        if (hit) {
+          used.add(hit.id);
+          reused += 1;
+          return hit.id;
+        }
+        // ★ 显式 id（调用方指定且属于本文档、且未被占用）
+        if (c.id && existingIds.has(c.id) && !used.has(c.id)) {
+          used.add(c.id);
+          return c.id;
+        }
+        return newCardId();
+      });
+
+      // ④ ★ 同一 id 不许出现两次（显式 id 与键命中会撞车 → 主键冲突）—— 撞了就重新发号
+      const seen = new Set<string>();
+      const finalIds = ids.map((id) => {
+        if (seen.has(id)) return newCardId();
+        seen.add(id);
+        return id;
+      });
+
+      // ③ 只删"本次真的不再存在"的旧卡
+      const keep = new Set(finalIds);
+      const deleted = existing.filter((r) => !keep.has(r.id)).map((r) => r.id);
+      if (deleted.length > 0) {
+        const ph = deleted.map(() => '?').join(',');
+        this.db.run(`DELETE FROM cards WHERE doc_id = ? AND id IN (${ph})`, docId, ...deleted);
+      }
+
+      // ⑤ 写入（复用 id 的行先删后插 —— 内容相同，等价于原样写回；★ `insertCardsNoTx` 仍是写入路径）
+      const reuseIds = finalIds.filter((id) => existingIds.has(id));
+      if (reuseIds.length > 0) {
+        const ph = reuseIds.map(() => '?').join(',');
+        this.db.run(`DELETE FROM cards WHERE doc_id = ? AND id IN (${ph})`, docId, ...reuseIds);
+      }
+      this.insertCardsNoTx(
+        docId,
+        finalIds.map((id, i) => ({ ...drafts[i]!, id })),
+      );
+      return { ids: finalIds, reused, inserted: finalIds.length - reuseIds.length, deleted };
     });
   }
 

@@ -572,7 +572,26 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
 
     const failures = result.stats.errorMessages ?? [];
     const graph = repo.replaceGraph(docId, result.entities, result.edges);
-    repo.replaceCards(docId, result.cards);
+    /**
+     * ★★ **空结果按语义分三种**（Lead 裁定；坑 22「空 ≠ 缺失」）——
+     * 决策依据是 `W_NO_CARDS` 的 **`cards_key`**，**不是**"卡片数 == 0"：
+     * ```
+     * ① 有失败                      → 'keep'（失败不清库）
+     * ② 无失败 + cards_key='empty'  → 'clear'（模型**明确说空** → 诚实替换成 0）
+     * ③ 无失败 + cards_key='missing'（或没有该警告）→ 'keep' + 如实警告
+     *    ★ **"模型没说" ≠ "模型说没有"**（可能被截断/偷懒）→ 不许因此删用户数据
+     * ```
+     * ⚠️ 多单元时若**同时**出现 missing 与 empty → 取 **keep**（安全侧）。
+     */
+    const noCardsKeys = (result.warnings ?? [])
+      .map((w) => (w && typeof w === 'object' ? (w as { cards_key?: unknown }).cards_key : undefined))
+      .filter((k): k is string => typeof k === 'string');
+    const explicitEmpty =
+      result.cards.length === 0 &&
+      failures.length === 0 &&
+      noCardsKeys.includes('empty') &&
+      !noCardsKeys.includes('missing');
+    repo.replaceCards(docId, result.cards, { emptyMeans: explicitEmpty ? 'clear' : 'keep' });
     repo.mergeDocumentMeta(docId, { section_summaries: result.sections });
     const xr = applyXrefs(repo, docId);
     indexDocument(db, repo, docId);

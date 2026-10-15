@@ -227,3 +227,132 @@ test('★ 现状语义（如实记录）：长任务先占槽 → 短任务**排
     '★ 现状：短任务必须**等长任务让出槽位**（FIFO）——若将来加了优先级车道，这条会红，**那时改它**',
   );
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⑤ ★★ 公平性（Lead 裁定"最小形态"）：优先级车道
+//    · 交互（人在等）插到批量前面 · 批量**仍必须能跑**（不饿死）· 默认不变
+// ═══════════════════════════════════════════════════════════════════════
+test('★★ ① 长批量在跑 + 交互提交 → **交互先完成**（长抽取不再堵住用户提问）', async () => {
+  LLM_QUEUE.setLimit(1);
+  const timeline: string[] = [];
+  // 一个长批量任务先占住唯一槽位
+  const longBatch = LLM_QUEUE.run(
+    async () => {
+      timeline.push('batch-long:start');
+      await new Promise((r) => setTimeout(r, 60));
+      timeline.push('batch-long:end');
+    },
+    { priority: 'batch' },
+  );
+  await new Promise((r) => setTimeout(r, 10)); // 确保它已占槽
+  // 先排一个**批量**（本该按 FIFO 排第一），再排一个**交互**
+  const queuedBatch = LLM_QUEUE.run(
+    async () => {
+      timeline.push('batch-queued:start');
+      timeline.push('batch-queued:end');
+    },
+    { priority: 'batch' },
+  );
+  const interactive = LLM_QUEUE.run(
+    async () => {
+      timeline.push('interactive:start');
+      timeline.push('interactive:end');
+    },
+    { priority: 'interactive' },
+  );
+  assert.equal(LLM_QUEUE.pendingInteractive, 1, '前置：交互车道里应有 1 个在等');
+  assert.equal(LLM_QUEUE.pendingBatch, 1, '前置：批量车道里应有 1 个在等');
+  await Promise.all([longBatch, queuedBatch, interactive]);
+  assert.deepEqual(
+    timeline,
+    ['batch-long:start', 'batch-long:end', 'interactive:start', 'interactive:end', 'batch-queued:start', 'batch-queued:end'],
+    '★ 交互必须**插到排在前面的批量之前**（这是"人在等"的公平性）',
+  );
+  assert.equal(LLM_QUEUE.pending, 0, '队列必须清空');
+});
+
+test('★★ ② **批量最终仍完成**（不饿死 —— 防"交互独占"这种反向不公平）', async () => {
+  LLM_QUEUE.setLimit(1);
+  const done: string[] = [];
+  // 3 个批量 + 3 个交互交替提交，全部必须完成
+  const tasks: Promise<void>[] = [];
+  for (let i = 0; i < 3; i += 1) {
+    tasks.push(LLM_QUEUE.run(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      done.push(`batch${i}`);
+    }, { priority: 'batch' }));
+    tasks.push(LLM_QUEUE.run(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      done.push(`interactive${i}`);
+    }, { priority: 'interactive' }));
+  }
+  await Promise.all(tasks);
+  assert.equal(done.length, 6, '★ 6 个任务必须**全部完成**（交互优先 ≠ 批量饿死）');
+  for (let i = 0; i < 3; i += 1) {
+    assert.ok(done.includes(`batch${i}`), `★ 批量 batch${i} 必须跑完`);
+    assert.ok(done.includes(`interactive${i}`), `交互 interactive${i} 必须跑完`);
+  }
+  assert.equal(LLM_QUEUE.pending, 0);
+});
+
+test('★ 默认优先级 = 批量：既有调用方行为不变（同优先级仍 FIFO）', async () => {
+  LLM_QUEUE.setLimit(1);
+  const order: number[] = [];
+  await Promise.all(
+    Array.from({ length: 4 }, (_, i) =>
+      // ⚠️ 不传 priority（= 既有调用方的写法）→ 必须与改动前一样按提交顺序
+      LLM_QUEUE.run(async () => {
+        await new Promise((r) => setTimeout(r, 3));
+        order.push(i);
+      }),
+    ),
+  );
+  assert.deepEqual(order, [0, 1, 2, 3], '★ 不传 priority 时行为必须与改动前一致（FIFO）');
+});
+
+test('★★ 端到端（真 provider 路径）：`priority:"interactive"` 真的插队 —— 假 fetch 记录**真实请求顺序**', async () => {
+  const { app } = await tryBuild(); // 默认并发 1
+  assert.ok(app);
+  const fetchOrder: string[] = [];
+  let releaseFirst: (() => void) | null = null;
+  globalThis.fetch = (async (_url: string, init: { body?: string }) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: { content?: string }[] };
+    const tag = String(body.messages?.[0]?.content ?? '?');
+    // ⚠️ 只记本用例的三个标签：假 fetch 也会看到**启动期探测**（如 'ping'）—— 那不是队列行为
+    if (tag === 'long-batch' || tag === 'queued-batch' || tag === 'user-waiting') fetchOrder.push(tag);
+    if (tag === 'long-batch') {
+      // 第一个（批量）请求**卡住**，直到我们放行 —— 期间交互请求会排队
+      await new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+    } else {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return new Response(
+      JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }) as unknown as typeof fetch;
+
+  const call = (content: string, priority: 'interactive' | 'batch') =>
+    app!.deps.providers!.completeJson({
+      messages: [{ role: 'user' as const, content }],
+      schema: { name: 's', schema: { type: 'object' } },
+      priority,
+    });
+
+  const p1 = call('long-batch', 'batch'); // 先占槽（长）
+  await new Promise((r) => setTimeout(r, 20));
+  const p2 = call('queued-batch', 'batch'); // 先排的批量
+  const p3 = call('user-waiting', 'interactive'); // 后提交但"人在等"
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(fetchOrder, ['long-batch'], '前置：只有一个请求真的发出（并发=1）');
+  releaseFirst!(); // 放行长批量
+  await Promise.all([p1, p2, p3]);
+  assert.deepEqual(
+    fetchOrder,
+    ['long-batch', 'user-waiting', 'queued-batch'],
+    '★★ 真 provider 路径：交互请求必须**插到排在前面的批量之前**（端到端，不只是 semaphore 单测）',
+  );
+  await app!.close();
+});

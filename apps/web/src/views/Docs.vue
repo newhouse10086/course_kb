@@ -188,7 +188,14 @@ function reparseEstimate(d: DocumentInfo): string {
   // OCR 走本地：**不消耗 LLM 额度但占 CPU**（实测约 9–12 秒/页）
   const lo = Math.round((pages * 9) / 60)
   const hi = Math.round((pages * 12) / 60)
+  /**
+   * ★ 如实风险说明（Lead 倾向加，2026-10-16）：后端 `replaceCards` 仍是**全删重插**
+   *   → reparse 后**旧卡片 id 全换**（实测 10 张 → 保留 0/10）→ 旧卡片链接会 404。
+   *   backend-core 修完后 Lead 会通知 → 那时删掉这句。
+   *   ⚠️ 不许让用户以为"reparse 是安全的"。
+   */
   return `若需 OCR：约 ${lo}–${hi} 分钟（${pages} 页 × 9–12 秒/页；OCR 走本地，**不消耗 LLM 额度但占 CPU**）`
+    + '；⚠️ 重解析会**重新生成卡片**，旧卡片链接可能失效（后端修复中）'
 }
 
 async function reparseDoc(d: DocumentInfo) {

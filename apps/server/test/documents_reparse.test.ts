@@ -24,6 +24,7 @@ import { after, before, test } from 'node:test';
 
 import { buildApp } from '../src/index.ts';
 import { loadConfig } from '../src/config.ts';
+import { OCR_CLOUD_EST } from '../src/routes/documents.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 let tmp = '';
@@ -169,8 +170,8 @@ test('★ 代价可见：正文为空/图片型 → 响应给 `needs_ocr` + `est
     const body = (await r.json()) as {
       task_id?: string;
       needs_ocr?: boolean;
-      est_minutes?: number;
-      est_usd?: number;
+      est_minutes?: [number, number] | null;
+      est_usd?: number | null;
       ocr_mode?: string;
       ocr_provider?: string;
       cost_note?: string;
@@ -179,15 +180,25 @@ test('★ 代价可见：正文为空/图片型 → 响应给 `needs_ocr` + `est
     assert.equal(body.needs_ocr, true, '★ 图片型必须标 needs_ocr');
     /**
      * ★★ 2026-10-16 起 OCR 改走**云端 OpenRouter**（用户裁定"不要接本地的模型"），
-     * 本用例原断言的是**本地** OCR 的旧口径（`est_minutes` 数组、"不消耗 LLM"）——
-     * 那是**已废弃的行为**。现断言云端口径：
-     *   `[实测]` qwen3-vl-235b 1.21s/页、$0.00132/页 ⟹ 434 页 ≈ 9 分钟 / $0.57
+     * 本用例原断言的是**本地** OCR 的旧口径（`est[1] >= 60` = 小时级、"不消耗 LLM"）——
+     * 那是**已废弃的行为**。现断言云端口径，且**不硬编码数字**：
+     *
+     * ★ 形状保持 `[lo, hi]` **区间**（Lead 裁定 b：契约是区间；且单值是在声称
+     *   我们没有的精度 —— 1.21s/页 只是**一次探测**，不是分布）。
+     * ★ 期望值从 `OCR_CLOUD_EST`（单一真相）算出，**与常量自洽**；
+     *   跨语言一致性另由 `test/ocr_estimate_consistency.test.ts` 守卫。
      */
     assert.equal(body.ocr_mode, 'cloud', '★ OCR 必须走云端（用户明确不要本地）');
     assert.equal(body.ocr_provider, 'openrouter', '★ provider 必须是 openrouter');
-    // ★ 云端后 434 页是"分钟级"（不是本地那种"小时级"）
-    assert.equal(typeof body.est_minutes, 'number', `est_minutes 应为单个数字，实际 ${JSON.stringify(body.est_minutes)}`);
-    assert.ok((body.est_minutes ?? 0) >= 5 && (body.est_minutes ?? 0) <= 20, `★ 434 页云端应约 9 分钟，实际 ${body.est_minutes}`);
+    const est = body.est_minutes;
+    assert.ok(Array.isArray(est) && est.length === 2, `★ 必须给时长区间 [lo,hi]，实际 ${JSON.stringify(est)}`);
+    const [lo, hi] = est as [number, number];
+    // ★ 用**同一常量**复算（不是硬编码 [7,11]）—— 改常量测试自动跟上
+    assert.equal(lo, Math.max(1, Math.round((434 * OCR_CLOUD_EST.secsPerPageLo) / 60)));
+    assert.equal(hi, Math.max(1, Math.round((434 * OCR_CLOUD_EST.secsPerPageHi) / 60)));
+    assert.ok(lo <= hi, `区间必须 lo<=hi，实际 [${lo},${hi}]`);
+    // ★ 云端应显著快于旧的本地口径（旧断言要求 >=60 分钟；换云端后必须小得多）
+    assert.ok(hi < 20, `★ 434 页云端上限应 <20 分钟（旧本地口径是小时级），实际 ${hi}`);
     // ★ 费用必须可见（用户要"跑之前看得见"）
     assert.equal(typeof body.est_usd, 'number', '必须给费用估算');
     assert.ok((body.est_usd ?? 0) > 0.1, `★ 434 页应有可见费用，实际 $${body.est_usd}`);
