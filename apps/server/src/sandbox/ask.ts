@@ -56,6 +56,8 @@ import {
   validateAnswerCitations,
   type CitationMode,
 } from '../agent/guards.ts';
+// ★ 渲染契约（前端 KaTeX/代码高亮/导图/引用 对输出的硬要求）——见 `agent/prompts.ts`
+import { RENDER_CONTRACT, withRenderContract } from '../agent/prompts.ts';
 import {
   formatSse,
   sanitizeOutgoingFrame,
@@ -1067,7 +1069,10 @@ async function getAskManager(): Promise<ChatSessionManagerLike> {
   if (askManager) return askManager;
   const mod = await import('../agent/session.ts');
   const manager = new mod.AgentSessionManager({
-    systemPrompt: ASK_SYSTEM_PROMPT,
+    // ★ 追加**渲染契约**：前端用 KaTeX（只认 `$...$`）、按语言高亮代码块、markmap 渲导图、
+    //   `[[card:…]]` 渲跳转引用 —— 提示词不写清楚，模型就会吐 `\(...\)` / 漏代码块结尾，
+    //   学生看到的是"公式原样显示 + 整段格式崩"。契约见 `agent/prompts.ts`。
+    systemPrompt: withRenderContract(ASK_SYSTEM_PROMPT),
     tools: [], // 教学答疑不需要任何文件/命令工具（安全 + 快）
     // ★ RETRIEVAL.md §5 + lead 点名的 resume 缺口修复：答疑上下文必须能**跨进程重启恢复**。
     //   放在 data/chat/ask 子目录，便于运维单独清理（学生提问会落盘，这是换来"重启不丢上下文"的权衡）。

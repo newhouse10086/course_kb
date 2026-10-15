@@ -202,6 +202,13 @@ export interface SessionInit {
   modelSource?: 'injected' | 'resolved' | 'pi-global-fallback';
   /** 模型来源相关的**警告**（非空时要外显给前端/日志，不许静默） */
   modelWarning?: string;
+  /**
+   * ★ 请求了 kb 工具但**没能注册**时的可读原因（缺 provider / 缺服务端身份 / 模块加载失败）。
+   *
+   * 连接层据此把 `tools_source` 从 `kb-readonly` 降级为 `kb-unavailable` ——
+   * **说开了其实关着**（`tools:[]` 却报 kb 工具可用）会把"工具没装"伪装成"知识库是空的"。
+   */
+  kbToolsWarning?: string;
 }
 
 /** 会话运行统计（诊断用） */
@@ -549,6 +556,7 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._resumeReason = init.resumeReason ?? '';
     this._modelSource = init.modelSource ?? 'pi-global-fallback';
     this._modelWarning = init.modelWarning;
+    this._kbToolsWarning = init.kbToolsWarning;
     // ★ 先订阅（坑 14）：在任何人拿到这个对象、发第一条 prompt 之前就挂好
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
   }
@@ -669,6 +677,8 @@ export class ManagedAgentSession implements ChatSessionLike {
       ...(this._resumeReason !== '' ? { resumeReason: this._resumeReason } : {}),
       modelSource: this._modelSource,
       ...(this._modelWarning !== undefined ? { modelWarning: this._modelWarning } : {}),
+      // ★ 让 ready 帧带上"kb 工具为什么没装上"（连接层据此降级 tools_source）
+      ...(this._kbToolsWarning !== undefined ? { kbToolsWarning: this._kbToolsWarning } : {}),
     });
   }
 
@@ -858,6 +868,7 @@ export class ManagedAgentSession implements ChatSessionLike {
     this._resumeReason = init.resumeReason ?? '';
     this._modelSource = init.modelSource ?? 'pi-global-fallback';
     this._modelWarning = init.modelWarning;
+    this._kbToolsWarning = init.kbToolsWarning;
     this.unsubscribePi = this.piSession.subscribe((event) => this.onPiEvent(event));
     try {
       oldUnsub();
@@ -1212,6 +1223,10 @@ export class AgentSessionManager implements ChatSessionManagerLike {
       resumeReason,
       modelSource,
       ...(modelWarning !== undefined ? { modelWarning } : {}),
+      // ★ 把"kb 工具为什么没装上"报到会话层（连接层据此把 `tools_source` 降级成 `kb-unavailable`）。
+      //   ⚠️ 原实现只在本地算出来、**既没进 SessionInit 也没进 ready 帧** →
+      //   上层永远拿不到原因，兜底警告形同虚设（"说开了其实关着"就是这么来的）。
+      ...(kbToolsWarning !== null ? { kbToolsWarning } : {}),
     };
   }
 

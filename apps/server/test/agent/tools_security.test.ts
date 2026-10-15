@@ -222,9 +222,12 @@ test('★★ 通道层三态策略：disabled-by-role / explicit / dangerous-opt
       prompt: async () => ({ disposition: 'started', aborted: false, syntheticSettled: false }),
       abort: async () => {},
       reset: async () => session.readyFrame(),
+      // ★ 忠实替身：`tools` = **实际生效值**（本次请求的白名单）。
+      //   恒返回 `[]` 的旧替身会把"说开了其实关着"伪装成正常 ——
+      //   连接层现在按生效值做同源降级，替身必须跟真会话一样如实回报。
       readyFrame: (): ReadyFrame => ({
-        type: 'ready', session_id: 'p', model: null, tools: [], tools_source: 'explicit', version: null,
-        mode: 'sdk', persistence: 'ephemeral', persistence_reason: 't', session_file: null,
+        type: 'ready', session_id: 'p', model: null, tools: [...(seen.tools ?? [])], tools_source: 'explicit',
+        version: null, mode: 'sdk', persistence: 'ephemeral', persistence_reason: 't', session_file: null,
         pi_session_id: null, thinking_level: null, restarted: false,
       }),
     };

@@ -52,7 +52,7 @@ import {
  * ⚠️ 原实现标的是 `none` —— 读起来像"没有工具"，而当时实际是 pi 的默认全集
  * （`read`/`bash`/`edit`/`write`）。那个自相矛盾的信号就是 shell 漏洞的线索。
  */
-export type ToolsSource = 'disabled-by-role' | 'explicit' | 'dangerous-opt-in' | 'kb-readonly';
+export type ToolsSource = 'disabled-by-role' | 'explicit' | 'dangerous-opt-in' | 'kb-readonly' | 'kb-unavailable';
 
 export interface ReadyFrame {
   type: 'ready';
@@ -606,21 +606,46 @@ export function makeRetrievalFrame(opts: {
  * 三态策略之一 —— 两者必须一致：`disabled-by-role` 时 `tools` 必然是 `[]`。
  */
 export function withToolsPolicy(frame: ReadyFrame, policy: ToolsSource, agentMode?: AgentMode): ReadyFrame {
+  const kbWarning = frame.kb_tools_warning;
+  const activeTools = Array.isArray(frame.tools) ? frame.tools : [];
+  const hasKbTool = activeTools.some((t) => (KB_TOOL_NAMES as readonly string[]).includes(t));
+
+  // ★★ 同源修正（坑 21 第二方向）：`kb-readonly` 是**建会话之前**就算出来的期望值，
+  //   而**实际生效值**在 `frame.tools` 里（pi 的 getActiveToolNames）。
+  //   kb 工具注册失败时（缺凭据/缺身份/模块加载失败）会话层会把它们从白名单里剔除，
+  //   若这里还报 `kb-readonly`，就成了"**说开了其实关着**"——且比单纯说谎更坏：
+  //   它会把"工具没装"伪装成"知识库是空的"（学生以为课程没内容）。
+  //
+  //   判据（两条都要，缺一不可）：
+  //   ① 会话层明确报了原因（`kb_tools_warning`）→ 一定降级
+  //   ② 生效工具集里**确实没有** kb 工具 → 也降级（兜住"没报原因但工具也没了"的情况）
+  let effectivePolicy: ToolsSource = policy;
+  let downgraded = false;
+  if (policy === 'kb-readonly' && (kbWarning !== undefined || !hasKbTool)) {
+    effectivePolicy = 'kb-unavailable';
+    downgraded = true;
+  }
+
   return {
     ...frame,
-    tools_source: policy,
+    tools_source: effectivePolicy,
     ...(agentMode ? { agent_mode: agentMode } : {}),
     // 危险状态**必须在帧里说出来**（不只是枚举值）—— 独立验收建议
-    ...(policy === 'dangerous-opt-in'
+    ...(effectivePolicy === 'dangerous-opt-in'
       ? {
           tools_warning:
             '本会话已开启主机工具（read/bash/edit/write）：浏览器用户可让 agent 执行服务器命令、读取主机文件。' +
             '这是显式 opt-in 的结果，不是默认状态 —— 请勿在演示/共享账号下使用。',
         }
       : {}),
-    // agent 模式但工具没能注册（知识库未接入 / 缺身份）→ 如实说明，别静默变 chat
-    ...(policy === 'disabled-by-role' && agentMode === 'agent' && frame.kb_tools_warning
-      ? { tools_warning: `agent 模式已选，但只读知识库工具不可用：${frame.kb_tools_warning}` }
+    // agent 模式但 kb 工具没能注册 → **必须**能出现这条警告（原写法把条件写成 `disabled-by-role`，
+    // 而 agent 模式下策略是 `kb-readonly` → 条件永假，警告永远不出现）。
+    ...(downgraded
+      ? {
+          tools_warning:
+            `agent 模式已选，但只读知识库工具不可用：${kbWarning ?? '会话没有注册 kb_search/kb_get'}` +
+            '（本轮回答没有知识库工具可用，请以「工具未装」而不是「知识库为空」理解）',
+        }
       : {}),
   };
 }
@@ -643,6 +668,8 @@ export function makeReadyFrame(opts: {
   resumeReason?: string;
   modelSource?: 'injected' | 'resolved' | 'pi-global-fallback';
   modelWarning?: string;
+  /** ★ 会话层报上来的"kb 工具没能注册"的可读原因（连接层据此把策略降级成 `kb-unavailable`） */
+  kbToolsWarning?: string;
 }): ReadyFrame {
   return {
     type: 'ready',
@@ -663,6 +690,9 @@ export function makeReadyFrame(opts: {
     ...(opts.resumeReason !== undefined ? { resumeReason: opts.resumeReason } : {}),
     model_source: opts.modelSource ?? 'pi-global-fallback',
     ...(opts.modelWarning !== undefined ? { model_warning: opts.modelWarning } : {}),
+    // ⚠️ 原错误：`kb_tools_warning` 只在 `ReadyFrame` 上**声明**过，`makeReadyFrame` **从不填它**
+    //   → 连接层依赖 `frame.kb_tools_warning` 的兜底分支永远拿不到值（等于白写）。
+    ...(opts.kbToolsWarning !== undefined ? { kb_tools_warning: opts.kbToolsWarning } : {}),
   };
 }
 

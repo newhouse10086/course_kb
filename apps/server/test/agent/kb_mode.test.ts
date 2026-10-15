@@ -39,6 +39,8 @@ class FakeSession implements ChatSessionLike {
   readonly id: string;
   isRunning = false;
   promptCalls: string[] = [];
+  /** ★ 实际生效的工具集（忠实替身：真会话里这来自 `getActiveToolNames()`）*/
+  activeTools: string[] = [];
   private listeners = new Set<(f: AgentFrame) => void>();
   constructor(id = 'kb-fake') {
     this.id = id;
@@ -60,9 +62,12 @@ class FakeSession implements ChatSessionLike {
     return this.readyFrame();
   }
   readyFrame(): ReadyFrame {
+    // ★ 忠实替身：`tools` 必须是**实际生效值**（真会话里是 `getActiveToolNames()`）。
+    //   旧替身恒返回 `[]` → 会把"说开了其实关着"这种不一致伪装成正常，
+    //   而连接层现在按生效值降级（恒 `[]` 的替身会被正确判成 `kb-unavailable`）。
     return {
-      type: 'ready', session_id: this.id, model: null, tools: [], tools_source: 'explicit', version: null,
-      mode: 'sdk', persistence: 'ephemeral', persistence_reason: 't', session_file: null,
+      type: 'ready', session_id: this.id, model: null, tools: [...this.activeTools], tools_source: 'explicit',
+      version: null, mode: 'sdk', persistence: 'ephemeral', persistence_reason: 't', session_file: null,
       pi_session_id: null, thinking_level: null, restarted: false,
     };
   }
@@ -86,6 +91,8 @@ function makeManager(): {
         let s = byId.get(id);
         if (!s) {
           s = new FakeSession(id);
+          // ★ 忠实替身：会话"生效的工具集" = 本次请求的白名单（真 pi 会话就是这么回报的）
+          s.activeTools = init?.tools ?? [];
           byId.set(id, s);
           sessions.push(s);
         }
@@ -215,14 +222,18 @@ test('★ 切换模式 = 换会话 + 重发 ready（chat 与 agent 各一份独�
   await conn.close();
 });
 
-test('★ 知识库未接入时用 agent：如实降级（工具集为空 + 可读警告），而不是假称有工具', async () => {
+test('★ 知识库未接入时用 agent：连接层照样把白名单交给会话（**移除与降级在会话层/帧层**）', async () => {
   const { manager, calls } = makeManager();
   const { frames } = await run({ manager: manager as never }, { mode: 'agent' }); // 不给 kb
   const ready = frames.filter((f) => f.type === 'ready').at(-1) as ReadyFrame;
-  assert.deepEqual(ready.tools, [], '注册不了就不该出现在工具集里');
   assert.equal(ready.agent_mode, 'agent', '模式仍如实回显');
+  // ★ 分层：连接层负责"按模式决定请求哪些工具"，**能不能注册由会话层说了算**
+  //   （会话层会把注册不了的 kb 工具从白名单剔除 + 报 `kb_tools_warning`，
+  //    连接层再据此把 `tools_source` 降级成 `kb-unavailable`）。
+  //   这条链路的端到端断言在 `kb_unavailable.test.ts`（真会话 + 真 WS 两档）。
   const agentCall = calls.find((c) => c.id.endsWith('.agent'));
-  assert.deepEqual(agentCall!.tools, [KB_TOOL_NAMES[0], KB_TOOL_NAMES[1]], '仍会把工具交给会话（由会话层如实降级）');
+  assert.deepEqual(agentCall!.tools, [...KB_TOOL_NAMES], '连接层把 kb 白名单交给会话');
+  assert.equal(ready.tools_source, 'kb-readonly', '会话层没报"注册失败"时，来源就是 kb-readonly（与生效值一致）');
 });
 
 // ---------------------------------------------------------------------------
