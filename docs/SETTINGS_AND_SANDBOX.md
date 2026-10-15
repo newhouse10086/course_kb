@@ -159,6 +159,50 @@ POST /api/v1/sandbox/ask
 - **必须引用知识库**（`[[card:crd_xxx]]`）—— 与本项目"可核查"原则一致，且能跳到原文
 - **能看见学生的报错**是核心价值（学生最常卡在"看不懂报错"）
 
+### 3.9 ⚠️ ★ **已知安全缺口：server 引擎（MySQL/PG）缺少第二道防线**（**未验证，如实披露**）
+
+**这是独立验收（静态核查）发现的真实缺口，不是推测**：
+
+```
+guard.py:6-7     "这是**第一道**闸（第二道在 SQLite 的 `set_authorizer`，见 runner.py）"
+                 → ★ **`set_authorizer` 是 SQLite 专属**，MySQL/PG 上没有等价物
+guard.py:43-50   词法闸覆盖：LOAD DATA / INTO OUTFILE / INTO DUMPFILE / COPY / PROGRAM /
+                 PG_READ_FILE / PG_LS_DIR / LO_IMPORT / DBLINK …
+engine.py:46-49  TRANSACTIONS_SERVER = { same_call: True, cross_call: False }   ← 与 sqlite 同一套假设
+```
+
+**缺口的确切含义**：
+> 本项目对 SQLite 做了**两道防线** —— 词法闸（给人看得懂的原因）+ **`set_authorizer`（漏网也执行不了）**。
+> **而 MySQL/PG 只有第一道。** 即：**词法闸被绕过时，server 引擎上没有任何兜底。**
+>
+> §3 的红线（禁 `LOAD DATA LOCAL INFILE` / `COPY FROM PROGRAM` / `INTO OUTFILE` / `pg_read_file`）
+> **目前只在 SQLite 上被真正验证过** —— server 引擎上它们是"**只靠正则挡**"的状态。
+
+**风险等级：高**（若某天部署了 MySQL/PG 并启用，学生的"危险语句"防护会**只剩一层**）
+**但当前不可利用**：本机未装 MySQL/PG/openGauss（`available:false`），**引擎根本起不来**。
+
+**本机为什么验不了**：`docker` ❌ · `mysql` 客户端 ❌ · `psql` 客户端 ❌ —— **三者全无**。
+
+**在装了 DB 的机器上怎么验**（零 LLM 额度）：
+```bash
+# 1. 装并启用引擎
+LAB_MYSQL_PASSWORD='…' bash scripts/deploy-lab-db.sh mysql -y
+# 2. 只打 /sandbox/execute，不需要 LLM
+curl -X POST .../sandbox/execute -d '{"engine":"mysql","sql":"LOAD DATA LOCAL INFILE ..."}'
+#    期望：E_SQL_FORBIDDEN（词法闸生效）
+# 3. ★ 关键：验证"绕过词法闸"时的行为（这才是缺口所在）
+#    用拼接/大小写/注释等手段构造词法闸漏网的语句 → 观察是否真的执行
+#    SQLite 上这一步会被 set_authorizer 拦住；MySQL/PG 上**预期拦不住**
+```
+
+**建议的处置（二选一，需产品决策）**：
+- **(a) 补第二道防线**：MySQL 用只读账号 + `secure_file_priv=''` + 禁 `FILE` 权限；
+  PG 用受限角色（无 `pg_read_server_files` / 无 superuser）+ `SECURITY DEFINER` 审查
+- **(b) 默认禁用 server 引擎**，直到第二道防线到位（当前它们本来就是 `available:false`，**等于已经在 (b)**）
+
+★ **诚实原则**：本缺口**已披露在文档里**，且 `/capabilities` 对 server 引擎如实报 `available:false` ——
+**没有"假装安全"**。但**运维若自行启用 MySQL/PG，必须知道第二道防线是空的**。
+
 ---
 
 ## 4. 交付拆分
