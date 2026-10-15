@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
 
 ---
 
-## 4. 接进 chat（**模式可独立选择**）
+## 4. 接进 chat（**两个正交维度：查不查 × 能不能读原文**）
 
 ```
 POST /api/v1/chat/:sessionId/message
@@ -139,6 +139,65 @@ POST /api/v1/chat/:sessionId/message
 { "message": "...", "retrieval": "kg" }
 { "message": "...", "retrieval": ["wiki","kg"] }  // 显式组合
 ```
+
+### 4.0 ★ `retrieval` 与 `mode` 是**两个正交维度**（不要混成一个下拉）
+| 维度 | 取值 | 回答的问题 |
+|---|---|---|
+| `retrieval` | `none \| wiki \| kg \| rag` | **查不查、怎么查**（检索摘要注入） |
+| **`mode`** | **`chat \| agent`** | **能不能读原文**（能否调用知识库只读工具） |
+
+```
+chat  = tools: []                       ← 默认（保守）；只用检索摘要
+agent = tools: ['kb_search','kb_get']   ← 可主动翻知识库原文
+```
+**模式是会话级的**（工具集在建会话时确定）→ 用 **`?mode=agent`** 连 WS；帧里的 `mode` 只做一致性校验。
+**非法值 → `E_BADREQUEST` + close(1008)，不静默降级**；且该帧**不转发**给 agent 层。
+
+**角色**：`allowed_roles.agent = ['admin','teacher','student']`（**学生也开** —— 答疑主体是学生；
+只读 + 按 `userId` 过滤，**风险画像与 `bash` 完全不同**）。
+★ **`agent` 模式绝不含 `bash`/`read`/`edit`/`write`** —— 危险工具仍由两道显式开关把关。
+
+### 4.0.1 知识库只读工具（`mode:'agent'` 才有）
+```
+kb_search(query, doc_id?, limit?)  → [{kind, ref_id, title, score, snippet}]   // snippet ≤200 字
+kb_get(ref_id)                     → {kind, ref_id, title, text, doc_id, truncated, evidence?:{span,quote}}
+```
+**硬约束**：
+- **只读**（结构性断言 `Object.keys(kb) === ['get','search']`）
+- **只查 `cards`/`units`/`search_docs`**，绝不碰主机文件系统
+- ★ **按 `userId` 走可见性过滤（复用 `docScopeSql()`）**：**不可见 = 当作不存在**
+  （不返回"无权"这种**可枚举信号** —— 否则能被用来探测他人资源）
+- **截断双向如实**（超长 `truncated:true`、没超长 `false` —— **不许谎报**）
+
+> **为什么它是"tool 标记泄漏"的正解**：模型想读卡片原文是**合理需求**。
+> 之前没有工具时，tool 调用会**退化成正文文本**（`<｜｜DSML｜｜ invoke …>`）流给学生 → 看到乱码。
+> **给它一个受控的只读出口，比堵住它更好。**
+
+### 4.0.2 ★ `context` 帧（页面上下文，第 11 种帧）
+请求侧**只接受 id，不收自由文本**（客户端不可信）：
+```jsonc
+{ "type":"prompt", "message":"…", "mode":"chat|agent", "retrieval":"…",
+  "context": { "doc_id":"…", "unit_id":"…", "session_id":"…", "page":3 } }
+```
+服务端用知识库把 id 解析成**真实标题**再注入；解析不到 → **丢弃 + 如实回**：
+```jsonc
+{ "type":"context", "used":{…}, "resolved":{"doc_title":"…","unit_title":"3.1 聚簇索引"},
+  "dropped":[{"field":"unit_id","value":"unt_zzz","reason":"未找到或无权访问"}] }
+```
+- **每轮帧序**：`context → retrieval → tool_* → text_delta → settled`
+- ★ **`dropped` 非空必须如实回**（前端显示"未找到你当前章节，已忽略"）—— **不许静默丢**
+- ★ **`session_id` 要按 `userId` 校验归属**（否则是一条跨用户读取路径）
+- **与 `retrieval` 正交**（`retrieval:'none'` 时 context 仍在）→ **单开一帧**，不塞进 `retrieval`
+
+### 4.0.3 ★ 坑 21：自述字段必须与实际生效值**同源**
+`ready.tools_source` 是**标签**，`ready.tools` 才是**真相**。它会在**两个方向**上都撒谎（都实测过）：
+```
+tools_source:'none'        但实际有 4 个危险工具 → 说关了其实开着  🔴 安全事故
+tools_source:'kb-readonly' 但实际 tools:[]       → 说开了其实关着  功能失效
+```
+**必须双向断言**；⚠️ **第二个只有真 WS 端到端能抓到**（单元测试 + `/capabilities` 断言**全绿**）。
+- **快守卫**（不花额度，进 `npm test`）：`test/tools_source_consistency.test.ts`
+- **慢 e2e**（真 WS + 真模型 24s，**不进默认套件**）：`npm run test:e2e:agent`
 
 **注入方式**（★ 不是 system，避免被当成指令）：
 ```
