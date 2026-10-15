@@ -19,8 +19,29 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+#: 这些**键名后缀**的值是**配置**（端点/模型名/路径/端口），**不是凭据**。
+#: ⚠️ **原错误写法**：注释写着"只把「像凭据」的值纳入黑名单（避免把 URL/模型名当成凭据）"，
+#:    但代码只判了 `len(v) >= 12 and re.search(r"[A-Za-z0-9_-]{12,}", v)` ——
+#:    **URL 与模型名照样命中** → `AMR_BASE=https://llm-api.x-aio.com/v1` 被当凭据 →
+#:    文档里出现该端点 URL 就**误报"❌ 不要提交"**（实测踩到，差点让 Lead 以为密钥泄漏）。
+#:    ★ 这正是坑 24（承诺了却不生效）——**扫描器自己犯了它要防的那类错**。
+NON_SECRET_KEY_SUFFIXES = (
+    "_BASE", "_URL", "_URI", "_HOST", "_PORT", "_MODEL", "_DIR", "_PATH",
+    "_ROOT", "_FILE", "_NAME", "_ID", "_KEY_ID", "_ENDPOINT", "_REGION",
+)
+
+
+def looks_like_secret(key, v):
+    """值是否**像凭据**。键名后缀 + 形态双重判定，避免把配置当密钥。"""
+    if any(key.upper().endswith(s) for s in NON_SECRET_KEY_SUFFIXES):
+        return False
+    if "://" in v:                      # URL 不是凭据
+        return False
+    return len(v) >= 12 and re.search(r"[A-Za-z0-9_\-]{12,}", v) is not None
+
+
 def load_env_secrets():
-    """从 .env 读取所有值，作为「真值黑名单」。**只返回值，不打印。**"""
+    """从 .env 读取**像凭据的值**，作为「真值黑名单」。**只返回值，不打印。**"""
     secrets = []
     for name in (".env", ".env.local"):
         fp = os.path.join(ROOT, name)
@@ -31,9 +52,8 @@ def load_env_secrets():
             if not ln or ln.startswith("#") or "=" not in ln:
                 continue
             k, v = ln.split("=", 1)
-            v = v.strip()
-            # 只把「像凭据」的值纳入黑名单（避免把 URL/模型名当成凭据）
-            if len(v) >= 12 and re.search(r"[A-Za-z0-9_-]{12,}", v):
+            k, v = k.strip(), v.strip()
+            if looks_like_secret(k, v):
                 secrets.append(v)
     return secrets
 
@@ -70,8 +90,24 @@ def scan_text(text, secrets):
             #   判据取"弱口令/夹具特征"（pass-/12345/short/dummy…）——
             #   **命中即列入"已跳过"，仍打印出来**，所以不是静默放过；
             #   若这里漏判，靠 .env 精确黑名单 + sk- 形态兜底。
-            if label == "password-literal" and re.search(
-                    r"(pass|pwd|secret|token|dummy|fixture|demo|sample|12345|abcd|qwerty|short|none)",
+            # ★ 测试夹具：`password-literal` 与 `sk-token` 规则对测试数据天然误报。
+            #   判据取"夹具特征词"（pass-/12345/dummy/caps/fixture…）——
+            #   **命中即列入"已跳过"，仍打印出来**，所以不是静默放过。
+            #   ⚠️ 为什么 `sk-token` 也能豁免而**不削弱**检查：
+            #     ① **真实密钥由 `.env` 精确黑名单兜底**（那条没有任何豁免，最强）；
+            #     ② `sk-` 形态只是"未登记密钥"的 backstop；
+            #     ③ 真实 key 是**高熵随机串**，**不会**含 `caps`/`test`/`pass`/`fixture` 这类词。
+            #   ★ 实证：`AMR_KEY: 'sk-caps-cost-pass-1'`（测试夹具）曾被判失败 →
+            #     **一次真实的 `npm test` 前提交被误拦**；而把真 key 放进文件时**仍被拦住**（已自证）。
+            #   ⚠️⚠️ **长度上限是关键（自证③暴露的洞）**：
+            #     只判"含夹具词"会被**伪装绕过** —— 实测把真 key 写成
+            #     `sk-test-<真key体>`（74 字符）时，因含 `test` 被**跳过**（漏判）。
+            #     ⟹ **夹具都短（`sk-caps-cost-pass-1` = 20 字符），真 key 都长（70+）** ——
+            #     所以夹具豁免**必须同时满足 `len < 30`**。
+            #     真 key 还有 `.env` 精确黑名单兜底（无任何豁免）。
+            if label in ("password-literal", "sk-token") and len(val) < 30 and re.search(
+                    r"(pass|pwd|secret|token|dummy|fixture|demo|sample|12345|abcd|qwerty|short|none"
+                    r"|caps|cost|shape|binding|probe)",
                     val, re.I):
                 skipped.append((label, val[:28]))
                 continue
