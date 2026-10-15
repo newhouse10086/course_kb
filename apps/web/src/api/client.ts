@@ -310,6 +310,31 @@ export const api = {
     return { id, title: r.conversation?.title, created_at: r.conversation?.created_at }
   },
 
+  /**
+   * ★ 重命名（`PATCH /conversations/:id {title}`）→ 服务端返回 `title_source:'user'`。
+   *   ⚠️ 前端**乐观更新**，失败要**回滚**（调用方负责）。
+   */
+  renameConversation: async (id: string, title: string):
+  Promise<{ title?: string; title_source?: string }> => {
+    const r = await req<{ conversation?: { title?: string; title_source?: string } }>(
+      `/conversations/${encodeURIComponent(id)}`, undefined,
+      { method: 'PATCH', body: JSON.stringify({ title }), headers: { 'Content-Type': 'application/json' } })
+    return { title: r.conversation?.title, title_source: r.conversation?.title_source }
+  },
+
+  /**
+   * ★ AI 生成名字（`POST /conversations/:id/title/generate`）。
+   *   `409 E_TITLE_USER_SET` = 已由用户手动命名（**如实提示，不覆盖用户的命名**）。
+   */
+  generateConversationTitle: async (id: string):
+  Promise<{ title?: string; title_source?: string; skipped?: boolean; reason?: string }> => {
+    const r = await req<{ conversation?: { title?: string; title_source?: string }; title?: string;
+      title_source?: string; skipped?: boolean; reason?: string }>(
+      `/conversations/${encodeURIComponent(id)}/title/generate`, undefined, { method: 'POST' })
+    return { title: r.conversation?.title ?? r.title, title_source: r.conversation?.title_source ?? r.title_source,
+      skipped: r.skipped, reason: r.reason }
+  },
+
   /** `GET /conversations`（rbac.ts 已存在）→ 归一成会话列表项 */
   conversations: async (): Promise<{ sessions: Array<{ id: string; title?: string; updated_at?: number }> }> => {
     const r = await req<{ conversations?: Array<{ id: string; title?: string; created_at?: number }> }>('/conversations')

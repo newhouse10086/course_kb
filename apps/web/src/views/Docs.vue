@@ -145,18 +145,39 @@ function extractInfo(d: DocumentInfo): ExtractInfo {
 const extractBusy = ref('')
 
 /**
- * ★★ 重新解析**暂时禁用**（Lead 裁定）：
- *   后端正在修一个**破坏性** bug —— 抽取产出 0 卡片时无条件全量替换 + reparse 后单元 id 变化
- *   触发 FK 级联删卡 ⟹ **连成功的 reparse 都会清掉旧卡片**（实测 cards 1 → 0）。
- *   → UI 结构/代价/进度/错误处理**全部做全**，但**按钮禁用并写明理由**；
- *     后端修好（Lead 会通知）后把这里改成 `true` 即可开放。
- *   ★ 判据："看起来能用、一点就毁数据"比"暂时不可用"危险得多。
+ * ★ **可用性三态**（`pi-bridge` 清单，Lead 转）：`ready` / `detecting` / `unavailable(reason)`。
+ *   ① `detecting` → **"正在检测模型可用性（首次约 1 分钟）"**
+ *      ★★ **不许显示成"可用"或"不可用"** —— 探测未完成时那两种说法**都不成立**。
+ *   ② `unavailable` → 显示 **reason 原文** + **禁用入口**（不画"能点但会失败"的按钮）
+ *   ③ `ready` → 正常入口
+ *   字段来自**文档 meta**（`extract_availability` / `extract_availability_reason`）与 `extract_note`；
+ *   `/capabilities.availability` 属 backend-api 写域 —— 那边加了这里再切过去。
  */
-const REPARSE_ENABLED = false
-const REPARSE_GATE_REASON = '⚠️ 重新解析当前会**清空已有卡片**（后端修复中）—— 修复后开放'
+function availOf(d: DocumentInfo): { kind: 'ready' | 'detecting' | 'unavailable'; text: string } {
+  const m = (d.meta || {}) as Record<string, unknown>
+  const raw = String(m.extract_availability || '')
+  const reason = String(m.extract_availability_reason || '')
+  if (raw === 'detecting') return { kind: 'detecting', text: '正在检测模型可用性（首次约 1 分钟）—— 探测完成前不代表可用或不可用' }
+  if (raw === 'unavailable') return { kind: 'unavailable', text: `模型不可用：${reason || '（后端未给原因 —— 不编）'}` }
+  return { kind: 'ready', text: '' }
+}
+
+/**
+ * ★★ 重新解析：**已开放**（2026-10-16，Lead 真数据验证通过）。
+ *   历史（保留记录）：曾因后端 `repo.replaceUnits` 全量 DELETE + FK 级联删卡而**暂时禁用**；
+ *   backend-core 改成"只删消失的单元"后，真数据验证：`units=4 · cards=5 · extract_status=partial` ✅
+ *   → 现在按正常入口开放（**代价仍先展示再执行**：页数 → 时长区间 + OCR 本地不耗额度）。
+ */
+const REPARSE_ENABLED = true
 
 /** 每份文档的重新解析状态（进度/错误；与视频页 taskState 同模式） */
 const reparseState = ref<Record<string, { text: string; progress: number | null; done: string; transport: string }>>({})
+/**
+ * ★ **服务端给的代价**（`est_minutes` 区间 + `cost_note`）——**独立持久元素**：
+ *   提交后立刻有 progress 帧，若把代价写进同一个元素会被**冲掉**（用户看不到"要等多久"）。
+ *   ⚠️ 我第一版就是这样，断言只能抓到一瞬（150ms）→ 假失败；这也是"取瞬时状态"的坑。
+ */
+const reparseServerCost = ref<Record<string, string>>({})
 
 /** 点击前的**代价预估**：`needs_ocr` 由后端判定，但页数已知 → 我们能给区间（不编数字） */
 function reparseEstimate(d: DocumentInfo): string {
@@ -169,9 +190,9 @@ function reparseEstimate(d: DocumentInfo): string {
 }
 
 async function reparseDoc(d: DocumentInfo) {
+  // ★ 兜底门控：即使将来再次临时关闭入口，这里也**绝不发请求**（断言会检查"点击 → 调用数不变"）
   if (!REPARSE_ENABLED) {
-    // ★ 禁用状态下**绝不发请求**（断言会检查这一点）
-    reparseState.value = { ...reparseState.value, [d.id]: { text: REPARSE_GATE_REASON, progress: null, done: 'false', transport: 'none' } }
+    reparseState.value = { ...reparseState.value, [d.id]: { text: '入口当前已关闭（后端修复中）', progress: null, done: 'false', transport: 'none' } }
     return
   }
   const id = d.id
@@ -180,12 +201,18 @@ async function reparseDoc(d: DocumentInfo) {
     const r = await api.reparseDocument(id)
     const range = Array.isArray(r.est_minutes) && r.est_minutes.length === 2
       ? `${r.est_minutes[0]}–${r.est_minutes[1]} 分钟` : ''
+    // ★ 代价写进**独立元素**（整个任务期间都在，不会被进度帧冲掉）
+    reparseServerCost.value = {
+      ...reparseServerCost.value,
+      [id]: [
+        r.needs_ocr ? '需 OCR' : '无需 OCR',
+        range ? `预计 ${range}` : '（服务端未给时长区间 —— 不编数字）',
+        r.cost_note || '',
+      ].filter(Boolean).join(' · '),
+    }
     reparseState.value = {
       ...reparseState.value,
-      [id]: {
-        text: `已入队（${r.task_id || '无 task_id'}）${r.needs_ocr ? ' · 需 OCR' : ''}${range ? ` · 预计 ${range}` : ''}${r.cost_note ? ` · ${r.cost_note}` : ''}`,
-        progress: null, done: '', transport: '',
-      },
+      [id]: { text: `已入队（${r.task_id || '无 task_id'}），任务进行中…`, progress: null, done: '', transport: '' },
     }
     const taskId = String(r.task_id || '')
     if (!taskId) return
@@ -320,8 +347,17 @@ onMounted(async () => {
               <div v-if="extractInfo(d).progress" class="faint tiny" data-testid="extract-progress">
                 {{ extractInfo(d).progress }}
               </div>
+              <!-- ★ 三态：detecting 如实说"正在检测"；unavailable 显示原因 + **禁用入口** -->
+              <div v-if="availOf(d).kind !== 'ready'" class="tiny" :class="availOf(d).kind === 'unavailable' ? 'warn-text' : 'faint'"
+                   data-testid="extract-availability" :data-availability="availOf(d).kind"
+                   :data-doc-avail="d.id">{{ availOf(d).text }}</div>
+              <!-- 任务侧提示位：`extract_note`（detecting 时含"已等待 Ns"）**逐字显示** -->
+              <div v-if="(d.meta || {}).extract_note" class="tiny faint" data-testid="extract-note-live"
+                   :data-doc-note="d.id">{{ (d.meta || {}).extract_note }}</div>
               <button v-if="extractInfo(d).needsConfirm" type="button" class="small primary"
-                      data-testid="extract-start" :data-extract-doc="d.id" :disabled="extractBusy === d.id"
+                      data-testid="extract-start" :data-extract-doc="d.id"
+                      :disabled="extractBusy === d.id || availOf(d).kind === 'unavailable'"
+                      :data-gate-reason="availOf(d).kind === 'unavailable' ? availOf(d).text : ''"
                       @click="startExtract(d)">开始抽取</button>
               <div v-if="extractInfo(d).failedReason" class="warn-text tiny" data-testid="extract-failed">
                 失败：{{ extractInfo(d).failedReason }}
@@ -337,13 +373,13 @@ onMounted(async () => {
               <button type="button" :data-delete="d.id" @click="remove(d)">删除</button>
               <!-- ★ 重新解析（Lead：后端有端点但前端没入口；**暂时禁用**并写明理由） -->
               <button type="button" :data-reparse="d.id" data-testid="btn-reparse"
-                      :disabled="!REPARSE_ENABLED" :title="REPARSE_ENABLED ? '' : REPARSE_GATE_REASON"
+                      :disabled="!REPARSE_ENABLED"
                       :data-reparse-enabled="REPARSE_ENABLED ? '1' : '0'"
                       @click="reparseDoc(d)">重新解析</button>
-              <div v-if="!REPARSE_ENABLED" class="warn-text tiny" data-testid="reparse_gate_reason"
-                   :data-doc-gate="d.id">{{ REPARSE_GATE_REASON }}</div>
               <!-- ★ 代价可见（先展示再执行）：页数 → 区间；OCR 本地、不耗额度但占 CPU -->
               <div class="faint tiny" data-testid="reparse_estimate" :data-doc-est="d.id">{{ reparseEstimate(d) }}</div>
+              <div v-if="reparseServerCost[d.id]" class="faint tiny" data-testid="reparse_server_cost"
+                   :data-doc-cost="d.id">{{ reparseServerCost[d.id] }}</div>
               <div v-if="reparseState[d.id]" class="tiny" data-testid="reparse_state" :data-doc-state="d.id"
                    :data-progress="reparseState[d.id].progress ?? ''" :data-done="reparseState[d.id].done">
                 {{ reparseState[d.id].text }}

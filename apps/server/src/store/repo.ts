@@ -14,6 +14,7 @@
 import { Db } from './db.ts';
 import { nameKey, newCardId, newDocId, newEdgeId, newEntityId, newTaskId, newUnitId } from './ids.ts';
 import { RbacRepo } from './rbac-repo.ts';
+import { CollectionsRepo } from './collections-repo.ts';
 import { docScopeSql } from './scope.ts';
 import type { DocScope } from './scope.ts';
 import type { Span, SpanKind } from './types.ts';
@@ -47,6 +48,8 @@ export interface DocumentRow {
   visibility: string; // private | course | public
   review_status: string; // draft | reviewed | published
   course_id: string | null;
+  /** ★ v4 迁移新增：视频目录归属（可空 —— 不属于任何目录的视频仍可用） */
+  collection_id: string | null;
 }
 
 export interface DocumentApi {
@@ -152,6 +155,11 @@ export interface TaskRow {
   // RBAC §5：LLM 并发=1 是全局的 → 必须能按优先级调度并区分师生
   priority: number;
   user_id: string | null;
+  /**
+   * ★ v8 心跳（看门狗判死依据）；`null` = v8 之前写的行 → 判据回落到 `created_at`
+   * （见 `staleRunningTasks` 的 `COALESCE`）。
+   */
+  heartbeat_at: number | null;
 }
 
 export interface TaskApi {
@@ -335,10 +343,13 @@ export class Repo {
   readonly db: Db;
   /** RBAC 相关表（users/roles/courses/sessions/notes/conversations/audit_log）。 */
   readonly rbac: RbacRepo;
+  /** ★ 视频目录（`collections`）—— 独立实体；可见性复用 `docScopeSql`（不引入第二套 RBAC 方言） */
+  readonly collections: CollectionsRepo;
 
   constructor(db: Db) {
     this.db = db;
     this.rbac = new RbacRepo(db);
+    this.collections = new CollectionsRepo(db);
   }
 
   // ── documents ──────────────────────────────────────────────────────
@@ -358,13 +369,19 @@ export class Repo {
     visibility?: 'private' | 'course' | 'public';
     reviewStatus?: 'draft' | 'reviewed' | 'published';
     courseId?: string | null;
+    /**
+     * ★ **视频目录归属**（`collections.id`，可空）。
+     * ⚠️ 路由必须**先校验可见性 + 管理权**再传进来（见 `routes/collections.ts` 的 `resolveCollectionForUpload`）——
+     * 否则就是把"目录"当成了一个可以随便写的外键（越权把视频塞进别人的目录）。
+     */
+    collectionId?: string | null;
   }): string {
     const id = input.id ?? newDocId();
     const now = Date.now();
     this.db.run(
       `INSERT INTO documents(id,title,kind,source_path,size_bytes,page_count,lang,status,meta_json,created_at,updated_at,
-        owner_id,visibility,review_status,course_id)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        owner_id,visibility,review_status,course_id,collection_id)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       id,
       input.title,
       input.kind,
@@ -381,6 +398,7 @@ export class Repo {
       // ★ 新上传一律 draft：模型/人工产物**默认不可见**给学生（RBAC §2）
       input.reviewStatus ?? 'draft',
       input.courseId ?? null,
+      input.collectionId ?? null,
     );
     return id;
   }
@@ -1098,12 +1116,72 @@ export class Repo {
     return rows.map(taskToApi);
   }
 
+  /**
+   * ★ 心跳（看门狗用，v8）：**只写 `heartbeat_at`**，不碰 `status/progress`。
+   *
+   * 为什么不复用 `updateTask({status:'running'})`：那会顺带改 `progress`/`stage`，
+   * 与真正在写进度的调用竞争 —— 心跳是"**我还活着**"的信号，语义要单一。
+   */
+  touchTaskHeartbeat(id: string, at = Date.now()): void {
+    this.db.run('UPDATE tasks SET heartbeat_at = ? WHERE id = ?', at, id);
+  }
+
+  /**
+   * ★ 看门狗：找出"**看起来在跑、其实已经死了**"的任务（v8）。
+   *
+   * 判据 = `status='running'` **且** `COALESCE(heartbeat_at, created_at) < cutoff`。
+   *
+   * ⚠️ 两条都是**故意**的：
+   * - 用 `COALESCE(heartbeat_at, created_at)`：老库的 running 行没有心跳（v8 之前写的），
+   *   若只认 `heartbeat_at` → **僵尸任务永远判不死**（正是要修的 bug）。
+   * - `cutoff` 由调用方按 `COURSE_KB_TASK_STALE_MS` 算，**必须大于单步最长耗时**：
+   *   OCR 434 页 ~40 分钟，**慢 ≠ 死**（判死阈值 30 分钟 + 运行期心跳续命）。
+   */
+  staleRunningTasks(cutoff: number): TaskRow[] {
+    return this.db.all<TaskRow>(
+      `SELECT * FROM tasks
+        WHERE status = 'running'
+          AND COALESCE(heartbeat_at, created_at) < ?
+        ORDER BY COALESCE(heartbeat_at, created_at) ASC`,
+      cutoff,
+    );
+  }
+
+  /** 所有 `running` 任务（判"某文档是否真的还有任务在跑"用，**不许**用 `extracting` 状态反推）。 */
+  runningTaskRows(): TaskRow[] {
+    return this.db.all<TaskRow>("SELECT * FROM tasks WHERE status = 'running'");
+  }
+
+  /**
+   * ★ 按状态列文档 id（看门狗自愈用，v8）。
+   *
+   * 只回 `id/status` —— 自愈只需要这两个字段，**不必要地读全表**（含 meta_json 大字段）会白白变慢。
+   */
+  documentsByStatus(status: string): { id: string; status: string }[] {
+    return this.db.all<{ id: string; status: string }>(
+      'SELECT id, status FROM documents WHERE status = ? ORDER BY created_at ASC',
+      status,
+    );
+  }
+
   updateTask(
     id: string,
-    patch: { status?: string; progress?: number; stage?: string; detail?: Record<string, unknown>; error?: string | null },
+    patch: {
+      status?: string;
+      progress?: number;
+      stage?: string;
+      detail?: Record<string, unknown>;
+      error?: string | null;
+      /** ★ v8 心跳（看门狗）；一般用 `touchTaskHeartbeat` */
+      heartbeatAt?: number;
+    },
   ): void {
     const sets: string[] = [];
     const params: unknown[] = [];
+    if (patch.heartbeatAt !== undefined) {
+      sets.push('heartbeat_at = ?');
+      params.push(Math.trunc(patch.heartbeatAt));
+    }
     if (patch.status !== undefined) {
       sets.push('status = ?');
       params.push(patch.status);

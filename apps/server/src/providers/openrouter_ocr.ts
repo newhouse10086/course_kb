@@ -33,10 +33,29 @@ import { CloudOcr } from './index.ts';
 import type { ProviderConfigEntry } from './types.ts';
 import { ProviderError } from './types.ts';
 
-/** 首选模型（**不要改**，见文件头实测表） */
-export const OPENROUTER_OCR_MODEL_PRIMARY = 'z-ai/glm-5.3-flash';
-/** 降级链第二档（更准但更慢） */
-export const OPENROUTER_OCR_MODEL_FALLBACK = 'google/gemini-2.5-flash-lite';
+/**
+ * 首选模型（**不要改**，见文件头实测表）
+ *
+ * ## ★ 2026-10-16 换为**国产模型**（用户要求："最好换成一个国产的"）
+ *
+ * 用户原话：**"ocr哪个模型不太可以哦。最好换成一个国产的哦，不用改太多，你看看有什么模型。对着文档改一下对应接口就行"**
+ *
+ * `[实测]` **本机真端点探测**（真实教材页 = 434 页扫描件第 30 页 + 空白图，见下表）：
+ * | 模型 | 真实页 | 单页耗时 | prompt tok | completion tok | 空白图 |
+ * |---|---|---|---|---|---|
+ * | `qwen/qwen3-vl-235b-a22b-instruct` | **954 字符**（教材正文，无编造）| **1211ms** | 1457 | 533 | `""`（诚实）|
+ * | `qwen/qwen3-vl-30b-a3b-instruct`   | **921 字符**（同上）        | **1344ms** | 1457 | 524 | `[看不清]`（诚实）|
+ *
+ * ⟹ **两个都通过**（HTTP 200 + 内容对得上 + 空白图不编造）→ 主/备**都改成国产**。
+ * ★ 接口**一行未改** —— `buildOcrBody` 用的是标准 OpenAI 视觉格式，所有兼容模型通用
+ *   （用户判断"不用改太多"是对的）。
+ */
+export const OPENROUTER_OCR_MODEL_PRIMARY = 'qwen/qwen3-vl-235b-a22b-instruct';
+/**
+ * 降级链第二档（更便宜，仍是国产 —— 原为 `google/gemini-2.5-flash-lite`，用户要求换国产）。
+ * `[实测]` 真实页 921 字符、1344ms、空白图诚实 —— 与首选同档可用。
+ */
+export const OPENROUTER_OCR_MODEL_FALLBACK = 'qwen/qwen3-vl-30b-a3b-instruct';
 /** ★ **禁用清单**（写进代码，防后人"图便宜"换它） */
 export const OPENROUTER_OCR_BANNED_MODELS = ['google/gemma-3-4b-it'] as const;
 

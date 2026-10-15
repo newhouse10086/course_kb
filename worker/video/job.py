@@ -54,7 +54,14 @@ from .subtitle import validate_timeline
 #: 本模块负责的 job 名前缀（backend-core 的 cli.py 按此前缀分派）
 JOB_PREFIX = "video."
 #: 支持的 job
-JOBS = ("video.parse", "video.caps", "video.manual_subtitles")
+JOBS = (
+    "video.parse",
+    "video.caps",
+    "video.manual_subtitles",
+    # ★ 云端 ASR 的 plan/convert（OpenRouter 调用在 Node；见 cloud_asr.py 模块文档）
+    "video.asr.plan",
+    "video.asr.convert",
+)
 
 EmitFn = Callable[[dict], None]
 
@@ -112,11 +119,171 @@ def run_job(payload: dict, emit: EmitFn, *, providers: dict | None = None) -> in
         return _run_caps(payload, emit)
     if job == "video.manual_subtitles":
         return _run_manual(payload, emit)
+    if job == "video.asr.plan":
+        return _run_asr_plan(payload, emit)
+    if job == "video.asr.convert":
+        return _run_asr_convert(payload, emit)
     if job != "video.parse":
         emit({"type": "error", "code": "E_JOB", "msg": f"未知 job：{job}",
               "detail": f"支持：{list(JOBS)}"})
         return 1
     return _run_parse(payload, emit, providers=providers)
+
+
+def _wire(payload: dict):
+    """读入参：**两种调用习惯都认**。
+
+    * 扁平 camelCase（``video.parse`` 一直这么用）：``{"videoPath": …, "workDir": …}``
+    * 嵌套 snake_case（Node ``runner`` 传 ``input`` 的习惯，见 ``cli.normalize_payload``）：
+      ``{"input": {"video_path": …, "work_dir": …}}``
+
+    ★ 两种都认是**刻意的**：Node 侧调用器风格不统一（`asr` job 走 ``input`` + snake_case，
+    ``video.parse`` 走扁平 camelCase），让 worker 兼容比让每个调用点记住风格更不容易踩坑。
+    """
+
+    inner = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+
+    def pick(*names: str, default: Any = None) -> Any:
+        for src in (payload, inner):
+            for n in names:
+                if n in src and src[n] is not None:
+                    return src[n]
+        return default
+
+    return pick
+
+
+def _run_asr_plan(payload: dict, emit: EmitFn) -> int:
+    """``video.asr.plan``：**只产媒体**（抽音频 + 切块 + 断点）→ 交给 Node 调 OpenRouter。
+
+    入参（两种写法都认，见 :func:`_wire`）::
+
+        {"job":"video.asr.plan","videoPath":"…","workDir":"…",
+         "options":{"chunkMs":30000,"resume":true,"language":"zh"}}
+
+    出参见 :func:`worker.video.cloud_asr.plan`。★ 本 job **不加载任何模型、不发 HTTP**。
+    """
+    from . import cloud_asr as cloud
+
+    pick = _wire(payload)
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    video = str(pick("videoPath", "path", "video_path") or "")
+    doc_id = str(pick("docId", "doc_id") or "")
+    work_dir = str(pick("workDir", "work_dir", "artifactDir") or "")
+    if not video:
+        emit({"type": "error", "code": "E_JOB", "msg": "video.asr.plan 需要 videoPath",
+              "detail": f"收到 payload keys={sorted(payload)}"})
+        return 1
+    if not work_dir:
+        work_dir = runner_mod.default_work_dir(doc_id or os.path.basename(video))
+
+    chunk_ms = int(options.get("chunkMs") or options.get("chunk_ms")
+                   or pick("chunkMs", "chunk_ms", default=cloud.DEFAULT_CLOUD_CHUNK_MS))
+    language = str(options.get("language") or pick("language", default="") or "")
+    resume = bool(options.get("resume", True))
+    model_hint = str(options.get("model") or pick("model", default="") or "")
+
+    emit({"type": "log", "level": "info",
+          "msg": f"云端 ASR plan：抽音频 + 切 {chunk_ms}ms 块 → {work_dir}"
+                 f"（OpenRouter 调用由 Node 负责；本进程不回退本地）"})
+
+    def on_progress(frac: float, stage: str) -> None:
+        emit({"type": "progress", "stage": stage or "asr.plan",
+              "frac": round(0.02 + 0.18 * max(0.0, min(1.0, frac)), 4), "detail": {}})
+
+    try:
+        out = cloud.plan(
+            video_path=video,
+            work_dir=work_dir,
+            chunk_ms=chunk_ms,
+            language=language,
+            resume=resume,
+            model_hint=model_hint,
+            on_progress=on_progress,
+        )
+    except VideoError as exc:
+        emit({"type": "error", "code": exc.code, "msg": exc.message, "detail": exc.detail})
+        return 1
+
+    est = out.get("estimate") or {}
+    if est.get("measured"):
+        emit({"type": "log", "level": "info",
+              "msg": f"计费估算（**实测**口径）：{out['chunksTotal']} 次调用 / "
+                     f"{est.get('audioSeconds')}s 音频 ≈ ${est.get('usd')}"
+                     f"（≈${est.get('usdPerAudioMinute')}/分钟音频、"
+                     f"≈${est.get('usdPerAudioHour')}/小时视频；USD；音频时长是大头）"})
+    else:
+        emit({"type": "log", "level": "warning",
+              "msg": f"计费估算不可用：{est.get('reason')}"})
+    emit({"type": "result", "data": out})
+    return 0
+
+
+def _run_asr_convert(payload: dict, emit: EmitFn) -> int:
+    """``video.asr.convert``：Node 的云端转写结果 → 段 + 与本地 ``asr`` job 同形的产物。
+
+    入参::
+
+        {"job":"video.asr.convert",
+         "plan": {…video.asr.plan 的 result…},
+         "transcriptions":[{"index":0,"text":"…","model":"…","usage":{…}}, …],
+         "model":"mistralai/voxtral-small-24b-2507"}
+
+    ★ ``transcriptions`` 也支持 ``transcriptionsPath``（大 payload 时 Node 落盘再传路径）。
+    ★ 缺块 / 全空 → **如实失败**，绝不回退本地、绝不产出空字幕。
+    """
+    from . import cloud_asr as cloud
+
+    pick = _wire(payload)
+    plan_data = pick("plan", "planData", "plan_data", default=None)
+    if isinstance(plan_data, str) and os.path.isfile(plan_data):
+        with open(plan_data, encoding="utf-8") as fh:
+            plan_data = json.load(fh)
+    if not isinstance(plan_data, dict):
+        emit({"type": "error", "code": "E_JOB", "msg": "video.asr.convert 需要 plan 对象",
+              "detail": f"收到 payload keys={sorted(payload)}"})
+        return 1
+
+    items = pick("transcriptions", "texts", default=None)
+    tpath = pick("transcriptionsPath", "transcriptions_path", default=None)
+    if items is None and tpath and os.path.isfile(str(tpath)):
+        with open(str(tpath), encoding="utf-8") as fh:
+            items = json.load(fh)
+    if not isinstance(items, list):
+        emit({"type": "error", "code": "E_JOB",
+              "msg": "video.asr.convert 需要 transcriptions 数组（或 transcriptionsPath）"})
+        return 1
+
+    work_dir = str(pick("workDir", "work_dir", default="") or "")
+    model = str(pick("model", default="") or "")
+    language = str(pick("language", default="") or "")
+    elapsed_ms = int(pick("elapsedMs", "elapsed_ms", default=0) or 0)
+
+    def on_progress(frac: float, stage: str) -> None:
+        emit({"type": "progress", "stage": stage or "asr.convert",
+              "frac": round(0.05 + 0.9 * max(0.0, min(1.0, frac)), 4), "detail": {}})
+
+    try:
+        out = cloud.convert(
+            plan_data=plan_data,
+            transcriptions=items,
+            model=model,
+            work_dir=work_dir or None,
+            language=language,
+            on_progress=on_progress,
+            elapsed_ms=elapsed_ms,
+        )
+    except VideoError as exc:
+        # ★ 如实失败（含 E_ASR_CLOUD_MISSING / E_ASR_EMPTY）——**不降级到本地**
+        emit({"type": "error", "code": exc.code, "msg": exc.message, "detail": exc.detail})
+        return 1
+
+    emit({"type": "log", "level": "info",
+          "msg": f"云端 ASR 完成：{out['model']}（{out['asrSource']}，块级时间戳）"
+                 f" 段={len(out['segments'])} 块={out['chunksDone']}/{out['chunksTotal']}"
+                 f" 续推={out['chunksResumed']}"})
+    emit({"type": "result", "data": out})
+    return 0
 
 
 def _run_caps(payload: dict, emit: EmitFn) -> int:

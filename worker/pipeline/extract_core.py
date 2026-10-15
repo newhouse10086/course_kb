@@ -45,6 +45,7 @@ from worker.models.schema_enums import (
     section_roles,
     usage_modes,
 )
+from worker.pipeline import chunk as chunk_mod
 from worker.pipeline import units as units_mod
 from worker.pipeline.llm import LLMClient, LLMError, LLMResult
 
@@ -437,12 +438,44 @@ def stable_entity_id(doc_id: str, name: str) -> str:
     return f"ent_{h[:12]}"
 
 
-def card_span(pu: "units_mod.PickedUnit", evidence_page: Any) -> Span:
-    """卡片锚点：优先用模型给的具体页，越界则夹回本单元 span。"""
-    if pu.span.kind == "page" and isinstance(evidence_page, int):
-        pg = max(pu.span.start, min(pu.span.end, evidence_page))
+def card_span(pu: "units_mod.PickedUnit", evidence_page: Any, chunk: "chunk_mod.Chunk | None" = None) -> Span:
+    """卡片锚点：优先用模型给的具体页，越界则夹回**本块**（无块时夹回本单元）span。
+
+    ★ **分块后的关键改动**：夹取上界从"整个单元"变成"**本块**"。
+    改前（截断版）超长单元只有一次调用，卡片 span 只能定位到整章（如 `page 66-75`）；
+    分块后每块有自己的 span（如 `66-72` / `72-75`），于是**每张卡的证据都能定位到
+    它真正来源的那一段**，而不是"这一章里某处"。
+    """
+    base = chunk.span if chunk is not None else pu.span
+    if base.kind == "page" and isinstance(evidence_page, int):
+        pg = max(base.start, min(base.end, evidence_page))
         return Span("page", pg, pg)
-    return pu.span
+    return base
+
+
+def _attach_chunk_meta(cards: Sequence[Card], chunk: "chunk_mod.Chunk",
+                       pu: "units_mod.PickedUnit") -> None:
+    """把块锚点写进卡片（**原地**）—— 保证"证据可回溯到原文哪一段"。
+
+    写入什么（都落在**已有**字段上，**不加 DB 列** —— `cards` 表归 T-BACKEND）：
+    * ``span``：夹进**本块** span（若当前 span 不是块 span 的子区间）
+    * ``prerequisites``：追加一条**人类可读的块定位标记** ``#chunk k/n chars[a,b)``
+
+    ⚠️ 为什么用 `prerequisites` 而**不是**新列：契约里 `evidence_span` 是唯一锚点字段，
+    而 `cards` 表没有块级列；往 `prerequisites` 追加一行是可回滚、可检索、
+    **不破坏封闭枚举/不要求迁移**的诚实做法（T-BACKEND 若要独立列，可从这里取值）。
+    块定位标记**只在真分了块（`total > 1`）时才加** —— 短单元保持与改前逐字一致。
+    """
+    if chunk.total <= 1:
+        return
+    for c in cards:
+        # ① span 夹进本块（若模型给的页落在本块之外，或 span 还是整单元的，都收敛到块）
+        if not (chunk.span.start <= c.span.start and c.span.end <= chunk.span.end):
+            c.span = Span(chunk.span.kind, chunk.span.start, chunk.span.end)
+        # ② 人类可读的块定位（可被 grep、可被前端展示）
+        marker = f"#chunk {chunk.index + 1}/{chunk.total} chars[{chunk.char_start},{chunk.char_end})"
+        if marker not in c.prerequisites:
+            c.prerequisites.append(marker)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -551,22 +584,29 @@ def unit_origin(pu: "units_mod.PickedUnit", origin_pages: dict[str, str] | None,
 
 
 def audit_cards(pu: "units_mod.PickedUnit", cards: Sequence[Card], *,
-                origin: str = "") -> list[dict[str, Any]]:
-    """逐卡片校验 evidence_quote → 审计条目（含原因分类）。"""
+                origin: str = "", body: str | None = None) -> list[dict[str, Any]]:
+    """逐卡片校验 evidence_quote → 审计条目（含原因分类）。
+
+    :param body: **本块**正文（分块抽取时传入）。``None`` = 用整单元正文（未分块/旧调用）。
+        ⚠️ 分块时**必须**传块正文：否则"块 2 的引用"能在整单元的别处找到，
+        校验退化成"在整章里能找到"→ **跨块伪造引用会被漏报**（闸门被悄悄放宽）。
+    """
+    text = pu.text if body is None else body
     out: list[dict[str, Any]] = []
     for c in cards:
-        chk = check_quote(c.evidence_quote, pu.text, origin=origin)
+        chk = check_quote(c.evidence_quote, text, origin=origin)
         entry = {"cardId": c.id, "name": c.name, **chk.to_dict()}
         out.append(entry)
     return out
 
 
 def audit_edges(pu: "units_mod.PickedUnit", edges: Sequence[Edge], *,
-                origin: str = "") -> list[dict[str, Any]]:
+                origin: str = "", body: str | None = None) -> list[dict[str, Any]]:
     """逐边校验 evidence_text（与卡片同一套判据）。"""
+    text = pu.text if body is None else body
     out: list[dict[str, Any]] = []
     for e in edges:
-        chk = check_quote(getattr(e, "evidence_text", "") or "", pu.text, origin=origin)
+        chk = check_quote(getattr(e, "evidence_text", "") or "", text, origin=origin)
         out.append({"edgeId": getattr(e, "id", ""), "src": getattr(e, "src", ""),
                     "dst": getattr(e, "dst", ""), **chk.to_dict()})
     return out
@@ -578,10 +618,14 @@ _QUOTE_STAT_KEYS = ("exact", "normalized", "rewritten", "fabricated", "missing")
 
 def record_quote_audit(outcome: "ExtractOutcome", pu: "units_mod.PickedUnit",
                        cards: Sequence[Card], edges: Sequence[Edge], *,
-                       origin: str = "", warn_limit: int = 20) -> None:
-    """把审计结果记进 ``stats`` + ``warnings``（**不丢卡片** —— 见下）。"""
-    card_audit = audit_cards(pu, cards, origin=origin)
-    edge_audit = audit_edges(pu, edges, origin=origin)
+                       origin: str = "", warn_limit: int = 20,
+                       body: str | None = None) -> None:
+    """把审计结果记进 ``stats`` + ``warnings``（**不丢卡片** —— 见下）。
+
+    :param body: **本块**正文（分块抽取时传入）—— 见 :func:`audit_cards` 的说明。
+    """
+    card_audit = audit_cards(pu, cards, origin=origin, body=body)
+    edge_audit = audit_edges(pu, edges, origin=origin, body=body)
     outcome.stats.setdefault("quoteAudit", [])
     for entry in card_audit + edge_audit:
         key = f"quote_{entry['kind']}"
@@ -621,8 +665,12 @@ def record_quote_audit(outcome: "ExtractOutcome", pu: "units_mod.PickedUnit",
         })
 
 
-def build_cards(doc_id: str, pu: "units_mod.PickedUnit", raw_cards: Sequence[dict]) -> list[Card]:
-    """模型输出 → :class:`Card` 列表（非法枚举**丢弃并记日志**，不炸整篇）。"""
+def build_cards(doc_id: str, pu: "units_mod.PickedUnit", raw_cards: Sequence[dict],
+                chunk: "chunk_mod.Chunk | None" = None) -> list[Card]:
+    """模型输出 → :class:`Card` 列表（非法枚举**丢弃并记日志**，不炸整篇）。
+
+    :param chunk: 本批卡片来自的块（``None`` = 未分块）。卡片 span 会夹进**本块** span。
+    """
     out: list[Card] = []
     for rc in raw_cards or []:
         name = str(rc.get("name") or "").strip()
@@ -646,7 +694,7 @@ def build_cards(doc_id: str, pu: "units_mod.PickedUnit", raw_cards: Sequence[dic
                     prerequisites=rc.get("prerequisites") or [],
                     cautions=rc.get("cautions") or [],
                     evidence_quote=rc.get("evidence_quote") or "",
-                    span=card_span(pu, rc.get("evidence_page")),
+                    span=card_span(pu, rc.get("evidence_page"), chunk),
                     confidence=rc.get("confidence") or 0.0,
                 )
             )
@@ -951,20 +999,17 @@ def extract_units(
     schema = build_extraction_schema()
     system_prompt = build_system_prompt(source_name)
 
-    for i, (key, pu) in enumerate(todo, 1):
-        frac = i / len(todo)
-        _emit(
-            emit,
-            {
-                "type": "progress",
-                "stage": "extract",
-                "frac": round(frac, 4),
-                "detail": {"done": i - 1, "total": len(todo), "unit_id": pu.unit_id,
-                           "title": pu.title, "span": pu.span.to_dict()},
-            },
-        )
-        body = (pu.text or "")[:chunk_chars]
-        if not body.strip():
+    # ★ 展开成**块级**待办（长文本分块；短单元仍是一块 ⟹ 行为与改前一致）。
+    #   断点键仍按**单元**（`key`）判断"这个单元做完没有" —— 若按块判断，
+    #   旧断点（单元级）会让整个单元重跑；按单元判断则"已完成"语义不变。
+    chunk_todo: list[tuple[str, units_mod.PickedUnit, chunk_mod.Chunk]] = []
+    for key, pu in todo:
+        chunks = chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)
+        if not chunks:
+            # ⚠️ 空正文 → `split_unit` 返回 0 块，**但单元必须仍被计数**：
+            #    `units_empty` 是"这个单元没有正文"的诚实上报（前端据此标注空单元）。
+            #    原错误写法：只在循环体里 `+= 1` → 空单元的块数为 0，循环根本不进 →
+            #    **空单元被彻底静默**（实测：`units_empty` 从 1 变 0）。
             outcome.stats["units_empty"] += 1
             if ckpt:
                 ckpt.mark(key, {"unit_id": pu.unit_id, "cards": 0, "reason": "空文本",
@@ -973,15 +1018,49 @@ def extract_units(
             _emit(emit, {"type": "log", "level": "warning",
                          "msg": f"单元无正文，跳过：{pu.title[:60]}"})
             continue
+        for ch in chunks:
+            chunk_todo.append((key, pu, ch))
+    outcome.stats["chunks_total"] = len(chunk_todo)
+    _per_unit_chunks: dict[str, int] = {}
+    for _k, _pu, _c in chunk_todo:
+        _per_unit_chunks[_pu.unit_id] = _per_unit_chunks.get(_pu.unit_id, 0) + 1
+    outcome.stats["chunked_units"] = sum(1 for n in _per_unit_chunks.values() if n > 1)
+    outcome.stats["max_chunks_per_unit"] = max(_per_unit_chunks.values(), default=0)
+    outcome.stats["chunks_done"] = 0
+    #: 已经完成过的单元（`units_done` 按单元去重计数，不按块）
+    _units_done_seen: set[str] = set()
+
+    for i, (unit_key, pu, ch) in enumerate(chunk_todo, 1):
+        # 进度按**块**推进（块数才是真实调用数）；`total` 也报块数，避免进度条到不了 100%
+        frac = i / len(chunk_todo)
+        _emit(
+            emit,
+            {
+                "type": "progress",
+                "stage": "extract",
+                "frac": round(frac, 4),
+                "detail": {"done": i - 1, "total": len(chunk_todo), "unit_id": pu.unit_id,
+                           "title": pu.title, "span": ch.span.to_dict(),
+                           "chunk": ch.to_dict()},
+            },
+        )
+        body = ch.text
+        # 空块的检查留在展开阶段（上面的 `if not chunks`）—— 到这里 `body` 必然非空。
+        # 仍保留一道断言式兜底：分块逻辑若产出全空白块，这里如实跳过而不是发空正文给模型。
+        if not body.strip():  # pragma: no cover - 防御性，正常不可达
+            _emit(emit, {"type": "log", "level": "warning",
+                         "msg": f"空块被跳过：{pu.title[:60]}（块 {ch.index + 1}/{ch.total}）"})
+            continue
         try:
             result = llm.complete_json(
                 system=system_prompt,
                 user=build_user_prompt(
                     source_name=source_name,
-                    span_kind=pu.span.kind,
+                    # ★ 提示词里的位置用**本块**的 span（不是整单元的）
+                    span_kind=ch.span.kind,
                     path=path_index.get(pu.unit_id, pu.title),
-                    start=pu.span.start,
-                    end=pu.span.end,
+                    start=ch.span.start,
+                    end=ch.span.end,
                     body=body,
                 ),
                 schema=schema,
@@ -992,10 +1071,10 @@ def extract_units(
             outcome.stats["units_failed"] += 1
             outcome.errors.append(
                 {"unit_id": pu.unit_id, "title": pu.title, "code": exc.code, "msg": exc.msg,
-                 "detail": exc.detail}
+                 "detail": exc.detail, "chunk": ch.to_dict()}
             )
             _emit(emit, {"type": "log", "level": "error",
-                         "msg": f"单元抽取失败 {pu.title[:40]}：{exc.code} {exc.msg}"})
+                         "msg": f"单元抽取失败 {pu.title[:40]}（块 {ch.index + 1}/{ch.total}）：{exc.code} {exc.msg}"})
             if ckpt:
                 ckpt.save()
             # 额度/凭据类错误：继续只会耗时间 → 中断（断点已存，可续跑）
@@ -1006,15 +1085,20 @@ def extract_units(
             continue
 
         outcome.stats["llm_calls"] += 1
+        outcome.stats["chunks_done"] = int(outcome.stats.get("chunks_done") or 0) + 1
         data = result.data or {}
         raw_cards = data.get("cards")
-        cards = build_cards(doc_id, pu, raw_cards or [])
+        cards = build_cards(doc_id, pu, raw_cards or [], ch)
+        _attach_chunk_meta(cards, ch, pu)
         if not cards:
             note_no_cards(outcome, pu, raw_cards, data.get("section") or {})
         graph = build_graph(doc_id, pu, data)
         # ★ 证据逐字校验（wiki-architect 请求 ②）：把"必须逐字摘录"变成**可断言的事实**
+        #    ⚠️ 分块后必须传**本块正文** —— 否则"块 2 的引用"会在整单元里找到，
+        #    校验就退化成"在整章里能找到"（跨块引用会漏报，等于放宽了闸门）。
         record_quote_audit(outcome, pu, cards, graph.edges,
-                           origin=unit_origin(pu, text_origin_pages, text_origin))
+                           origin=unit_origin(pu, text_origin_pages, text_origin),
+                           body=body)
         outcome.cards.extend(cards)
         outcome.entities.extend(graph.entities)
         outcome.edges.extend(graph.edges)
@@ -1022,7 +1106,11 @@ def extract_units(
         outcome.stats["entities"] += len(graph.entities)
         outcome.stats["edges"] += len(graph.edges)
         outcome.stats["edges_dropped"] += graph.dropped_edges
-        outcome.stats["units_done"] += 1
+        # ⚠️ `units_done` 按**单元去重**计数（一个 3 块单元只算 1 个单元完成），
+        #    否则"单元数"口径会虚高 —— 与前端进度/闸门的口径保持一致。
+        if pu.unit_id not in _units_done_seen:
+            _units_done_seen.add(pu.unit_id)
+            outcome.stats["units_done"] += 1
 
         section = data.get("section") or {}
         if section.get("section_summary"):
@@ -1036,8 +1124,11 @@ def extract_units(
             }
 
         if ckpt:
+            # ⚠️ 断点键仍是**单元级** `unit_key`（不是块级）——
+            #    否则一次中断会留下"N 个块只做了 1 个"的中间态，续跑语义变复杂；
+            #    而单元级键的语义是"这个单元的所有块都做完了"（与改前的断点兼容）。
             ckpt.mark(
-                key,
+                unit_key,
                 {
                     "unit_id": pu.unit_id,
                     "span": pu.span.to_dict(),
@@ -1045,6 +1136,7 @@ def extract_units(
                     "entities": len(graph.entities),
                     "edges": len(graph.edges),
                     "dropped": graph.dropped_edges,
+                    "chunk": ch.to_dict(),  # ★ 块锚点（诊断"这个单元做到第几块"）
                     "attempts": result.attempts,
                     "ms": result.elapsed_ms,
                     "at": int(time.time() * 1000),
@@ -1061,7 +1153,9 @@ def extract_units(
                     "unit_id": pu.unit_id,
                     "title": pu.title,
                     "level": pu.level,
+                    # ★ 单元级 span（落库锚点）——与块级 `chunk.span` 区分开
                     "span": pu.span.to_dict(),
+                    "chunk": ch.to_dict(),
                     "cards": [c.to_dict() for c in cards],
                     "entities": [e.to_dict() for e in graph.entities],
                     "edges": [e.to_dict() for e in graph.edges],
@@ -1075,8 +1169,8 @@ def extract_units(
                 "type": "progress",
                 "stage": "extract",
                 "frac": round(frac, 4),
-                "detail": {"done": i, "total": len(todo), "unit_id": pu.unit_id,
-                           "cards": len(cards)},
+                "detail": {"done": i, "total": len(chunk_todo), "unit_id": pu.unit_id,
+                           "cards": len(cards), "chunk": ch.to_dict()},
             },
         )
 
@@ -1118,38 +1212,57 @@ def plan_prompts(
     schema = build_extraction_schema()
     items = []
     for pu in picked:
-        items.append(
-            {
-                "key": pick_key(pu),
-                # ★ 可移植的键：不含"合成 unit_id"，跨进程/跨 doc_id 也能对上
-                #   （`key` 里含 unit_id；若 Node 在 plan 与 convert 之间换了
-                #     doc_id/合成规则，用 unit_key 匹配即可 —— 实测踩过这个坑）
-                "unit_key": f"{ord_by_id.get(pu.unit_id, 0)}#{pu.span.kind}:{pu.span.start}-{pu.span.end}",
-                #: ★ 本单元来源（native/ocr/mixed）—— 供 Node 落库/前端标注；
-                #: 提示词用的是**一条通用约束**（不按来源分身），所以这不是提示词开关
-                "text_origin": unit_origin(pu, text_origin_pages, text_origin),
-                "unit_ord": ord_by_id.get(pu.unit_id, 0),
-                "unit_id": pu.unit_id,
-                "title": pu.title,
-                "kind": pu.kind,
-                "span": pu.span.to_dict(),
-                "chars": pu.chars,
-                "system": system_prompt,
-                "user": build_user_prompt(
-                    source_name=source_name,
-                    span_kind=pu.span.kind,
-                    path=path_index.get(pu.unit_id, pu.title),
-                    start=pu.span.start,
-                    end=pu.span.end,
-                    body=(pu.text or "")[:chunk_chars],
-                ),
-            }
-        )
+        # ★ 长文本分块（**不再截断**）：超长单元 → 多块，逐块一次调用。
+        #   短单元 → 单块，行为与改前**逐字一致**（chunk.split_unit 保证）。
+        chunks = chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)
+        for ch in chunks:
+            items.append(
+                {
+                    # ★ 块级 key：`make_key` 的 span 段用**块自己映射出来的 span**，
+                    #   于是 convert 侧能靠 `by_key` / `by_span` 精确对回**同一个块**
+                    #   （不能用单元 span —— 那样同一单元的 N 块会撞成同一个 key，
+                    #    convert 只认第一块，其余块的卡片全丢）。
+                    "key": make_key(pu.unit_id, ch.span),
+                    # ★ 可移植的键：不含"合成 unit_id"，跨进程/跨 doc_id 也能对上
+                    #   （`key` 里含 unit_id；若 Node 在 plan 与 convert 之间换了
+                    #     doc_id/合成规则，用 unit_key 匹配即可 —— 实测踩过这个坑）
+                    "unit_key": f"{ord_by_id.get(pu.unit_id, 0)}#{ch.span.kind}:{ch.span.start}-{ch.span.end}",
+                    #: ★ 本单元来源（native/ocr/mixed）—— 供 Node 落库/前端标注；
+                    #: 提示词用的是**一条通用约束**（不按来源分身），所以这不是提示词开关
+                    "text_origin": unit_origin(pu, text_origin_pages, text_origin),
+                    "unit_ord": ord_by_id.get(pu.unit_id, 0),
+                    "unit_id": pu.unit_id,
+                    "title": pu.title,
+                    "kind": pu.kind,
+                    # ★ 单元**原始** span（不含分块）—— 落库/展示要的是单元级锚点
+                    "unit_span": pu.span.to_dict(),
+                    #: ★ 本块映射后的 span（卡片锚点用这个，见 `chunk.py` 的诚实说明）
+                    "span": ch.span.to_dict(),
+                    "chars": ch.chars,
+                    #: ★ 分块元信息（块数/本块序号/字符区间）—— 单调可回溯、可观测
+                    "chunk": ch.to_dict(),
+                    "system": system_prompt,
+                    "user": build_user_prompt(
+                        source_name=source_name,
+                        span_kind=ch.span.kind,
+                        path=path_index.get(pu.unit_id, pu.title),
+                        start=ch.span.start,
+                        end=ch.span.end,
+                        body=ch.text,
+                    ),
+                }
+            )
     return {
         "schema": schema,
         "optional_fields": sorted(OPTIONAL_CARD_FIELDS),
         "pick": pick_stats.to_dict(),
         "items": items,
+        # ★ 代价可见：分块后的**实际调用数**（> 单元数时说明发生了分块）。
+        #   `needs_confirm` 闸门与 meta 都按这个数上报（坑 24：承诺必须与生效一致）。
+        "chunks": len(items),
+        "units_planned": len(picked),
+        "chunked_units": sum(1 for pu in picked if len(chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars)) > 1),
+        "max_chunks_per_unit": chunk_mod.max_chunk_count([pu.text or "" for pu in picked], chunk_chars),
     }
 
 
@@ -1163,33 +1276,53 @@ def convert_payloads(
     max_pages: int = units_mod.MAX_PAGES_PER_UNIT,
     pages_total: int = 0,
     excluded_ranges: Sequence[Sequence[int]] | None = None,
+    chunk_chars: int = chunk_mod.DEFAULT_CHUNK_CHARS,
 ) -> ExtractOutcome:
     """把 Node 侧拿到的模型输出（``payloads``）校验 + 转成卡片/图谱。
 
-    ``payloads`` 每项：``{"key": <pick_key> 或 "unit_id", "data": {section,cards,entities,edges}}``
+    ``payloads`` 每项：``{"key": <make_key(unit_id, chunk_span)> 或 "unit_id", "data": {...}}``
     （与 :func:`plan_prompts` 的 ``items[].key`` 对齐）。
+
+    ★ **长文本分块**（`chunk.py`）：同一单元的 N 个块各有**自己的 span**，
+    所以这里按**块级 key/span** 匹配，再把结果**合并回同一个 `unit_id`**。
+    块级锚点（块序号 / 字符偏移 / 块 span）随卡片一起带出 —— 见 `_attach_chunk_meta`。
+
+    ⚠️ ``chunk_chars`` **必须与 plan 用同一个值**：两侧分块结果不同 → 块级 key 对不上
+    → 卡片被静默丢弃（与 `make_key` 注释里那个 bug 同源）。故默认值也统一取
+    `chunk.DEFAULT_CHUNK_CHARS`（不再各写一个 24_000 字面量）。
     """
     picked, pick_stats = units_mod.pick_units(
         units, max_pages=max_pages, pages_total=pages_total, excluded_ranges=excluded_ranges
     )
-    by_key = {pick_key(pu): pu for pu in picked}
+    # ── ★ 块级索引：`(单元, 块)` 二元组。同一单元的多块**各有 key 与 span**，
+    #    因此必须分别建索引；否则 N 块撞成同一个 key → convert 只认第一块、
+    #    其余块的卡片被静默丢弃（与 `make_key` 注释里那个"花钱抽出却全丢"同源）。
+    chunked: dict[str, tuple[units_mod.PickedUnit, chunk_mod.Chunk]] = {}
+    for pu in picked:
+        for ch in chunk_mod.split_unit(pu.text or "", pu.span, chunk_chars):
+            chunked[make_key(pu.unit_id, ch.span)] = (pu, ch)
+    by_key: dict[str, tuple[units_mod.PickedUnit, chunk_mod.Chunk]] = dict(chunked)
     by_unit: dict[str, units_mod.PickedUnit] = {}
     for pu in picked:
         by_unit.setdefault(pu.unit_id, pu)
     #: 兜底匹配：unit_key / span（跨 doc_id、跨合成 id 都能对上）
     ord_by_id = {u.id: u.ord for u in units}
     by_unit_key = {
-        f"{ord_by_id.get(pu.unit_id, 0)}#{pu.span.kind}:{pu.span.start}-{pu.span.end}": pu
-        for pu in picked
+        f"{ord_by_id.get(pu.unit_id, 0)}#{ch.span.kind}:{ch.span.start}-{ch.span.end}": (pu, ch)
+        for (pu, ch) in chunked.values()
     }
-    by_span: dict[str, units_mod.PickedUnit] = {}
-    for pu in picked:
-        by_span.setdefault(span_key(pu.span), pu)
+    by_span: dict[str, tuple[units_mod.PickedUnit, chunk_mod.Chunk]] = {}
+    for (pu, ch) in chunked.values():
+        by_span.setdefault(span_key(ch.span), (pu, ch))
 
     outcome = ExtractOutcome(doc_id=doc_id)
     outcome.stats["pick"] = pick_stats.to_dict()
     outcome.stats.update({"units_total": len(picked), "units_done": 0, "cards": 0,
-                          "entities": 0, "edges": 0, "edges_dropped": 0, "llm_calls": 0})
+                          "entities": 0, "edges": 0, "edges_dropped": 0, "llm_calls": 0,
+                          "chunks_total": len(chunked), "chunks_done": 0})
+    #: 已经产出过内容的单元（`units_done` 按**单元**去重计数，不按块 —— 否则一个 3 块单元
+    #: 会被数成 3 个单元，前端进度与"单元数"口径就漂了）
+    units_seen: set[str] = set()
     for item in payloads or []:
         key = str(item.get("key") or "")
         unit_key = str(item.get("unit_key") or "")
@@ -1197,19 +1330,30 @@ def convert_payloads(
         span_k = f"{span.get('kind')}:{span.get('start')}-{span.get('end')}" if span else ""
         # ⚠️ 匹配顺序（逐级放宽）——最后一级"只按 span"专门兜住
         #    "plan 与 convert 用了不同 doc_id / 合成 id" 的情况（Lead 实测的那个 bug）
-        pu = by_key.get(key) or by_unit_key.get(unit_key)
-        if pu is None:
+        hit = by_key.get(key) or by_unit_key.get(unit_key)
+        if hit is None:
             parsed = parse_key(key)
             if parsed:
                 _uid, kind, start, end = parsed
-                pu = (
+                hit = (
                     by_key.get(key)
                     or by_span.get(f"{kind}:{start}-{end}")
-                    or by_unit.get(_uid)
+                    or None
                 )
-        if pu is None:
-            pu = by_span.get(span_k)
-        if pu is None:
+        if hit is None:
+            hit = by_span.get(span_k)
+        if hit is None:
+            # 旧版 plan（单元级 key）的兼容路径：按 unit_id 找到单元 → 用它的**块列表**，
+            # 取与请求 span 最贴近的块（没有则第一块）。这样"跨版本 plan/convert 混用"不会
+            # 变成"卡片全丢"，但仍如实计入下面的 `units_failed` 之外的匹配统计。
+            parsed = parse_key(key)
+            uid = parsed.unit_id if parsed else (key.split(KEY_SEP)[0] if KEY_SEP in key else key)
+            pu0 = by_unit.get(uid)
+            if pu0 is not None:
+                cands = [c for c in chunked.values() if c[0].unit_id == uid]
+                if cands:
+                    hit = cands[0]
+        if hit is None:
             # key 对不上也算"这一个单元失败了"（stats 要说实话，状态才好判）
             outcome.stats["units_failed"] = int(outcome.stats.get("units_failed") or 0) + 1
             outcome.errors.append(
@@ -1220,8 +1364,12 @@ def convert_payloads(
             )
             continue
         data = item.get("data") if isinstance(item.get("data"), dict) else item
+        pu, ch = hit
         raw_cards = (data or {}).get("cards")
-        cards = build_cards(doc_id, pu, raw_cards or [])
+        cards = build_cards(doc_id, pu, raw_cards or [], ch)
+        # ★ 给本块的卡片打上**块锚点**（块序号 / 字符区间 / 块 span）——
+        #   这是"证据能回溯到原文哪一段"的物理依据（见 `_attach_chunk_meta`）。
+        _attach_chunk_meta(cards, ch, pu)
         if not cards:
             note_no_cards(outcome, pu, raw_cards, (data or {}).get("section") or {})
         graph = build_graph(doc_id, pu, data or {})

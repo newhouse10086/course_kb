@@ -657,6 +657,10 @@ def job_extract_convert(payload: dict[str, Any], emit: Emitter) -> dict[str, Any
         max_pages=int(opt(payload, "max_pages", 8) or 8),
         pages_total=int(opt(payload, "pages_total", 0) or 0),
         excluded_ranges=opt(payload, "excluded_ranges") or [],
+        # ★ 必须与 `job_extract_plan` 用**同一个** chunk_chars ——
+        #   两侧分块不同 → 块级 key 对不上 → 卡片被静默丢弃（E_PICK_KEY）。
+        #   两端都从同一 payload 字段取（Node 在 plan 与 convert 都传 deps.chunkChars）。
+        chunk_chars=int(opt(payload, "chunk_chars", 24_000) or 24_000),
     )
     emit.progress("extract.convert", 1.0, {"cards": len(outcome.cards)})
     data = outcome.to_dict()

@@ -35,6 +35,7 @@ import type { WorkerRunnerWithRaw } from '../worker/runner.ts';
 import type { WorkerEvent } from '../worker/protocol.ts';
 import type { TaskHandler, TaskHandlerContext } from './queue.ts';
 import type { Extractor, CompleteJsonFn } from './extract.ts';
+import { OPENROUTER_ASR_MODEL, createOpenRouterAsr } from '../providers/openrouter_audio.ts';
 
 /** 单个抽取窗口的字符预算（v1 用的同一量级；超长单元必须切窗，否则丢内容 —— 坑 5）。 */
 export const MAX_EXTRACT_CHARS = 8000;
@@ -820,8 +821,196 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
   };
 
   /**
-   * 视频/音频任务：交给 worker（faster-whisper 不可替代）。
-   * worker 不可用时**如实失败**（契约 §8 `E_ASR_LOAD`），不产出假字幕。
+   * 视频 ASR —— **走 OpenRouter（云端）**：plan / convert 两阶段。
+   *
+   * 形状照抄本仓库已有的 plan/convert 范式（`extract.plan`→Node 调 LLM→`extract.convert`）：
+   *
+   * ```
+   * ① worker video.asr.plan      [Python] ffmpeg 抽音频 + 切块 + **断点** → chunks[]
+   * ② 本函数逐块调 OpenRouter     [Node]   providers/openrouter_audio.ts::createOpenRouterAsr（**唯一实现**）
+   * ③ worker video.asr.convert   [Python] 结果 + 块偏移 → 段（块级时间戳）→ 与本地 asr job **同形**的产物
+   * ```
+   *
+   * ## 三条硬要求（用户裁定 + Lead 明确）
+   *
+   * 1. ★★ **绝不静默降级回本地 faster-whisper**：这里**不走 provider 的 policy 降级链**
+   *    （链里 `local-fw` 排第一，会"悄悄"用本地），而是**直接按 id 取 openrouter_asr 构造**——
+   *    结构上就没有本地那一跳。云端失败 → **如实抛** + 可读 reason。
+   * 2. ★ **不许两套 ASR 实现**：HTTP 调用只在 `openrouter_audio.ts`，本函数只做编排。
+   * 3. ★ **代价可见**：plan 带回实测口径的计费估算（音频时长是账单大头），逐块进度也上报。
+   *
+   * ⚠️ 想改成"用注册表里的实例"也行，但那需要给 `PipelineDeps` 加 `providers`；
+   *    这里用**同一工厂 + 配置项**构造（仍是**同一实现**，不是第二套），顺便天然绕开 policy 链。
+   */
+  const asrViaOpenRouter = async (
+    ctx: TaskHandlerContext,
+    docId: string,
+    absPath: string,
+  ): Promise<Record<string, unknown>> => {
+    // ⚠️ 路径是 `cfg.providers.providers.asr`：`cfg.providers` 是 ProviderConfig
+    //    （{policy, providers, sourcePath, warnings}），**不是**按 kind 索引的 map。
+    const entries = cfg.providers?.providers?.asr ?? [];
+    const entry = entries.find(
+      (p) => p.type === 'openrouter_asr' || p.id === 'openrouter-asr' || p.id === 'openrouter_asr',
+    );
+    if (!entry) {
+      throw new ApiError('E_ASR_LOAD', '没有配置 OpenRouter ASR provider', {
+        hint:
+          'ASR 已改为**云端优先**（用户裁定）。请在 config/providers.yaml 的 providers.asr 下配置 ' +
+          '`type: openrouter_asr` + `.env` 的 `OPENROUTER_KEY`。本地 faster-whisper 仅在显式指定时使用。',
+      });
+    }
+    const asr = createOpenRouterAsr(entry);
+    if (!asr.info.configured) {
+      throw new ApiError('E_ASR_LOAD', `OpenRouter ASR 不可用：${asr.info.reason}`, {
+        hint: '检查 .env 的 OPENROUTER_KEY 是否配置；**不会**回退本地 faster-whisper（用户明确要求走 API）。',
+      });
+    }
+    const asrModel = String(entry.options?.model ?? OPENROUTER_ASR_MODEL);
+    const workDir = path.join(cfg.dataDir, 'video', docId);
+    const language = asStr(ctx.params.language, '');
+
+    const forward = (e: unknown): void => {
+      const ev = e as Partial<WorkerEvent> & { type?: string };
+      if (ev.type === 'log') {
+        ctx.log(asStr(ev.msg), (ev.level as 'info' | 'warn' | 'error' | 'debug') ?? 'info');
+      } else if (ev.type === 'progress') {
+        ctx.log(`[plan] ${asStr(ev.stage, '')}`, 'debug');
+      }
+    };
+
+    // ① plan：Python 产媒体（抽音频 + 切块 + 断点），**不转写**
+    ctx.progress(0.06, '准备音频（抽轨 + 切块）');
+    const plan = (await runner({
+      job: 'video.asr.plan',
+      input: {
+        doc_id: docId,
+        path: absPath,
+        work_dir: workDir,
+        options: { chunkMs: asNum(ctx.params.chunkMs, 30_000), language, resume: true },
+      },
+      signal: ctx.signal,
+      timeoutMs: cfg.workerTimeoutMs,
+      onEvent: forward,
+    })) as {
+      chunks?: { index: number; path: string; startMs: number; endMs: number; durationMs?: number; done?: boolean }[];
+      chunksTotal?: number;
+      doneChunks?: number[];
+      estimate?: Record<string, unknown>;
+      language?: string;
+    };
+
+    const all = plan.chunks ?? [];
+    if (all.length === 0) throw new ApiError('E_ASR_LOAD', 'plan 没有产出任何音频块（视频无音轨？）');
+    const total = all.length;
+    const resumeFrom = plan.doneChunks?.length ?? 0;
+    ctx.log(
+      `云端 ASR：${total} 块（${resumeFrom} 块已在断点里） 模型=${asrModel} 计费估算=${JSON.stringify(plan.estimate ?? {})}`,
+      'info',
+    );
+
+    // ② 逐块调 OpenRouter（**并发=1**：用户硬要求；顺带让进度/计费可预期）
+    const transcriptions: { index: number; text: string; model: string; elapsedMs: number }[] = [];
+    let done = resumeFrom;
+    for (const c of all) {
+      if (c.done) continue;
+      if (ctx.signal?.aborted) {
+        // 取消：**不抛错**（队列会把 abort 收尾成 `cancelled`），也不继续调 API 白花钱。
+        // 断点里已完成的块由上面的阶段性 convert 落过盘 → 续跑不重复计费。
+        ctx.log(`任务被取消，已落盘 ${done}/${total} 块（断点保留，可续跑）`, 'warn');
+        return { video: { cancelled: true, chunks_done: done, chunks_total: total } };
+      }
+      const t0 = Date.now();
+      let r: Awaited<ReturnType<typeof asr.transcribe>>;
+      try {
+        r = await asr.transcribe({
+          audioPath: c.path,
+          durationMs: c.durationMs ?? c.endMs - c.startMs,
+          ...(language ? { language } : {}),
+          requireWordTimestamps: false, // voxtral 没有词级时间戳 → 如实不要求（块级）
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // ★ 如实失败：**不**换本地、**不**产出空字幕
+        throw new ApiError('E_ASR_LOAD', `云端 ASR 第 ${c.index + 1}/${total} 块失败：${msg}`, {
+          hint:
+            'ASR 走 OpenRouter（用户裁定）。请检查 OPENROUTER_KEY/额度/网络后重试；' +
+            '断点已保存，重试只会补没转完的块（不会重复计费已完成的块）。',
+        });
+      }
+      const text = r.segments.map((s) => s.text).join(' ').trim();
+      transcriptions.push({
+        index: c.index,
+        text,
+        model: asrModel,
+        elapsedMs: Date.now() - t0,
+      });
+      done += 1;
+      ctx.progress(0.06 + 0.88 * (done / total), `云端转写 ${done}/${total}${text ? '' : '（本块无语音）'}`);
+
+      // ③ 阶段性落盘（每 5 块 / 最后一块）：中断后重跑**不会重复计费**已完成的块
+      if (done % 5 === 0 || done === total) {
+        await runner({
+          job: 'video.asr.convert',
+          input: {
+            doc_id: docId,
+            path: absPath,
+            work_dir: workDir,
+            plan,
+            transcriptions,
+            model: asrModel,
+            partial: true,
+          },
+          signal: ctx.signal,
+          timeoutMs: cfg.workerTimeoutMs,
+          onEvent: forward,
+        });
+        ctx.log(`云端 ASR：已落盘 ${done}/${total} 块断点`, 'debug');
+      }
+    }
+
+    // ④ 最终 convert：块必须齐 + 全空文本 → 如实失败（绝不产出空字幕假装成功）
+    const result = (await runner({
+      job: 'video.asr.convert',
+      input: {
+        doc_id: docId,
+        path: absPath,
+        work_dir: workDir,
+        plan,
+        transcriptions,
+        model: asrModel,
+        partial: false,
+      },
+      signal: ctx.signal,
+      timeoutMs: cfg.workerTimeoutMs,
+      onEvent: forward,
+    })) as Record<string, unknown> & { segments?: unknown[] };
+
+    ctx.log(
+      `云端 ASR 完成：${asrModel}（来源 openrouter，块级时间戳） 段=${(result.segments ?? []).length}`,
+      'info',
+    );
+    repo.upsertVideoArtifact(docId, result);
+    ctx.artifact('subtitle', `/api/v1/documents/${docId}/video/subtitle?fmt=srt`);
+    ctx.progress(1, '完成');
+    return {
+      video: {
+        duration_ms: asNum(result.durationMs),
+        segments: Array.isArray(result.segments) ? result.segments.length : 0,
+        // ★ 如实标注来源与实际模型（降级也要标；这里没有降级路径）
+        asr_source: 'openrouter',
+        asr_model: asrModel,
+        asrProvider: 'openrouter-asr',
+      },
+    };
+  };
+
+  /**
+   * 视频/音频任务：本地路径（faster-whisper / 抽帧 / 导图）。
+   *
+   * ⚠️ **ASR 已改走云端**（见 :func:`asrViaOpenRouter`）：本函数的 `asr` 分支不再用本地转写。
+   * 保留本地实现作**显式可选**路径（离线/降级场景），但**默认不走**、也**不许静默降级**。
    */
   const videoJob = (job: 'asr' | 'video' | 'slides' | 'mindmap'): TaskHandler => async (ctx) => {
     const docId = ctx.docId;
@@ -829,6 +1018,9 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
     const doc = repo.getDocumentRow(docId);
     if (!doc) throw new ApiError('E_NOTFOUND', `文档不存在：${docId}`);
     const absPath = path.isAbsolute(doc.source_path) ? doc.source_path : path.join(cfg.root, doc.source_path);
+
+    // ★ ASR：云端（plan/convert）。**不走下面的本地 worker `asr` job**。
+    if (job === 'asr') return asrViaOpenRouter(ctx, docId, absPath);
 
     ctx.progress(0.05, '准备媒体处理');
     let result: Record<string, unknown>;
@@ -858,7 +1050,9 @@ export function createHandlers(deps: PipelineDeps): Record<string, TaskHandler> 
       throw err instanceof ApiError
         ? err
         : new ApiError('E_ASR_LOAD', `媒体处理失败：${err instanceof Error ? err.message : String(err)}`, {
-            hint: '本地 ASR 依赖 faster-whisper；可改用更小的模型或配置云端 provider',
+            hint:
+              '这条是**本地**媒体路径（抽帧/导图等）。ASR 已改为**云端 OpenRouter**（`asr` 任务走 plan/convert），' +
+              '若这里是 ASR 相关失败，请检查 .env 的 OPENROUTER_KEY 与 config/providers.yaml 的 openrouter_asr 配置。',
           });
     }
 

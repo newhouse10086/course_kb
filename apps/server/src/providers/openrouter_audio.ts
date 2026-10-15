@@ -9,16 +9,34 @@
  *    `"does not support 'mp3' when stream=true"` ⟹ 目标格式（wav/mp3）**由本地 ffmpeg 转**，
  *    **不是**请求参数。
  *
- * ## 模型选择（定价来自 Lead 的全量核查，写进注释防后人"升级"）
- * - TTS：**只能用 `openai/gpt-audio-mini`**（音频输出 $0.6/M）
- *   ⚠️ **千万不要换成 `openai/gpt-audio`** —— 音频输出 **$32/M，贵 53 倍**。
- *   ⚠️ **`google/lyria-3-*:free` 不是 TTS**（是**音乐生成**模型）—— 别被"免费 + 有音频输出"骗到。
- * - ASR：**`mistralai/voxtral-small-24b-2507`**（专用语音理解，in $0.1/M / out $0.3/M，**最便宜档**）。
- *   `openai/gpt-audio-mini` 也能转写，但它会"接着聊"而不是纯转写 → 仅作备选。
- * - **免费音频模型实测不可用**（403 agentic-only / 502），**不写进代码**。
+ * ## 模型选择（定价来自 `/api/v1/models` 权威字段 + 1 次真调用实测）
  *
- * ## 本地优先
- * ASR 的**首选仍是本地 faster-whisper**（免费、离线）；本 provider 是**可选备选**（`policy.asr: local-first` 自动保证）。
+ * ⚠️ **2026-10-16 修正**：原作者把几个数字**记混了**（$32/M 是 gpt-audio 的音频**输入**价，
+ * 它的音频**输出**是 $64/M；mini 的输出是 $2.4/M）。旧注释写"音频输出 $32/M，贵 53 倍"，
+ * 两个数字都不是输出价 —— **注释里的数字也会撒谎**，所以下面每个数字都标了出处。
+ *
+ * | 模型 | audio in | audio out | 用途 |
+ * |---|---|---|---|
+ * | `openai/gpt-audio-mini` | $0.6/M | **$2.4/M** | TTS ✅（默认） |
+ * | `openai/gpt-audio` | $32/M | **$64/M** | ❌ 音频输出是 mini 的 **26.7×** |
+ * | `mistralai/voxtral-small-24b-2507` | **$100/M**（$0.0001/audio-token，1 token=1 秒） | —（audio→text，无音频输出） | ASR ✅（默认） |
+ *
+ * ★ **注释不是守卫**（坑 24「死旋钮 / 承诺但不生效」的变体）：光写"千万不要换成 gpt-audio"，
+ * 后人改一行 `model:` 就绕过去了。所以这里改成**代码强制** —— 见
+ * :func:`assertAudioModelAffordable`：单价超上限 / 模型不合适 / 模型不在表里，一律**直接抛**。
+ * ⚠️ **`google/lyria-3-*:free` 不是 TTS**（是**音乐生成**模型）—— 别被"免费 + 有音频输出"骗到。
+ * `openai/gpt-audio-mini` 也能转写，但它会"接着聊"而不是纯转写 → 仅作备选。
+ * **免费音频模型实测不可用**（403 agentic-only / 502），**不写进代码**。
+ *
+ * ## ASR 走云端（2026-10-16 用户裁定）
+ * ★ **ASR 默认走 OpenRouter API（`mistralai/voxtral-small-24b-2507`），不再以本地 faster-whisper 为默认**。
+ * 本地实现保留为**显式可选**（离线/降级场景），但默认路径不许走它，**也不许静默降级回本地**：
+ * 云端不可用 → **如实报错 + 可读 reason**（`worker/video/cloud_asr.py` 里 plan/convert 分工，
+ * OpenRouter 调用只在本文件这一处）。
+ *
+ * ★ **实测计费口径（2026-10-16，30s 音频）**：`usage.cost = 0.0030593`
+ * ⟹ **≈$0.0061/分钟音频 ≈ $0.367/小时视频**；账单大头是**音频时长**（1 audio token = 1 秒），
+ * 不是文字 token。所以别用"in $0.1/M"去估 ASR 成本（会**严重低估**）。
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -31,6 +49,104 @@ import { ProviderError } from './types.ts';
 /** 默认模型（**不要改**，见文件头定价说明） */
 export const OPENROUTER_TTS_MODEL = 'openai/gpt-audio-mini';
 export const OPENROUTER_ASR_MODEL = 'mistralai/voxtral-small-24b-2507';
+
+// ═══════════════════════════════════════════════════════════════
+// ★ 单价守卫：把"注释里的警告"变成**代码强制**（坑 24）
+// ═══════════════════════════════════════════════════════════════
+
+/** 音频模型单价表（USD / 1M token；来自 `/api/v1/models` 的 `pricing` 字段，2026-10-16）。 */
+export const AUDIO_MODEL_PRICES: Record<
+  string,
+  { audioInPerM: number; audioOutPerM: number; modality: string; note?: string }
+> = {
+  'mistralai/voxtral-small-24b-2507': {
+    // usage: {"audio_tokens":30} 对应 30.0s 音频 ⟹ 1 audio token = 1 秒
+    audioInPerM: 100, // pricing.audio = "0.0001" /token × 1e6
+    audioOutPerM: 0,
+    modality: 'text+file+audio->text',
+    note: 'ASR 专用；实测 ≈$0.0061/分钟音频',
+  },
+  'openai/gpt-audio-mini': {
+    audioInPerM: 0.6,
+    audioOutPerM: 2.4,
+    modality: 'text+audio->text+audio',
+    note: 'TTS 默认；实测可用（见 providers_openrouter_audio.test.ts）',
+  },
+  'openai/gpt-audio': {
+    audioInPerM: 32,
+    audioOutPerM: 64,
+    modality: 'text+audio->text+audio',
+    note: '音频输出是 mini 的 26.7× —— 禁止用于 TTS',
+  },
+};
+
+/** TTS：音频**输出** token 价上限（USD/1M）。mini=2.4 ✅；gpt-audio=64 ❌ */
+export const TTS_AUDIO_OUTPUT_CEILING_USD_PER_M = 10;
+/** ASR：每分钟音频总成本上限（USD）。voxtral 实测 ≈0.0061 ✅ */
+export const ASR_USD_PER_AUDIO_MINUTE_CEILING = 0.05;
+
+/**
+ * ★ 单价守卫：模型**单价过高 / 不适合该用途 / 不在表里** → 直接抛。
+ *
+ * 存在理由（Lead 要求）：文件头写着"千万不要换成 `openai/gpt-audio`（音频输出 $64/M）"，
+ * 但**注释不是守卫** —— 改一行 `model:` 就绕过去了（坑 24：承诺但不生效）。
+ * 这里让它变成**可执行的约束**：配置阶段就失败，而不是等账单来了才发现。
+ *
+ * **fail-closed**：表里没有的模型一律拒绝（宁可让新人显式加表 + 填价，也不放行未知单价）。
+ *
+ * @throws ProviderError `E_PROVIDER_PRICE`
+ */
+export function assertAudioModelAffordable(model: string, kind: 'asr' | 'tts'): void {
+  const p = AUDIO_MODEL_PRICES[model];
+  if (!p) {
+    throw new ProviderError(
+      'E_PROVIDER_PRICE',
+      `音频模型 ${model} 不在单价表里（拒绝放行未知单价）`,
+      `请在 openrouter_audio.ts 的 AUDIO_MODEL_PRICES 里补上它的 pricing（来源：GET /api/v1/models）与 modality，` +
+        `并确认单价可接受；不要为了"先跑起来"绕过这个检查。`,
+    );
+  }
+  if (kind === 'tts') {
+    if (!p.modality.includes('audio') || !p.modality.split('->')[1]?.includes('audio')) {
+      throw new ProviderError(
+        'E_PROVIDER_PRICE',
+        `模型 ${model} 不是音频输出模型（modality=${p.modality}），不能用于 TTS`,
+        'TTS 需要形如 `text+audio->text+audio` 的模型（音频输出）。',
+      );
+    }
+    if (p.audioOutPerM > TTS_AUDIO_OUTPUT_CEILING_USD_PER_M) {
+      throw new ProviderError(
+        'E_PROVIDER_PRICE',
+        `模型 ${model} 音频输出 $${p.audioOutPerM}/M 超过上限 $${TTS_AUDIO_OUTPUT_CEILING_USD_PER_M}/M`,
+        `${p.note ?? ''}；TTS 请用 ${OPENROUTER_TTS_MODEL}（音频输出 $${AUDIO_MODEL_PRICES[OPENROUTER_TTS_MODEL]?.audioOutPerM}/M）。`,
+      );
+    }
+    return;
+  }
+  // ASR：必须是"音频输入 → **纯文本输出**"，且每分钟音频总成本可接受
+  //
+  // ⚠️ 判据必须是**输出侧恰好是 text**，不能用 `modality.includes('audio->text')`：
+  //    `text+audio->text+audio`（gpt-audio）里**也**含有子串 `audio->text`！
+  //    第一版就是这么写的 → gpt-audio 被放行当 ASR（红证当场抓到）。
+  const [inSide, outSide] = p.modality.split('->');
+  if (!inSide?.includes('audio') || outSide?.trim() !== 'text') {
+    throw new ProviderError(
+      'E_PROVIDER_PRICE',
+      `模型 ${model} 不适合做 ASR（modality=${p.modality}）`,
+      `ASR 需要形如 \`text+file+audio->text\` 的模型（输出侧**恰好是 text**）；${model} 的输出侧是 ` +
+        `"${outSide ?? ''}"（双向音频模型会"接着聊"而不是纯转写）。ASR 请用 ${OPENROUTER_ASR_MODEL}。`,
+    );
+  }
+  // 1 audio token = 1 秒音频（实测）⟹ 每分钟 60 个 audio token
+  const perMinute = (60 * p.audioInPerM) / 1_000_000;
+  if (perMinute > ASR_USD_PER_AUDIO_MINUTE_CEILING) {
+    throw new ProviderError(
+      'E_PROVIDER_PRICE',
+      `模型 ${model} 音频输入约 $${perMinute.toFixed(4)}/分钟，超过上限 $${ASR_USD_PER_AUDIO_MINUTE_CEILING}/分钟`,
+      `${p.note ?? ''}；ASR 请用 ${OPENROUTER_ASR_MODEL}（实测 ≈$0.0061/分钟）。`,
+    );
+  }
+}
 
 /** ★ stream 时**唯一**允许的音频格式（Lead 实测：传 mp3 → 400） */
 export const OPENROUTER_STREAM_AUDIO_FORMAT = 'pcm16';
@@ -166,6 +282,8 @@ function connOf(entry: ProviderConfigEntry, modelDefault: string): {
 export function createOpenRouterTts(entry: ProviderConfigEntry): CloudTts {
   const o = entry.options ?? {};
   const conn = connOf(entry, OPENROUTER_TTS_MODEL);
+  // ★ 单价守卫（fail-closed）：换成 gpt-audio 之类 → 这里当场抛，不等账单
+  assertAudioModelAffordable(conn.model, 'tts');
   const voice = optStr(o, 'voice', 'alloy');
   const maxChars = optNum(o, 'max_chars_per_request', 1024);
   const formats = Array.isArray(o.formats) && o.formats.length > 0 ? (o.formats as string[]) : ['wav', 'mp3'];
@@ -246,6 +364,8 @@ export function createOpenRouterTts(entry: ProviderConfigEntry): CloudTts {
 
 export function createOpenRouterAsr(entry: ProviderConfigEntry): CloudAsr {
   const conn = connOf(entry, OPENROUTER_ASR_MODEL);
+  // ★ 单价守卫（fail-closed）：不是 audio→text 的模型（如 gpt-audio）→ 当场抛
+  assertAudioModelAffordable(conn.model, 'asr');
 
   const transcribe = async (req: { audioPath: string; durationMs?: number; language?: string; signal?: AbortSignal }) => {
     const buf = fs.readFileSync(req.audioPath);
@@ -291,7 +411,10 @@ export function createOpenRouterAsr(entry: ProviderConfigEntry): CloudAsr {
     label: String(entry.options?.label ?? 'OpenRouter ASR（voxtral-small）'),
     vendor: 'OpenRouter',
     wordTimestamps: false, // ★ 不谎报：本路径不产出字级时间戳
-    pricing: { unit: 'per_minute', amount: 0.0001, currency: 'USD' },
+    // ⚠️ 2026-10-16 修正：原来写 `per_minute: 0.0001`（≈$0.0001/分钟）—— **比实测低 61 倍**，
+    //    属于"自述字段与实际不同源"（坑 21），会让用户拿它算预算时严重低估。
+    //    实测（1 次真调用，30.0s 音频）：usage.cost=0.0030593 ⟹ $0.0030593/30s = 0.0061186/分钟。
+    pricing: { unit: 'per_minute', amount: 0.0061186, currency: 'USD' },
     ...(conn.notConfiguredReason ? { notConfiguredReason: conn.notConfiguredReason } : {}),
     probe: async (signal) => {
       // 真探测：0.1s 静音 WAV（极短，成本可忽略）→ 必须拿到**非空**转写

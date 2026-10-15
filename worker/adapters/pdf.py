@@ -49,6 +49,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -115,11 +117,115 @@ OCR_MIN_PAGE_CHARS = 8
 #: 上限可用环境变量 ``COURSE_KB_OCR_MAX_PAGES`` 覆盖。
 #:
 #: `[实测]` 为什么必须设上限：CPU ONNX 推理 **~9 秒/页**（200 DPI，本机无 GPU）。
-#: 434 页扫描件全量 OCR ≈ **65 分钟**，超出用户对单次上传的容忍度。
-#: 取 300 页 ≈ 45 分钟（仍是长任务，但配断点可接受）；超出部分**如实标注未 OCR**。
-DEFAULT_OCR_MAX_PAGES = 300
+#: 图片型 PDF 最多 OCR 多少页。**0 = 不限制（默认）**。
+#:
+#: ## ★★ 用户裁定（2026-10-16）：取消上限
+#: > **"要取消啊，肯定要取消的，真正投入生产，这是为了教育事业，投资肯定要在合理范围内大力的"**
+#:
+#: ⟹ **默认 0 = 全部页都 OCR**（434 页就 434 页）。
+#: `COURSE_KB_OCR_MAX_PAGES` **保留可配** —— 留给"紧急限成本"的场景。
+#:
+#: ⚠️ **历史**：本项原为 `300`，理由是"434 页本地 OCR ≈ 65 分钟，超出容忍度"。
+#: 那个理由在**本地 CPU OCR**（~9-12s/页）下成立；改走**云端 OpenRouter**
+#: （`[实测-外部]` 3.8-5.5s/页）后工时大幅下降，且用户明确"投资要大力"。
+#: ⟹ **不许再用"省钱/省时"当理由做静默截断**；
+#:    成本要**摆到用户面前让他决定**（见 `estimate_ocr_cost`），而不是替他省。
+DEFAULT_OCR_MAX_PAGES = 0
 
-#: OCR 引擎实例缓存。
+#: OCR 引擎实现选择（**默认云端，用户指令**）。
+#:
+#: ## ★★ 用户指令（2026-10-16）
+#: > **"openrouter的ocr模型用的是什么模型？这里不要接本地的模型，这里的处理和视频接的语音转文字模型一个方案"**
+#:
+#: ⟹ **默认必须是云端 OpenRouter**，**不许静默降级回本地 rapidocr**。
+#:
+#: ## 两种实现（**同一入口，显式选择**）
+#: | 值 | 行为 | 谁调 OpenRouter |
+#: |---|---|---|
+#: | `'cloud'`（**默认**）| worker 只**渲染**页 → 图；由 **Node 调 OpenRouter** 后回传文本 | `providers/openrouter_ocr.ts`（**唯一一处实现**）|
+#: | `'local'` | worker 自己调本地 rapidocr | —（显式选才走）|
+#: | `'off'` | 不 OCR，如实标注 | — |
+#:
+#: ## 为什么 `cloud` 是"两阶段"而不是 worker 自己发 HTTP
+#: `AGENTS.md §0`：**Node 是编排者，Python 是计算器**。
+#: 若 worker 自己用 Python 调 OpenRouter，就会出现**第二套 OCR 实现**
+#: （第二份提示词/模型名/降级链）—— 正是坑 27「两条路径 = 两套真相」的形状。
+#: 两阶段做法：worker 渲染（PyMuPDF 是 Python 的活）+ Node 调 API（provider 在 Node）
+#: ⟹ **OpenRouter 调用只存在一处**。
+OCR_MODE_CLOUD = "cloud"
+OCR_MODE_LOCAL = "local"
+OCR_MODE_OFF = "off"
+
+#: 默认 OCR 模式 —— **云端**（用户指令）。
+DEFAULT_OCR_MODE = OCR_MODE_CLOUD
+
+#: 云端 OCR 的**预计单页耗时（秒）**，用于诚实的耗时/成本预估。
+#: ⚠️ `[实测-外部]` Lead 实测：glm-5.3-flash **3821ms/页**、gemini-2.5-flash-lite **5460ms/页**。
+#: 本值取较快档 + 网络余量，仅用于**预估提示**；真实耗时由实测更新。
+CLOUD_OCR_SECS_PER_PAGE_EST = 3.82
+
+#: 云端 OCR **每页 token 的实测值**（用于计费估算）。
+#:
+#: ★★ `[实测]` 本机真端点探测（2026-10-16，`qwen/qwen3-vl-235b-a22b-instruct`，
+#: 真实教材页 = 434 页扫描件第 30 页，150 DPI → 166KB JPEG）：
+#: ```
+#: prompt_tokens  = 1457 / 页
+#: completion_tokens = 533 / 页
+#: ```
+#: ⚠️ **原估算错了 6.5 倍**：我原来只按 2000 prompt tokens × $0.0001/1K 算 → $0.0002/页。
+#: 真实成本是 **$0.00132/页** —— 因为**输出 token 单价是输入的 9 倍**
+#: （in $0.21/M vs out $1.90/M），**输出占比 27% 却贡献 77% 的费用**。
+#: ⟹ 教训：**算 token 成本必须把输入与输出分开**，不能只按一个单价乘总量。
+CLOUD_OCR_PROMPT_TOKENS_PER_PAGE = 1457
+CLOUD_OCR_COMPLETION_TOKENS_PER_PAGE = 533
+
+#: 模型单价（USD / 1M tokens）—— `[实测-外部]` OpenRouter 模型 API 报价。
+#: 默认对应主模型 `qwen/qwen3-vl-235b-a22b-instruct`（in $0.21/M · out $1.90/M）。
+CLOUD_OCR_USD_PER_M_INPUT = 0.21
+CLOUD_OCR_USD_PER_M_OUTPUT = 1.90
+
+
+def estimate_ocr_cost(pages: int, *, mode: str = OCR_MODE_CLOUD) -> dict:
+    """OCR 的**耗时与计费估算**（估算值，如实标明口径）。
+
+    为什么要它：用户说"投资要在合理范围内大力的" ⟹
+    **不是替他把页数砍掉，而是把成本摆出来让他自己决定**。
+    """
+    pages = max(0, int(pages))
+    if mode == OCR_MODE_LOCAL:
+        return {
+            "mode": "local",
+            "pages": pages,
+            "est_seconds": pages * 12.8,      # `[实测]` 20 页连续样本 12.79s/页
+            "est_minutes": round(pages * 12.8 / 60, 1),
+            "est_usd": 0.0,
+            "billing_note": "本地 OCR：不产生 API 费用，但占用 CPU（~12.8 秒/页）。",
+        }
+    tokens_in = pages * CLOUD_OCR_PROMPT_TOKENS_PER_PAGE
+    tokens_out = pages * CLOUD_OCR_COMPLETION_TOKENS_PER_PAGE
+    # ★ 输入/输出**分开算**（单价差 9 倍；只按一个单价乘总量会低估 6.5 倍 —— 见常量注释）
+    usd = tokens_in / 1_000_000 * CLOUD_OCR_USD_PER_M_INPUT + tokens_out / 1_000_000 * CLOUD_OCR_USD_PER_M_OUTPUT
+    secs = pages * CLOUD_OCR_SECS_PER_PAGE_EST
+    return {
+        "mode": "cloud",
+        "pages": pages,
+        "est_seconds": round(secs, 1),
+        "est_minutes": round(secs / 60, 1),
+        # ⚠️ 口径写清楚：按**图片 token**计费（输入+输出分开），不是按次
+        "est_usd": round(usd, 4),
+        "est_tokens_input": tokens_in,
+        "est_tokens_output": tokens_out,
+        "billing_note": (
+            f"云端 OCR（OpenRouter 视觉模型）：按 **token** 计费（输入+输出分开算）——"
+            f"实测 **{CLOUD_OCR_PROMPT_TOKENS_PER_PAGE} in + {CLOUD_OCR_COMPLETION_TOKENS_PER_PAGE} out** tokens/页；"
+            f"单价 in ${CLOUD_OCR_USD_PER_M_INPUT}/M · out ${CLOUD_OCR_USD_PER_M_OUTPUT}/M；"
+            f"{pages} 页 ≈ **${usd:.4f}**（USD，估算；**以 OpenRouter 账单为准**）"
+        ),
+        "time_note": f"约 {CLOUD_OCR_SECS_PER_PAGE_EST}s/页（实测档）→ {pages} 页约 {round(secs / 60, 1)} 分钟",
+    }
+
+
+#: OCR 引擎实例缓存（**仅 `mode='local'` 用**）。
 #:
 #: `[实测]` **每次新建 `RapidOCR()` 要 13.9s，复用只要 9.0s**（省 ~35%）。
 #: 原错误写法（我第一版就是）：跟 `worker/video/slides.py::ocr_image` 一样
@@ -462,55 +568,115 @@ def ocr_pages(
     path: str,
     pages: Iterable[int],
     *,
+    mode: str = DEFAULT_OCR_MODE,
     dpi: int = OCR_RENDER_DPI,
     on_progress: ProgressFn | None = None,
     max_pages: int = 0,
     base_frac: float = 0.0,
     span_frac: float = 1.0,
+    out_dir: str = "",
+    cloud_texts: dict[int, str] | None = None,
 ) -> dict:
-    """**按页** OCR：返回 ``{页号: 该页识别文本}`` + 如实的能力/meta。
+    """按页 OCR：返回 ``{页号: 该页识别文本}`` + 如实的 meta。
 
-    设计要点（见模块 docstring）：
-    * 页号由**我们**掌握 → 不需要坐标也能保住页码回溯；
-    * **绝不伪造坐标**：本函数不返回任何 ``box``；
-    * OCR 不可用 → **不抛异常**，返回空 ``texts`` + ``available=False`` + 可读 reason
-      （调用方据此如实标注，而不是静默产出空正文）。
+    ## 两种模式（`mode`，**默认 `'cloud'`** —— 用户指令）
+    * **`'cloud'`（默认）**：worker **只渲染**，**不调任何模型**。
+      返回 ``images``（页→图路径），由 **Node 调 OpenRouter**（唯一实现处）。
+      若调用方已把 Node 的 OCR 结果通过 ``cloud_texts`` 传回（第二阶段），
+      则本函数直接把文本填进 ``texts``。
+    * **`'local'`**：worker 自己调本地 rapidocr（**仅显式选择时**）。
+
+    ## ★★ 硬约束
+    * **不许静默降级回本地**：`mode='cloud'` 且拿不到云端文本时，
+      **如实标注** `skipped='cloud_ocr_not_provided'` + 可读 reason，
+      **绝不偷偷用 rapidocr**（那会违背用户指令，且让 `ocr_engine` 自述失真 —— 坑 21）。
+    * **绝不伪造坐标**：不返回 `box`；页内顺序标 `approx`。
+    * 与 `_OCR_ENGINE_CACHE` 同源 —— 本地引擎只在 `mode='local'` 时才初始化。
     """
-    cap = ocr_availability()
     page_list = [int(p) for p in pages]
     if max_pages and max_pages > 0:
         page_list = page_list[:max_pages]
 
     out: dict[int, str] = {}
+    cost = estimate_ocr_cost(len(page_list), mode=mode)
     meta: dict = {
-        "configured": cap["configured"],
-        "available": cap["available"],
-        "engine": cap["engine"],
-        "reason": cap["reason"],
+        "ocr_mode": mode,
         "pages_requested": len(page_list),
         "pages_ocr_ok": 0,
         "pages_empty": 0,
         "dpi": dpi,
-        # 如实标注：视觉 OCR 无检测框，页内顺序是"近似"
+        # 如实：LLM 型 OCR 无检测框，页内顺序是"近似"
         "within_page_order": "approx",
         "box": None,
+        "cost_estimate": cost,
     }
+
     if not page_list:
-        meta["reason"] = meta["reason"] or "没有需要 OCR 的页"
-        return {"texts": out, "meta": meta}
+        meta["reason"] = "没有需要 OCR 的页"
+        meta["chars_ocr"] = 0
+        return {"texts": out, "meta": meta, "images": []}
+
+    # ── 云端模式：渲染 → 交给 Node（唯一 OpenRouter 实现处）──────────────
+    if mode == OCR_MODE_CLOUD:
+        meta["engine"] = "openrouter"
+
+        # ★ 第二阶段**不需要**图片文件：cloud_texts 以**页号**为键，
+        #   而页号由我们自己掌握 ⟹ **跳过渲染**，省掉一整趟 434 页的渲染开销。
+        if cloud_texts is not None:
+            meta["stage"] = "cloud_texts_applied"
+            meta["available"] = True
+            meta["configured"] = True
+            meta["pages_rendered"] = 0
+            for pg in page_list:
+                txt = (cloud_texts.get(pg) or "").strip()
+                if len(txt) >= OCR_MIN_PAGE_CHARS:
+                    out[pg] = txt
+                    meta["pages_ocr_ok"] += 1
+                else:
+                    meta["pages_empty"] += 1
+            meta["chars_ocr"] = sum(len(t) for t in out.values())
+            if meta["pages_ocr_ok"] == 0:
+                meta["reason"] = (
+                    f"云端 OCR 对 {len(page_list)} 页均未返回可用文字（每页 < {OCR_MIN_PAGE_CHARS} 字符）"
+                    f"→ 这些页可能确实没有文字"
+                )
+            return {"texts": out, "meta": meta, "images": []}
+
+        render_dir = out_dir or os.path.join(tempfile.gettempdir(), f"pdfocr_{os.getpid()}_{int(time.time())}")
+        rendered = render_pages_to_images(
+            path, page_list, render_dir,
+            dpi=dpi, on_progress=on_progress, max_pages=max_pages,
+        )
+        meta["renderer"] = rendered["meta"].get("renderer")
+        meta["pages_rendered"] = rendered["meta"].get("pages_rendered", 0)
+        meta["pages_render_failed"] = rendered["meta"].get("pages_failed", 0)
+        images = rendered["images"]
+
+        # ★ 第一阶段结束：等 Node 调 OpenRouter 后回传。
+        #    **绝不**在这里 fallback 到本地 —— 如实说明"文本尚未提供"。
+        meta["available"] = True          # 云端通道可用（凭据/模型由 Node 判定）
+        meta["configured"] = True
+        meta["stage"] = "rendered_awaiting_cloud_ocr"
+        meta["reason"] = (
+            f"已渲染 {len(images)} 页待云端 OCR；"
+            f"由 Node 的 providers.recognize() 调用 OpenRouter（{cost['billing_note']}）"
+        )
+        return {"texts": out, "meta": meta, "images": images}
+
+    # ── 本地模式（**仅显式选择**）────────────────────────────────────────
+    cap = ocr_availability()
+    meta.update({"configured": cap["configured"], "available": cap["available"],
+                 "engine": cap["engine"], "reason": cap["reason"]})
     if not cap["available"]:
-        # ★ 不抛异常、不产假文本：调用方必须能区分"没正文"与"没 OCR"
-        meta["skipped"] = "ocr_unavailable"
-        return {"texts": out, "meta": meta}
+        meta["skipped"] = "local_ocr_unavailable"
+        return {"texts": out, "meta": meta, "images": []}
 
     try:
         import fitz
     except ImportError as exc:  # pragma: no cover
         meta["available"] = False
         meta["reason"] = f"PyMuPDF 不可用：{exc}"
-        return {"texts": out, "meta": meta}
-
-    from worker.video.slides import ocr_availability as _video_ocr_availability  # noqa: F401
+        return {"texts": out, "meta": meta, "images": []}
 
     doc = fitz.open(str(path))
     try:
@@ -521,7 +687,7 @@ def ocr_pages(
         except Exception as exc:  # noqa: BLE001
             meta["available"] = False
             meta["reason"] = f"OCR 引擎初始化失败（{engine}）：{type(exc).__name__}: {exc}"
-            return {"texts": out, "meta": meta}
+            return {"texts": out, "meta": meta, "images": []}
 
         for idx, pg in enumerate(page_list, 1):
             tmp_png = ""
@@ -529,8 +695,6 @@ def ocr_pages(
                 page = doc[pg - 1]
                 pix = page.get_pixmap(dpi=int(dpi))
                 # 用临时文件：rapidocr 的 API 接受路径（与 video 侧同一调用形态）
-                import tempfile
-
                 fd, tmp_png = tempfile.mkstemp(suffix=".png", prefix="pgocr_")
                 os.close(fd)
                 pix.save(tmp_png)
@@ -566,11 +730,82 @@ def ocr_pages(
             f"OCR 可用（{cap['engine']}）但对 {len(page_list)} 页均未识别出文字"
             f"（每页 < {OCR_MIN_PAGE_CHARS} 字符）→ 该 PDF 可能是空白页/纯图无文字"
         )
-    return {"texts": out, "meta": meta}
+    return {"texts": out, "meta": meta, "images": []}
+
+
+def render_pages_to_images(
+    path: str,
+    pages: Iterable[int],
+    out_dir: str,
+    *,
+    dpi: int = OCR_RENDER_DPI,
+    on_progress: ProgressFn | None = None,
+    max_pages: int = 0,
+) -> dict:
+    """把指定页渲染成 PNG 文件（**云端 OCR 的第一阶段**）。
+
+    为什么拆出这一步：`AGENTS.md §0`「**Node 是编排者，Python 是计算器**」——
+    渲染 PDF 页是 PyMuPDF（Python）的活，而**调用 OpenRouter 必须只有一处**
+    （`apps/server/src/providers/openrouter_ocr.ts`）。
+    两阶段为此：worker 渲染 → Node 调 API → 文本回流建单元。
+
+    :return: ``{"images": [{"page": 1, "path": "..."}, ...], "meta": {...}}``
+        ⚠️ `meta` **不谎称已 OCR**：这里只渲染，`ocr_engine` 由 Node 回填。
+    """
+    try:
+        import fitz
+    except ImportError as exc:  # pragma: no cover
+        return {"images": [], "meta": {"available": False, "reason": f"PyMuPDF 不可用：{exc}"}}
+
+    page_list = [int(p) for p in pages]
+    if max_pages and max_pages > 0:
+        page_list = page_list[:max_pages]
+    os.makedirs(out_dir, exist_ok=True)
+
+    images: list[dict] = []
+    meta: dict = {
+        "renderer": "pymupdf",
+        "dpi": dpi,
+        "pages_requested": len(page_list),
+        "pages_rendered": 0,
+        "pages_failed": 0,
+        # 如实：**没有坐标**（视觉 LLM OCR 无检测框）
+        "box": None,
+        "within_page_order": "approx",
+    }
+    if not page_list:
+        meta["reason"] = "没有需要渲染的页"
+        return {"images": images, "meta": meta}
+
+    doc = fitz.open(str(path))
+    try:
+        for idx, pg in enumerate(page_list, 1):
+            out_png = os.path.join(out_dir, f"page_{pg:06d}.png")
+            try:
+                page = doc[pg - 1]
+                pix = page.get_pixmap(dpi=int(dpi))
+                pix.save(out_png)
+                images.append({"page": pg, "path": out_png})
+                meta["pages_rendered"] += 1
+            except Exception as exc:  # noqa: BLE001 - 单页渲染失败不该毁整篇
+                log.warning("第 %s 页渲染失败：%s", pg, exc)
+                meta["pages_failed"] += 1
+            if on_progress:
+                report(on_progress, idx / max(1, len(page_list)), f"渲染第 {pg} 页（{idx}/{len(page_list)}）")
+    finally:
+        doc.close()
+
+    meta["out_dir"] = out_dir
+    return {"images": images, "meta": meta}
 
 
 def _env_ocr_max_pages() -> int:
-    """``COURSE_KB_OCR_MAX_PAGES`` 覆盖 OCR 页数上限（0/非法 → 默认值）。"""
+    """``COURSE_KB_OCR_MAX_PAGES`` 覆盖 OCR 页数上限。
+
+    **默认 0 = 不限制**（用户裁定取消上限）。
+    环境变量设为正整数时启用限流（**紧急限成本**用）；
+    设为 ``0`` 或非法值 → 不限制。
+    """
     raw = os.environ.get("COURSE_KB_OCR_MAX_PAGES", "").strip()
     if raw:
         try:
@@ -595,17 +830,26 @@ class PdfAdapter(DocumentAdapter):
         max_pages_per_unit: int = MAX_PAGES_PER_UNIT,
         max_pages: int = 0,
         ocr: str = "auto",
+        ocr_mode: str = DEFAULT_OCR_MODE,
         ocr_dpi: int = OCR_RENDER_DPI,
         ocr_max_pages: int = 0,
+        cloud_ocr_texts: dict[int, str] | None = None,
     ):
         self.max_pages_per_unit = max(1, int(max_pages_per_unit))
         #: >0 时只解析前 N 页（调试/测试用；0 = 全篇）
         self.max_pages = max(0, int(max_pages))
-        #: OCR 策略：``auto``（默认，逐页判定后自动 OCR）| ``off``（显式关闭，如实标注）
+        #: 旧开关：``auto`` | ``off``（**保留兼容**；`off` 等价于 `ocr_mode='off'`）
         self.ocr = ocr if ocr in ("auto", "off") else "auto"
+        #: ★ OCR 模式：``cloud``（默认，用户指令）| ``local`` | ``off``
+        self.ocr_mode = ocr_mode if ocr_mode in (OCR_MODE_CLOUD, OCR_MODE_LOCAL, OCR_MODE_OFF) else DEFAULT_OCR_MODE
+        if self.ocr == "off":
+            self.ocr_mode = OCR_MODE_OFF
         self.ocr_dpi = max(72, int(ocr_dpi))
-        #: OCR 页数上限；0 = 用 ``DEFAULT_OCR_MAX_PAGES``（防扫描件把 worker 跑死）
+        #: OCR 页数上限；0 = **不限制**（用户裁定取消上限）。
+        #: ``COURSE_KB_OCR_MAX_PAGES`` 可覆盖（紧急限成本用）。
         self.ocr_max_pages = max(0, int(ocr_max_pages)) or _env_ocr_max_pages()
+        #: ★ 云端模式第二阶段：Node 已 OCR 好的 ``{页号: 文本}``（None = 第一阶段）
+        self.cloud_ocr_texts = cloud_ocr_texts
 
     def can_handle(self, path: str) -> bool:
         if Path(path).suffix.lower() in self.extensions:
@@ -699,13 +943,23 @@ class PdfAdapter(DocumentAdapter):
                     ocr_result = ocr_pages(
                         str(p),
                         ocr_pages_list,
+                        mode=self.ocr_mode,
                         dpi=self.ocr_dpi,
                         on_progress=on_progress,
                         max_pages=max_ocr,
                         base_frac=0.10,
                         span_frac=0.25,
+                        # ★ 云端模式下：调用方（Node）已把 OCR 文本按页回传时，直接用它
+                        **({"cloud_texts": self.cloud_ocr_texts} if self.cloud_ocr_texts is not None else {}),
                     )
                 meta["ocr"] = ocr_result["meta"]
+                # ★ 云端模式第一阶段：把"待 OCR 的页图清单"交给调用方（Node）
+                #   —— 只有一处 OpenRouter 实现（providers/openrouter_ocr.ts）
+                if ocr_result.get("images"):
+                    meta["ocr_images"] = ocr_result["images"]
+                    meta["ocr_awaiting_cloud"] = bool(
+                        ocr_result["meta"].get("stage") == "rendered_awaiting_cloud_ocr"
+                    )
                 # ★ 如实标注"因上限而未 OCR 的页" —— 绝不假装全篇都 OCR 过
                 if skipped_by_cap:
                     meta["ocr"]["pages_skipped_by_cap"] = skipped_by_cap
@@ -734,8 +988,7 @@ class PdfAdapter(DocumentAdapter):
             meta["body_chars_sampled"] = total_body_chars
             meta["body_chars_sampled_pages"] = min(200, len(probe_pages))
 
-            # ── ★ 逐页 text_origin（来源标记）───────────────────────────
-            # 本页正文是"原生文字层"还是"OCR 识别出来的"？—— 下游据此做**诊断与前端标注**。
+            # ── ★ 逐页 text_origin（来源标记）───────────────────────────            # 本页正文是"原生文字层"还是"OCR 识别出来的"？—— 下游据此做**诊断与前端标注**。
             #
             # ⚠️ **提示词不按它分化**（只加一条通用约束，见 `worker/MULTIFORMAT.md` §6）——
             #    `text_origin` **不是提示词开关**，4 种类型 × 提示词分身 = 4 份真相必然漂移。

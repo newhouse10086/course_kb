@@ -960,25 +960,29 @@ def main() -> int:
             dom = driver.ch.outer_html()
             ok("文档页有「重新解析」入口（后端端点有了，前端要能点到）",
                'data-testid="btn-reparse"' in dom)
-            ok("★ 按钮**暂时禁用**（后端会清空卡片的 bug 修复中）",
-               driver.ch.evaluate("document.querySelector('[data-testid=\"btn-reparse\"]').disabled === true"))
-            gate = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_gate_reason\"]')||{{}}).textContent || ''")
-            ok("★ 禁用理由如实显示（不是静默禁用）", "清空已有卡片" in str(gate), str(gate)[:80])
+            # ★ 已开放（Lead 真数据验证：units=4 · cards=5）→ 断言方向翻转
+            ok("★ 按钮**已开放**（后端保卡修复已真数据验证）",
+               driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"btn-reparse\"]')).disabled === false")
+               and 'data-reparse-enabled="1"' in dom)
+            ok("★ 旧的禁用理由文案已移除（完成使命）", 'data-testid="reparse_gate_reason"' not in dom)
             # ⚠️ 按**目标文档**限定（第一行是 video，page_count=0 → "页数未知"；我第一版就读错了行）
             est = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_estimate\"]')||{{}}).textContent || ''")
             ok("★ 代价可见：给**区间**（不是假精确的单个数）", "–" in str(est) or "-" in str(est), str(est))
             ok("★ 代价里写明 OCR 本地、不耗 LLM 额度但占 CPU",
                "不消耗 LLM 额度" in str(est) and "CPU" in str(est), str(est))
-            # ★★ 判据：**禁用状态下点击不发请求**（不许"看起来禁用了其实能点"）
+            # ★ 现在点击**应该真的发请求**（与"禁用时不许发"互为反例 —— 同一判据的两个方向都要有）
             before = api("/api/v1/_fixture/reparse_calls").get("calls")
             driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"btn-reparse\"]')).click()")
-            time.sleep(1.0)
+            time.sleep(1.5)
             after = api("/api/v1/_fixture/reparse_calls").get("calls")
-            ok("★★ 禁用状态点击**不发请求**（调用数不变）", int(before) == int(after), f"calls {before} → {after}")
-            # 点击后应显示禁用理由（不是"已提交"）
+            ok("★★ 开放后点击**真的发请求**（调用数 +1）", int(after) > int(before), f"calls {before} → {after}")
+            # ★ 服务端给的代价在**独立持久元素**里（不被进度帧冲掉）—— 用户整个任务期间都能看到"要等多久"
+            cost = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_server_cost\"]')||{{}}).textContent || ''")
+            ok("★ 服务端代价**持久可见**：需 OCR + **区间** + cost_note",
+               "需 OCR" in str(cost) and "65–87" in str(cost) and "消耗 LLM 额度" in str(cost), str(cost)[:160])
             st = driver.ch.evaluate(f"({ROW}?.querySelector('[data-testid=\"reparse_state\"]')||{{}}).textContent || ''")
-            ok("禁用状态点击：只显示理由，不假装已入队",
-               "清空已有卡片" in str(st) or str(st) == "", str(st)[:100])
+            ok("★ 长任务进度可见（在动，不是卡死）",
+               "tsk_reparse_mock" in str(st) and ("%" in str(st) or "进行中" in str(st)), str(st)[:120])
 
         run_view("PDF 重新解析 / 入口 + 禁用 + 代价（禁用点击不发请求）", check_reparse_entry)
 
@@ -1133,6 +1137,133 @@ def main() -> int:
             api("/api/v1/_fixture/config?role=teacher&collections_missing=0")
 
         run_view("视频目录 / 学生视图 + 未实现如实说明", check_video_collections_student_and_missing)
+
+        # ============ 9b-16. 会话命名（契约 SESSION_NAMING §4）：行内重命名 + AI 起名 ============
+        def check_session_rename() -> None:
+            api("/api/v1/_fixture/config?rename_fail=0")
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"rename-start\"]').length >= 2", timeout=60, interval=0.3)
+            # ① 行内编辑：Enter 提交 → 乐观更新 + 服务端确认
+            before = api("/api/v1/_fixture/title_calls").get("rename")
+            # ★ 记下**要改的是哪一个会话**（坑 28：不靠"第一个"，按 id 限定读取）
+            target_id = str(driver.ch.evaluate("document.querySelector('[data-testid=\"rename-start\"]').dataset.id"))
+            driver.ch.evaluate("document.querySelector('[data-testid=\"rename-start\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"rename-input\"]')", timeout=30, interval=0.2)
+            ok("★ 行内编辑：有输入框 + 长度计数（0/80，服务端才是权威）",
+               'data-testid="rename-counter"' in driver.ch.outer_html()
+               and "80" in str(driver.ch.evaluate("document.querySelector('[data-testid=\"rename-counter\"]').textContent")))
+            driver.ch.evaluate("(() => { const i=document.querySelector('[data-testid=\"rename-input\"]');"
+                               " i.value='我改的名字'; i.dispatchEvent(new Event('input',{bubbles:true})); return 1 })()")
+            # ★ 先确认 v-model **真的**更新了（计数器是模型长度）—— 否则后面全是"输入没进去"的假象
+            cnt = str(driver.ch.evaluate("document.querySelector('[data-testid=\"rename-counter\"]').textContent"))
+            ok("行内编辑：输入后模型同步（计数器反映长度）", cnt.startswith("5/"), f"counter={cnt}")
+            driver.ch.evaluate("(() => { const i=document.querySelector('[data-testid=\"rename-input\"]');"
+                               " i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true})); return 1 })()")
+            time.sleep(1.2)
+            after = api("/api/v1/_fixture/title_calls").get("rename")
+            ok("★ Enter 提交 → 真的发了 PATCH（调用数 +1）", int(after) > int(before), f"{before} → {after}")
+            # ★ 按**目标 id** 读那一行（不读"第一个"）
+            t1 = driver.ch.evaluate(
+                f"document.querySelector('[data-testid=\"session-item\"][data-id=\"{target_id}\"] [data-testid=\"session-title\"]')?.textContent?.trim() || ''")
+            ok("★ 乐观更新：列表**立即**显示新名字", "我改的名字" in str(t1), f"target={target_id} title={t1}")
+            ok("★ 显示用服务端返回的 title_source（=user）",
+               "user" in str(driver.ch.evaluate("document.querySelector('[data-testid=\"session-title\"][data-title-source-server=\"user\"]')?.dataset?.titleSourceServer || ''")))
+            # ② Esc 取消：不改名、不发请求
+            before2 = api("/api/v1/_fixture/title_calls").get("rename")
+            driver.ch.evaluate("Array.from(document.querySelectorAll('[data-testid=\"rename-start\"]'))[1].click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"rename-input\"]')", timeout=30, interval=0.2)
+            driver.ch.evaluate("(() => { const i=document.querySelector('[data-testid=\"rename-input\"]');"
+                               " i.value='不该保存'; i.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " i.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); return 1 })()")
+            time.sleep(0.8)
+            after2 = api("/api/v1/_fixture/title_calls").get("rename")
+            ok("★ Esc 取消：**不发请求**（调用数不变）", int(before2) == int(after2), f"{before2} → {after2}")
+            ok("★ Esc 取消：输入框关闭且名字未变",
+               not driver.ch.evaluate("!!document.querySelector('[data-testid=\"rename-input\"]')")
+               and "不该保存" not in driver.ch.outer_html())
+            # ③ 空白名 → 本地拦截（不发请求）
+            before3 = api("/api/v1/_fixture/title_calls").get("rename")
+            driver.ch.evaluate("document.querySelector('[data-testid=\"rename-start\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"rename-input\"]')", timeout=30, interval=0.2)
+            driver.ch.evaluate("(() => { const i=document.querySelector('[data-testid=\"rename-input\"]');"
+                               " i.value='   '; i.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true})); return 1 })()")
+            time.sleep(0.8)
+            after3 = api("/api/v1/_fixture/title_calls").get("rename")
+            note = driver.ch.evaluate("(document.querySelector('[data-testid=\"rename-note\"]')||{}).textContent || ''")
+            ok("★ 空白名：本地拦截 + 如实提示（不发请求）",
+               int(before3) == int(after3) and "不能为空" in str(note), f"{before3} → {after3} / {note}")
+            driver.ch.evaluate("document.querySelector('[data-testid=\"rename-cancel\"]')?.click()")
+            # ④ AI 起名：可用时 → 生成中 → 更新为 AI 名（title_source=ai）
+            gen_before = api("/api/v1/_fixture/title_calls").get("generate")
+            driver.ch.evaluate("Array.from(document.querySelectorAll('[data-testid=\"title-generate\"]')).filter(b=>!b.disabled)[0].click()")
+            time.sleep(1.5)
+            gen_after = api("/api/v1/_fixture/title_calls").get("generate")
+            ok("★ AI 起名：点击真的发请求（调用数 +1）", int(gen_after) > int(gen_before), f"{gen_before} → {gen_after}")
+            ok("★ AI 起名：成功后名字更新且标记为 AI（title_source=ai）",
+               "AI" in driver.ch.outer_html() and 'data-testid="title-ai-mark"' in driver.ch.outer_html())
+            # ⑤ ★ `title_source==='user'` → AI 按钮**禁用**（服务端也会拒 409）
+            dis = driver.ch.evaluate(
+                "(() => { const b=document.querySelector('[data-testid=\"title-generate\"][data-title-source-server=\"user\"]');"
+                " return b ? b.disabled : null })()")
+            ok("★ 已由用户命名（title_source=user）→ AI 起名按钮**禁用**", dis is True, f"disabled={dis}")
+
+        run_view("会话命名 / 行内重命名 + AI 起名", check_session_rename)
+
+        # ============ 9b-17. 重命名**失败要回滚** + 如实提示（乐观更新的反例） ============
+        def check_rename_rollback() -> None:
+            api("/api/v1/_fixture/config?rename_fail=1")
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.wait_for("document.querySelectorAll('[data-testid=\"rename-start\"]').length >= 2", timeout=60, interval=0.3)
+            orig = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"session-title\"]')[0].textContent.trim()")
+            driver.ch.evaluate("document.querySelector('[data-testid=\"rename-start\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"rename-input\"]')", timeout=30, interval=0.2)
+            driver.ch.evaluate("(() => { const i=document.querySelector('[data-testid=\"rename-input\"]');"
+                               " i.value='注定失败的名字'; i.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " i.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true})); return 1 })()")
+            time.sleep(1.5)
+            now = driver.ch.evaluate("document.querySelectorAll('[data-testid=\"session-title\"]')[0].textContent.trim()")
+            note = driver.ch.evaluate("(document.querySelector('[data-testid=\"rename-note\"]')||{}).textContent || ''")
+            ok("★ 失败**回滚**原名（不留下没保存成功的名字）", str(now) == str(orig), f"{orig} → {now}")
+            ok("★ 失败**如实提示**（不是静默失败）", "回滚" in str(note) or "失败" in str(note), str(note)[:100])
+            api("/api/v1/_fixture/config?rename_fail=0")
+
+        run_view("会话命名 / 失败回滚 + 如实提示", check_rename_rollback)
+
+        # ============ 9b-18. 可用性三态文案（detecting / unavailable(reason)） ============
+        def check_availability_tristate() -> None:
+            # ① detecting：**"正在检测模型可用性（首次约 1 分钟）"**，且**不许**说成"可用/不可用"
+            api("/api/v1/_fixture/config?avail=detecting")
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            ROW_PDF = f"document.querySelector('[data-doc-avail=\"{DOC_PDF}\"]')"
+            driver.ch.wait_for(f"!!{ROW_PDF}", timeout=60, interval=0.3)
+            dtext = str(driver.ch.evaluate(f"({ROW_PDF}).textContent"))
+            ok("★ detecting 文案：正在检测模型可用性（首次约 1 分钟）",
+               "正在检测模型可用性" in dtext and "1 分钟" in dtext, dtext[:120])
+            ok("★★ detecting：不许显示成可用或不可用（探测未完成时不成立）",
+               "不可用" not in dtext, dtext[:120])
+            ok("★ detecting：任务侧 extract_note 逐字显示（含已等待 12s）",
+               "已等待 12s" in str(driver.ch.outer_html()), "缺少 extract_note")
+            ok("★ detecting：`data-availability` 如实标出状态机",
+               str(driver.ch.evaluate(f"({ROW_PDF}).dataset.availability")) == "detecting")
+            # ② unavailable：显示 **reason 原文** + 入口**禁用**（不画"能点但会失败"的按钮）
+            api("/api/v1/_fixture/config?avail=unavailable")
+            dump_dom(driver, url(normal, "docs"), "!!document.getElementById('docs-report')", timeout=120)
+            driver.ch.wait_for(f"!!{ROW_PDF}", timeout=60, interval=0.3)
+            utext = str(driver.ch.evaluate(f"({ROW_PDF}).textContent"))
+            ok("★ unavailable 文案：显示 reason **原文**",
+               "amr 返回 403" in utext and "凭据无效" in utext, utext[:160])
+            ok("★ unavailable：`data-availability` = unavailable",
+               str(driver.ch.evaluate(f"({ROW_PDF}).dataset.availability")) == "unavailable")
+            gate = driver.ch.evaluate(
+                f"(() => {{ const r={ROW_PDF}?.closest('tr'); const b=r?.querySelector('[data-testid=\"extract-start\"]');"
+                " return JSON.stringify({ has: !!b, disabled: b ? b.disabled : null, reason: b ? b.dataset.gateReason : '' }) })()")
+            gj = json.loads(gate)
+            ok("★★ unavailable：抽取入口禁用 + 逐字原因（不画能点但会失败的按钮）",
+               (gj["has"] is False) or (gj["disabled"] is True and "不可用" in str(gj["reason"])), gate)
+            api("/api/v1/_fixture/config?avail=")
+
+        run_view("可用性三态 / detecting + unavailable 文案", check_availability_tristate)
 
         # ============ 9c. 模式选择器（chat / agent）—— 用户需求，两个正交控件 ============
         def check_mode_switch() -> None:

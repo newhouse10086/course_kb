@@ -488,6 +488,13 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
   let AI_PARSE_CALLS = 0
   /** ★ 新建的目录（夹具静态列表之外，模拟"服务端真的存了"） */
   const CREATED_COLLECTIONS = []
+  /** ★ 会话命名夹具：`title_source` 由**服务端**给（default/user/ai）；含调用计数供断言 */
+  let RENAME_CALLS = 0
+  let GEN_CALLS = 0
+  const TITLE_STATE = new Map([
+    ['cnv_mock0001', { title: '新问答', title_source: 'default' }],
+    ['cnv_mock0002', { title: 'B+ 树节点分裂的代价', title_source: 'ai' }],
+  ])
   const CFG = { strip_unit_ids: false, no_video_artifact: false, uploads: [], role: 'teacher', running_llm: true,
     /** 检索帧用哪种模式（none/wiki/kg/rag）；kg_hit=1 时 kg 才有命中（默认 kg = 查了 0 命中） */
     retrieval: 'wiki', kg_hit: false,
@@ -499,8 +506,12 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     rich_answer: false,
     /** 连接后是否发 `history` 帧（夹具 ?history=1） */
     history: false,
+    /** ★ 抽取可用性三态夹具（?avail=detecting|unavailable）—— pi-bridge 的 ready/detecting/unavailable */
+    avail_state: '',
     /** 视频目录接口"未实现"注入（夹具 ?collections_missing=1） */
     collections_missing: false,
+    /** 重命名失败注入（夹具 ?rename_fail=1）：验证"乐观更新失败 → 回滚 + 如实提示" */
+    rename_fail: false,
     /** 会话登记失败注入（夹具 ?conv_fail=1）：验证"登记失败 → 输入禁用 + 可读提示" */
     conv_fail: false }
   globalThis.__MOCK_CFG__ = CFG   // capabilitiesPayload() 在顶层，靠它读到 fixture 开关
@@ -544,10 +555,18 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
   let release = null
   const holdWaiters = []
 
-  const server = http.createServer((req, res) => {
+  // ★ 必须 async：JSON 端点要 `await readJson(req)` 收请求体（mock 是裸 http server，没有 req.body）
+  const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://127.0.0.1')
     const p = u.pathname
     const q = u.searchParams
+      /** ★ 收 JSON body（mock 是裸 http server，**没有** `req.body`） */
+      const readJson = (r) => new Promise((resolve) => {
+        const chunks = []
+        r.on('data', (c) => chunks.push(c))
+        r.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')) } catch { resolve({}) } })
+      })
+
     const json = (obj, status = 200) => {
       const body = Buffer.from(JSON.stringify(obj), 'utf8')
       res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store' })
@@ -607,6 +626,34 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     // ★ 重新解析（202 契约）；`/_fixture/reparse_calls` 暴露调用次数给 e2e
     if (api === '/_fixture/reparse_calls') return json({ calls: REPARSE_CALLS })
     if (api === '/_fixture/ai_parse_calls') return json({ calls: AI_PARSE_CALLS })
+    if (api === '/_fixture/title_calls') return json({ rename: RENAME_CALLS, generate: GEN_CALLS })
+    // ★ 重命名（PATCH /conversations/:id {title}）→ 服务端返回 title_source:'user'
+    if (/^\/conversations\/[^/]+$/.test(api) && req.method === 'PATCH') {
+      RENAME_CALLS += 1
+      const id = api.split('/')[2]
+      const body = await readJson(req)
+      if (CFG.rename_fail) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        return res.end(JSON.stringify({ error: { code: 'E_MOCK', msg: '重命名失败（夹具注入）' } }))
+      }
+      const cur = TITLE_STATE.get(id) || { title: '新问答', title_source: 'default' }
+      const next = { title: String(body.title || '').slice(0, 80), title_source: 'user' }
+      TITLE_STATE.set(id, next)
+      return json({ conversation: { id, ...next, doc_id: null, created_at: Date.now() } })
+    }
+    // ★ AI 生成名字（POST /conversations/:id/title/generate）；已由用户命名 → 409 E_TITLE_USER_SET
+    if (/^\/conversations\/[^/]+\/title\/generate$/.test(api) && req.method === 'POST') {
+      GEN_CALLS += 1
+      const id = api.split('/')[2]
+      const cur = TITLE_STATE.get(id) || { title: '新问答', title_source: 'default' }
+      if (cur.title_source === 'user') {
+        res.writeHead(409, { 'Content-Type': 'application/json' })
+        return res.end(JSON.stringify({ error: { code: 'E_TITLE_USER_SET', msg: '会话已由用户手动命名，不覆盖' } }))
+      }
+      const next = { title: 'AI 起名：聚簇索引与回表代价', title_source: 'ai' }
+      TITLE_STATE.set(id, next)
+      return json({ conversation: { id, ...next, doc_id: null, created_at: Date.now() } })
+    }
     // ★ 视频目录（collections 契约）
     if (api === '/collections' && req.method === 'GET') {
       if (globalThis.__MOCK_CFG__?.collections_missing) {
@@ -624,7 +671,7 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       return json({ total: list.length, collections: list })
     }
     if (api === '/collections' && req.method === 'POST') {
-      const body = JSON.parse(String(req.body || '{}'))
+      const body = await readJson(req)
       if ((globalThis.__MOCK_CFG__?.role || 'teacher') !== 'teacher') {
         res.writeHead(403, { 'Content-Type': 'application/json' })
         return res.end(JSON.stringify({ error: { code: 'E_FORBIDDEN', msg: '只有教师可以建目录' } }))
@@ -654,6 +701,7 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     }
     // ★ 触发 AI 解析（POST /tasks {kind:'video_parse'}）
     if (api === '/tasks' && req.method === 'POST') {
+      void (await readJson(req))   // 收掉请求体（避免 keep-alive 下污染下一个请求）
       AI_PARSE_CALLS += 1
       return json({ task_id: 'tsk_aiparse_mock', status: 'queued' }, 202)
     }
@@ -670,8 +718,10 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
       return json({
         total: 2, offset: 0, limit: 50,
         conversations: [
-          { id: 'cnv_mock0001', title: '新问答', doc_id: null, created_at: Date.now() - 3600_000 },   // ★ 默认名（模拟用户痛点）
-          { id: 'cnv_mock0002', title: 'B+ 树节点分裂的代价', doc_id: null, created_at: Date.now() - 86_400_000 },
+          { id: 'cnv_mock0001', title: TITLE_STATE.get('cnv_mock0001').title,
+            title_source: TITLE_STATE.get('cnv_mock0001').title_source, doc_id: null, created_at: Date.now() - 3600_000 },
+          { id: 'cnv_mock0002', title: TITLE_STATE.get('cnv_mock0002').title,
+            title_source: TITLE_STATE.get('cnv_mock0002').title_source, doc_id: null, created_at: Date.now() - 86_400_000 },
         ],
       })
     }
@@ -701,6 +751,8 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         if (q.has('history')) CFG.history = ['1', 'true'].includes(q.get('history'))
         if (q.has('conv_fail')) CFG.conv_fail = ['1', 'true'].includes(q.get('conv_fail'))
         if (q.has('collections_missing')) CFG.collections_missing = ['1', 'true'].includes(q.get('collections_missing'))
+        if (q.has('rename_fail')) CFG.rename_fail = ['1', 'true'].includes(q.get('rename_fail'))
+        if (q.has('avail')) CFG.avail_state = String(q.get('avail') || '')
     // ⚠️ mock 里有**两个** server（normal/degraded），各自有自己的 CFG；而 WS 处理函数读的是
     //    `globalThis.__MOCK_CFG__`（谁后创建谁覆盖）→ 夹具必须**顺手把自己这份发布出去**，
     //    否则"给 normal 设的开关"会被 degraded 的 CFG 覆盖（实测：history 帧发不出来）
@@ -991,6 +1043,10 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
             // ★ 抽取状态夹具：`done_empty` = **跑完了但零卡片**（绝不能被显示成"成功"）；
             //   `needs_confirm` + 估算（**次数 + 时长都要有**，用户真正感受到的痛是"要等 3–7 小时"）
             meta: { toc_entries: 2545, chapters: 42, extract_status: 'done_empty', needs_confirm: true,
+              ...(globalThis.__MOCK_CFG__?.avail_state === 'detecting'
+                ? { extract_availability: 'detecting', extract_note: '正在检测模型可用性…已等待 12s' } : {}),
+              ...(globalThis.__MOCK_CFG__?.avail_state === 'unavailable'
+                ? { extract_availability: 'unavailable', extract_availability_reason: 'LLM 不可用：amr 返回 403（凭据无效）' } : {}),
               extract_estimate: { llm_calls: 2523, duration_human: '3–7 小时' },
               extract_progress: { done: 340, total: 2523 } } },
           { id: DOC_VIDEO, title: '第 5 讲 索引与执行计划（合成夹具数据）', kind: 'video', page_count: 0, size_bytes: 1024 * 1024, lang: 'zh', status: 'ready', created_at: 1760400001000, updated_at: 1760400001000, meta: { fixture: true } },
@@ -1041,12 +1097,23 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
             'Cache-Control': 'no-cache',
             'Transfer-Encoding': 'chunked',
           })
-          const frames = [
-            `event: progress\ndata: ${JSON.stringify({ task_id: taskId, progress: 0.42, stage: '转写音频', done: 42, total: 100 })}\n\n`,
-            ': keepalive\n\n',
-            `event: log\ndata: ${JSON.stringify({ task_id: taskId, level: 'info', msg: 'mock：分章与思维导图' })}\n\n`,
-            `event: done\ndata: ${JSON.stringify({ task_id: taskId, status: 'done', elapsed_ms: 1200 })}\n\n`,
-          ]
+          /**
+           * ★ 重新解析任务（`tsk_reparse_mock`）**保持 running**：
+           *   真实的 reparse 要 65–87 分钟 → mock 里"立刻 done"会让**提交时的代价文案**一闪而过，
+           *   断言只能看到"完成"（我第一版就是这样假失败的）。
+           *   → 只发 progress 帧、不发 done，忠实模拟长任务（也顺便让"进度可见"可断言）。
+           */
+          const frames = taskId === 'tsk_reparse_mock'
+            ? [
+                `event: progress\ndata: ${JSON.stringify({ task_id: taskId, progress: 0.05, stage: 'OCR 逐页识别（1/434）', done: 1, total: 434 })}\n\n`,
+                ': keepalive\n\n',
+              ]
+            : [
+                `event: progress\ndata: ${JSON.stringify({ task_id: taskId, progress: 0.42, stage: '转写音频', done: 42, total: 100 })}\n\n`,
+                ': keepalive\n\n',
+                `event: log\ndata: ${JSON.stringify({ task_id: taskId, level: 'info', msg: 'mock：分章与思维导图' })}\n\n`,
+                `event: done\ndata: ${JSON.stringify({ task_id: taskId, status: 'done', elapsed_ms: 1200 })}\n\n`,
+              ]
           let i = 0
           const write = () => {
             if (i >= frames.length) { res.end('0\r\n\r\n'); return }

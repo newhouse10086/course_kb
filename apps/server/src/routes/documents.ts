@@ -22,6 +22,7 @@ import { ApiError, notFound } from '../store/errors.ts';
 import { buildOutline } from '../store/outline.ts';
 import { newDocId } from '../store/ids.ts';
 import { EXT_TO_KIND, KIND_TO_MIME, kindFromFilename } from '../store/types.ts';
+import { canManageCollection } from '../store/collections-repo.ts';
 import { xrefHistogram } from '../store/xref.ts';
 import { EXTRACT_STATUS, readExtractStatus } from '../tasks/handlers.ts';
 import type { DocumentApi, DocumentRow } from '../store/repo.ts';
@@ -147,6 +148,39 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
       const size = fs.statSync(finalFile).size;
       const relPath = path.relative(cfg.root, finalFile).split(path.sep).join('/');
       // RBAC：记录上传者；**抽取产物默认 draft**（学生看不到，教师审核后才发布，§2）
+      /**
+       * ★ **视频目录**（`collection_id`）：前端以 **multipart 字段**发
+       * （`client.ts::uploadDocument` → `form.append('collection_id', …)`），
+       * 这里同时接受 query 兜底（与 `course_id` 一致的风格）。
+       *
+       * ⚠️ 必须在**文件流读完之后**取 —— `@fastify/multipart` 会在消费流的过程中解析后续字段
+       *   （前端是先 append 文件、再 append collection_id）。
+       */
+      const queryCid = strParam(req.query ? (req.query as Record<string, unknown>).collection_id : undefined);
+      const fieldCid = (() => {
+        const f = (part as unknown as { fields?: Record<string, unknown> }).fields;
+        const raw = f?.collection_id as { value?: unknown } | string | undefined;
+        if (raw === undefined) return undefined;
+        const v = typeof raw === 'string' ? raw : raw?.value;
+        return typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined;
+      })();
+      const collectionIdRaw = fieldCid ?? queryCid ?? null;
+      if (collectionIdRaw !== null) {
+        // ★ fail-closed：目录**不可见 → 404**（不泄露存在性）；可见但无管理权 → 403
+        const scope = scopeFor(user);
+        const colRow = repo.collections.getScopedRow(collectionIdRaw, scope);
+        if (!colRow) {
+          throw new ApiError('E_NOTFOUND', `视频目录不存在或对你不可见：${collectionIdRaw}`, {
+            hint: '先 GET /api/v1/collections 确认可见目录',
+          });
+        }
+        if (!canManageCollection(colRow, scope)) {
+          throw new ApiError('E_FORBIDDEN', '只能把视频放进自己创建的目录', {
+            detail: `collection=${collectionIdRaw}`,
+          });
+        }
+      }
+
       const courseId = strParam(req.query ? (req.query as Record<string, unknown>).course_id : undefined) ?? null;
       if (courseId) {
         const course = repo.rbac.getCourse(courseId);
@@ -166,6 +200,8 @@ export function registerDocumentRoutes(app: FastifyInstance, deps: AppDeps): voi
         visibility: courseId ? 'course' : 'private',
         reviewStatus: 'draft',
         courseId,
+        // ★ 目录归属（已校验可见性 + 管理权；未传 = 不归类）
+        collectionId: collectionIdRaw,
       });
 
       const taskId = queue.enqueue({

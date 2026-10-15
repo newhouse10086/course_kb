@@ -265,6 +265,19 @@ const V2_ADDED_COLUMNS: Record<string, Record<string, string>> = {
     // RBAC §5：任务优先级与归属（LLM 并发=1 是全局的，必须能区分师生）
     priority: 'INTEGER NOT NULL DEFAULT 0',
     user_id: 'TEXT REFERENCES users(id)',
+    /**
+     * ★ v8：**心跳**（看门狗用）。
+     *
+     * ## 修的是什么（用户实测撞到）
+     * 关机/重启后，`tasks.status` 卡在 `running` **永远不动** → 队列被堵死，**后面的任务全排不上**
+     * （Lead 手动把两条 `extracting → ready` 才恢复）。真因：任务**没有心跳/超时** ——
+     * 进程重启后旧任务**无人接管也无人判死**。
+     *
+     * ⚠️ 判死判据**不许**用 `created_at`：OCR 434 页要跑 ~40 分钟，**慢 ≠ 死**。
+     * 必须用"**最后心跳**"（在跑就更新），阈值还要**大于**单步最长耗时。
+     * 见 `src/tasks/watchdog.ts`。
+     */
+    heartbeat_at: 'INTEGER',
   },
   conversations: {
     /**
@@ -470,6 +483,26 @@ export class Db {
       this.db
         .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
         .run(7, 'conversation_title_source', Date.now());
+    }
+    /**
+     * ★ 迁移 **v8**：`tasks.heartbeat_at` + 看门狗索引（任务心跳/判死，见 `tasks/watchdog.ts`）。
+     *
+     * 为什么是新版本号：v2 的补列块被 `if (!applied.has(2))` 门住 ——
+     * **已迁移过的库永远不会重跑它**（v5、v7 都吃过这个教训）。所以照 v7 的做法：
+     * ① 列声明进 `V2_ADDED_COLUMNS`（新库直接有）；② 新块 v8 调幂等的 `addMissingColumns()`。
+     *
+     * ⚠️ 已存在的 `running` 行 `heartbeat_at` 是 NULL —— 看门狗的判据必须能处理它
+     * （用 `COALESCE(heartbeat_at, created_at)`，见 `staleRunningTasks`），
+     * 否则**老库里的僵尸任务永远判不死**（那正是我们要修的 bug）。
+     */
+    if (!applied.has(8)) {
+      this.addMissingColumns();
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_task_heartbeat ON tasks(status, heartbeat_at);
+      `);
+      this.db
+        .prepare('INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)')
+        .run(8, 'task_heartbeat_watchdog', Date.now());
     }
     return Math.max(1, ...applied);
   }

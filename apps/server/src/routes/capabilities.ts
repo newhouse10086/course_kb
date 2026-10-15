@@ -18,6 +18,7 @@ import { spawnSync } from 'node:child_process';
 import type { FastifyInstance } from 'fastify';
 
 import type { AppDeps } from '../app-deps.ts';
+import { LLM_QUEUE } from '../providers/llm/openai_compatible.ts';
 import { redact } from '../config.ts';
 import { selftestBigram } from '../store/bigram.ts';
 import { schemaSummary } from '../store/schema-enums.ts';
@@ -114,8 +115,14 @@ function llmBlock(deps: AppDeps, caps: Record<string, unknown> | undefined): Rec
     available,
     model: creds?.model || String(first?.model ?? ''),
     provider: creds?.providerId || String(first?.id ?? ''),
-    // 契约 C1：并发恒为 1（用户硬要求）
-    concurrency: 1,
+    // ★ 并发**真值**（同源，坑 21）：读 provider 层唯一队列，不再硬编码 1
+    concurrency: LLM_QUEUE.concurrency,
+    concurrency_detail: {
+      in_flight: LLM_QUEUE.inFlight,
+      pending: LLM_QUEUE.pending,
+      peak_in_flight: LLM_QUEUE.peakInFlight,
+      note: '默认 1；改 COURSE_KB_LLM_CONCURRENCY 需**重启**生效（非法值拒绝启动）',
+    },
     ...(reason ? { reason } : {}),
     ...(creds && creds.missingEnv.length > 0 ? { missing_env: [...creds.missingEnv] } : {}),
   };
@@ -438,7 +445,7 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
           max_pages_per_unit: 8,
           span_threshold: 3,
           min_degree_for_page: 2,
-          llm_concurrency: 1,
+          llm_concurrency: LLM_QUEUE.concurrency, // ★ 同源：读真值（原为硬编码 1）
           unit_split: 'recursive_descent_with_intro',
         },
         paths: {

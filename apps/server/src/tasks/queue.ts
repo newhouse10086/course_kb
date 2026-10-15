@@ -43,6 +43,13 @@ export interface TaskQueueOptions {
    * 由 `index.ts` 注入（它知道怎么按 userId 查角色）；默认 1（最保守）。
    */
   resolveQuota?: (userId: string) => number;
+  /**
+   * ★ v8 看门狗的判死阈值（ms）—— 运行期心跳周期由它推导：`min(30s, staleMs/3)`。
+   *
+   * ⚠️ **必须与 `watchdog.ts` 用同一个值**（`index.ts` 一处算出、两处注入），
+   * 否则会出现"一边续命、一边判死"的**自相矛盾**（这类不一致最难查）。
+   */
+  staleMs?: number;
 }
 
 interface QueueItem {
@@ -92,6 +99,8 @@ export class TaskQueue {
   private readonly handlers: Record<string, TaskHandler>;
   private readonly concurrency: number;
   private readonly resolveQuota: (userId: string) => number;
+  /** ★ v8 看门狗判死阈值（ms）；运行期心跳周期由它推导 */
+  private readonly heartbeatStaleMs: number;
   private readonly pending: QueueItem[] = [];
   private readonly active = new Map<string, AbortController>();
   /** 每个用户"在跑"的任务数（配额判定用；不含 pending，pending 从数组现算） */
@@ -109,6 +118,7 @@ export class TaskQueue {
     this.handlers = opts.handlers;
     this.concurrency = Math.max(1, opts.concurrency ?? 1);
     this.resolveQuota = opts.resolveQuota ?? (() => 1);
+    this.heartbeatStaleMs = Math.max(1_000, opts.staleMs ?? 30 * 60 * 1000);
   }
 
   /**
@@ -452,6 +462,8 @@ export class TaskQueue {
         lastProgress = f;
         if (detail) extraDetail = { ...extraDetail, ...detail };
         this.repo.updateTask(taskId, { progress: f, stage, status: 'running' });
+        // ★ 有进度就是"活着"的证据 → 顺手续命（看门狗判死只认心跳，见 watchdog.ts）
+        this.repo.touchTaskHeartbeat(taskId);
         const frame: Record<string, unknown> = { task_id: taskId, progress: f, stage };
         if (detail && typeof detail.done === 'number') frame.done = detail.done;
         if (detail && typeof detail.total === 'number') frame.total = detail.total;
@@ -467,6 +479,28 @@ export class TaskQueue {
     };
 
     this.repo.updateTask(taskId, { status: 'running', stage: '启动中' });
+    this.repo.touchTaskHeartbeat(taskId);
+
+    /**
+     * ★★ **运行期心跳定时器**（v8 看门狗的一半，另一半在 `watchdog.ts`）。
+     *
+     * ## 为什么不能只靠 `progress` 回调续命
+     * 单步可能**长时间没有进度事件**：OCR 434 页的一步就是 ~40 分钟。
+     * 只靠进度 → 这 40 分钟内心跳是旧的 → **看门狗会把正在跑的任务判死**（误杀）。
+     * ⟹ 心跳必须表达"**runner 还活着**"，与"有没有进度"**无关**。
+     *
+     * 周期 = `min(30s, staleMs/3)`：保证阈值内至少续命 3 次（一次被事件循环忙住也不会误判）。
+     * `unref()`：**不能因为这个定时器让进程无法退出**（测试/关停时会被卡住）。
+     */
+    const heartbeatMs = Math.max(1_000, Math.min(30_000, Math.floor(this.heartbeatStaleMs / 3)));
+    const heartbeatTimer = setInterval(() => {
+      try {
+        this.repo.touchTaskHeartbeat(taskId);
+      } catch {
+        /* 库已关（关停中）→ 忽略；不能因为心跳失败把任务弄挂 */
+      }
+    }, heartbeatMs);
+    heartbeatTimer.unref?.();
 
     /**
      * ★★ **任务终态必须回写文档状态**（用户直接撞到的 bug）。
@@ -558,6 +592,8 @@ export class TaskQueue {
         this.bus.finish(taskId);
       }
     } finally {
+      // ★ 心跳定时器必须在这里停 —— 否则任务结束后还在写库（关停时撞上已关闭的连接）
+      clearInterval(heartbeatTimer);
       this.release(taskId, item.userId);
       /**
        * ⚠️ **队列级自动链式已移除**（Lead 真上传实测暴露的概念冲突）：

@@ -103,6 +103,89 @@ const sessionOriginNote = ref('')
  */
 const sessionBlocked = ref('')
 /** ★ 第 12 种帧 `history`：历史内容（pi-bridge：连接恢复时紧跟 ready 发一帧） */
+/* ═══ ★ 会话命名（契约 §4）：行内重命名 + AI 生成名字 ═══ */
+const TITLE_MAX = 80
+const editingId = ref('')          // 正在行内编辑的会话 id
+const editText = ref('')
+const renameNote = ref<Record<string, string>>({})   // 每个会话的如实提示（失败/已由你命名…）
+const genBusy = ref('')            // 正在生成名字的会话 id（显示「生成中…」）
+/** ★ 服务端返回的 `title_source` 覆盖表（**不自己猜**"这个名字是不是 AI 起的" —— 坑 21） */
+const titleSourceOverride = ref<Record<string, string>>({})
+
+function titleSourceOf(s: { id: string; title_source?: string }): string {
+  return String(titleSourceOverride.value[s.id] ?? s.title_source ?? 'default')
+}
+function beginRename(s: { id: string; title?: string }) {
+  editingId.value = s.id
+  // 默认名不预填（避免用户直接回车把"新问答"又存回去）
+  editText.value = DEFAULT_TITLES.includes(String(s.title || '').trim()) ? '' : String(s.title || '')
+}
+function cancelRename() { editingId.value = ''; editText.value = '' }
+/** Enter 提交（Esc 取消）；**不用失焦提交**（契约要求：失焦容易误提交） */
+async function commitRename(s: { id: string; title?: string }) {
+  const id = s.id
+  const next = editText.value.trim()
+  if (!next) { renameNote.value = { ...renameNote.value, [id]: '名字不能为空（本地拦截，不发请求）' }; return }
+  if (next.length > TITLE_MAX) { renameNote.value = { ...renameNote.value, [id]: `名字太长（>${TITLE_MAX} 字，本地拦截）` }; return }
+  const prev = String(s.title || '')
+  // ★ 乐观更新：先改本地显示
+  sessions.value = sessions.value.map((x) => (x.id === id ? { ...x, title: next } : x))
+  titleSourceOverride.value = { ...titleSourceOverride.value, [id]: 'user' }
+  cancelRename()
+  try {
+    const r = await api.renameConversation(id, next)
+    // 服务端是权威：用它的返回值覆盖（可能做了裁剪）
+    sessions.value = sessions.value.map((x) => (x.id === id ? { ...x, title: r.title ?? next } : x))
+    titleSourceOverride.value = { ...titleSourceOverride.value, [id]: String(r.title_source || 'user') }
+    renameNote.value = { ...renameNote.value, [id]: '已改名（服务端已确认）' }
+  } catch (e) {
+    // ★ 失败**回滚** + 如实提示
+    sessions.value = sessions.value.map((x) => (x.id === id ? { ...x, title: prev } : x))
+    titleSourceOverride.value = { ...titleSourceOverride.value, [id]: String((s as { title_source?: string }).title_source || 'default') }
+    const err = e as { status?: number; code?: string; message?: string }
+    renameNote.value = {
+      ...renameNote.value,
+      [id]: (err.status === 404 || err.code === 'E_NOTFOUND') ? '后端尚未实现重命名（PATCH 404）—— 已回滚原名'
+        : (err.status === 403) ? '无权重命名该会话（403）—— 已回滚原名'
+          : `改名失败：${err.message || e} —— 已回滚原名`,
+    }
+  }
+}
+/** ★ AI 生成名字（`title_source==='user'` 时**不发请求**，如实提示） */
+async function generateTitle(s: { id: string; title?: string; title_source?: string }) {
+  const id = s.id
+  if (titleSourceOf(s) === 'user') {
+    renameNote.value = { ...renameNote.value, [id]: '已由你手动命名 —— 不再自动生成（服务端也会拒：E_TITLE_USER_SET）' }
+    return
+  }
+  genBusy.value = id
+  const prev = String(s.title || '')
+  try {
+    const r = await api.generateConversationTitle(id)
+    if (r.skipped) {
+      renameNote.value = { ...renameNote.value, [id]: `未生成：${r.reason || '服务端跳过（原因未给）'}` }
+    } else if (r.title) {
+      sessions.value = sessions.value.map((x) => (x.id === id ? { ...x, title: r.title } : x))
+      titleSourceOverride.value = { ...titleSourceOverride.value, [id]: String(r.title_source || 'ai') }
+      renameNote.value = { ...renameNote.value, [id]: '已由 AI 生成名字' }
+    } else {
+      renameNote.value = { ...renameNote.value, [id]: '未返回名字 —— 保留原名（不编）' }
+    }
+  } catch (e) {
+    // ★ 失败**保留原名** + 如实提示
+    const err = e as { status?: number; code?: string; message?: string }
+    renameNote.value = {
+      ...renameNote.value,
+      [id]: err.status === 409 || err.code === 'E_TITLE_USER_SET' ? '已由你手动命名，服务端拒绝覆盖（409 E_TITLE_USER_SET）—— 保留原名'
+        : (err.status === 404 || err.code === 'E_NOTFOUND') ? '后端尚未实现 AI 命名（404）—— 保留原名'
+          : `生成失败：${err.message || e} —— 保留原名`,
+    }
+    sessions.value = sessions.value.map((x) => (x.id === id ? { ...x, title: prev } : x))
+  } finally {
+    genBusy.value = ''
+  }
+}
+
 const historyTruncated = ref(false)
 const historyCount = ref(0)
 /** `ready.reason`（清空判据的依据；也是排障线索） */
@@ -140,8 +223,9 @@ function sessionLabelSource(s: { id: string; title?: string }): 'server' | 'deri
   return t && !DEFAULT_TITLES.includes(t) ? 'server' : 'derived'
 }
 
-/** 左侧**平铺**会话列表（后端权威；后端没实现时如实说"暂不可用"） */
-const sessions = ref<Array<{ id: string; title?: string; updated_at?: number; message_count?: number }>>([])
+/** 左侧**平铺**会话列表（后端权威；后端没实现时如实说"暂不可用"）
+ *  ★ `title_source` 由**服务端**给（`default`/`user`/`ai`）—— 前端不猜（坑 21） */
+const sessions = ref<Array<{ id: string; title?: string; title_source?: string; updated_at?: number; message_count?: number }>>([])
 const sessionsNote = ref('')
 const sessionsLoading = ref(false)
 /** 输入区左侧的"上下文指示"（可点掉）—— 用户要能一眼看出"它知道我在看什么" */
@@ -1056,14 +1140,39 @@ void _esc
       <div v-else-if="sessionsNote" class="small faint side-note" data-testid="session-list-unavailable">{{ sessionsNote }}</div>
       <ul class="side-list">
         <li v-for="s in sessions" :key="s.id">
-          <button type="button" class="side-item" :class="{ on: s.id === chatSessionId }"
-                  data-testid="session-item" :data-id="s.id" @click="switchSession(s.id)">
-            <span class="t" data-testid="session-title" :data-title-source="sessionLabelSource(s)"
-                  :data-api-title="s.title || ''">{{ sessionLabel(s) }}</span>
-            <span class="small faint">
-              {{ fmtWhen(s.updated_at) }}<template v-if="s.message_count"> · {{ s.message_count }} 条</template>
-            </span>
-          </button>
+          <div class="side-wrap">
+            <button type="button" class="side-item" :class="{ on: s.id === chatSessionId }"
+                    data-testid="session-item" :data-id="s.id" @click="switchSession(s.id)"
+                    @dblclick="beginRename(s)">
+              <span class="t" data-testid="session-title" :data-title-source="sessionLabelSource(s)"
+                    :data-api-title="s.title || ''" :data-title-source-server="titleSourceOf(s)">{{ sessionLabel(s) }}</span>
+              <span class="small faint">
+                {{ fmtWhen(s.updated_at) }}<template v-if="s.message_count"> · {{ s.message_count }} 条</template>
+                <template v-if="titleSourceOf(s) === 'ai'"> · <b data-testid="title-ai-mark">AI</b></template>
+                <template v-else-if="titleSourceOf(s) === 'user'"> · 你命名</template>
+              </span>
+            </button>
+            <!-- ★ 行内重命名：Enter 提交 / Esc 取消（**不用失焦提交** —— 契约要求） -->
+            <div v-if="editingId === s.id" class="rename-row">
+              <input v-model="editText" data-testid="rename-input" :maxlength="TITLE_MAX" placeholder="新名字"
+                     @keydown.enter.prevent="commitRename(s)" @keydown.esc.prevent="cancelRename()" />
+              <span class="small faint" data-testid="rename-counter">{{ editText.length }}/{{ TITLE_MAX }}</span>
+              <button type="button" class="small" data-testid="rename-ok" @click="commitRename(s)">确定</button>
+              <button type="button" class="small" data-testid="rename-cancel" @click="cancelRename()">取消</button>
+            </div>
+            <div v-else class="rename-row">
+              <button type="button" class="small" data-testid="rename-start" :data-id="s.id"
+                      @click="beginRename(s)">重命名</button>
+              <!-- ★ AI 生成：`title_source==='user'` → **禁用**（服务端也会拒 409） -->
+              <button type="button" class="small" data-testid="title-generate" :data-id="s.id"
+                      :disabled="genBusy === s.id || titleSourceOf(s) === 'user'"
+                      :data-title-source-server="titleSourceOf(s)"
+                      :title="titleSourceOf(s) === 'user' ? '已由你手动命名（服务端会拒：E_TITLE_USER_SET）' : '让 AI 根据对话内容起名'"
+                      @click="generateTitle(s)">{{ genBusy === s.id ? '生成中…' : 'AI 起名' }}</button>
+            </div>
+            <div v-if="renameNote[s.id]" class="small faint rename-note" data-testid="rename-note"
+                 :data-id="s.id">{{ renameNote[s.id] }}</div>
+          </div>
         </li>
       </ul>
       <div class="small faint mono side-note" data-testid="current-session">当前：{{ chatSessionId.slice(0, 20) }}…</div>
@@ -1330,6 +1439,11 @@ void _esc
 .side-item:hover { background: var(--paper-2); }
 .side-item.on { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .side-item .t { display: block; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-wrap { border-bottom: var(--hair) dotted var(--rule); }
+.rename-row { display: flex; gap: 4px; align-items: center; padding: 3px 6px; flex-wrap: wrap; }
+.rename-row input { border: var(--hair) solid var(--rule-strong); background: var(--panel); color: var(--ink);
+  font-size: 12.5px; padding: 2px 6px; min-width: 0; flex: 1 1 80px; }
+.rename-note { padding: 2px 6px 4px; }
 .chat-main { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 
 .mode-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }

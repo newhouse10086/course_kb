@@ -606,6 +606,69 @@ export function materializePiModels(cfg: ServerConfig): PiModelsMaterialization 
   };
 }
 
+/**
+ * ★★ **LLM 并发**（用户要求："并发设置为固定可改"）。
+ *
+ * ## 语义（Lead 裁定）
+ * ```
+ * 默认 = 1（用户最初的硬要求："并发跑推理不太合适" —— 不许悄悄改成 >1）
+ * 上限 = 4（COURSE_KB_LLM_CONCURRENCY_MAX 可调）—— 再大意义不大：
+ *        上游会限流，且我们的降级链/探测/抽取都按"同一时刻只有一个请求"设计过
+ * 优先级：COURSE_KB_LLM_CONCURRENCY（env）> 默认 1
+ *        （`settings.json` 的 `llm.concurrency` 由 settings 层负责，见下方说明）
+ * ★ 生效方式：**需重启**（provider 层单例，不热生效）
+ * ```
+ *
+ * ## ★ 为什么不"静默截断"
+ * 配 `99` → **拒绝并如实报错**（不是悄悄改成 4）。理由：运维设了 99 却按 4 跑，
+ * 他会以为"调大有效但不够快"——**"看起来成功"比报错危险**。
+ * 同理 `0` / 负数 / 非数字 → **拒绝**（0 并发 = 永远不跑，绝不许静默变 0）。
+ *
+ * @returns `{ value, requested }`；`rejected` 非空时**调用方必须拒绝启动**（带可读 reason）
+ */
+export function resolveLlmConcurrency(env: Record<string, string | undefined>): {
+  value: number;
+  requested: number | null;
+  max: number;
+  rejected?: string;
+} {
+  const maxRaw = Number(env.COURSE_KB_LLM_CONCURRENCY_MAX);
+  const max = Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.floor(maxRaw) : 4;
+  const raw = env.COURSE_KB_LLM_CONCURRENCY;
+  if (raw === undefined || raw === '') return { value: 1, requested: null, max };
+
+  const want = Number(raw);
+  if (!Number.isFinite(want)) {
+    return {
+      value: 1,
+      requested: null,
+      max,
+      rejected: `COURSE_KB_LLM_CONCURRENCY='${raw}' 不是数字 —— 拒绝启动（合法范围 1..${max}）`,
+    };
+  }
+  const n = Math.floor(want);
+  if (n < 1) {
+    return {
+      value: 1,
+      requested: n,
+      max,
+      rejected: `COURSE_KB_LLM_CONCURRENCY=${n} 非法（0 并发 = 永远不跑）—— 拒绝启动（合法范围 1..${max}）`,
+    };
+  }
+  if (n > max) {
+    return {
+      value: max,
+      requested: n,
+      max,
+      rejected:
+        `COURSE_KB_LLM_CONCURRENCY=${n} 超过上限 ${max} —— **拒绝**（不静默截断：` +
+        `否则你会以为"调大有效但不够快"）。要更高请同时提高 COURSE_KB_LLM_CONCURRENCY_MAX（并知悉：` +
+        `上游可能限流，且探测/降级链/抽取都按并发=1 设计过）`,
+    };
+  }
+  return { value: n, requested: n, max };
+}
+
 /** 解析 `COURSE_KB_BOOTSTRAP_ADMIN=用户名:初始口令`（**不回显口令**）。 */export function parseBootstrapAdmin(raw: string | undefined): { username: string; password: string } | null {
   if (!raw) return null;
   // 只按**第一个**冒号切：口令里允许有冒号

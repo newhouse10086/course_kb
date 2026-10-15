@@ -253,7 +253,11 @@ export type ProviderErrorCode =
   | 'E_TIMEOUT'
   | 'E_PROVIDER'         // provider 自身报错
   | 'E_CAPABILITY'       // 没有 provider 满足本次能力要求
-  | 'E_NO_PROVIDER';     // 该 kind 没有任何可用 provider
+  | 'E_NO_PROVIDER'      // 该 kind 没有任何可用 provider
+  // ★ 单价守卫（openrouter_audio.ts::assertAudioModelAffordable）
+  // 为什么要有独立的码：靠"注释里写着不要换成 gpt-audio"拦不住人（坑 24：承诺但不生效）。
+  // 配了天价模型时必须在**配置/构造阶段**就失败，而不是等账单来了才发现。
+  | 'E_PROVIDER_PRICE';
 
 /**
  * ⚠️ **不要用 TypeScript 参数属性**（`constructor(public readonly x: T)`）——

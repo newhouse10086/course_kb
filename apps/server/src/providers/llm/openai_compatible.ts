@@ -21,32 +21,104 @@ import { ProviderError } from '../types.ts';
 // ─────────────────────────────────────────────────────────────
 
 /**
- * **全局串行队列**（并发 = 1）。
+ * ★★ **LLM 并发闸门**（原 `SerialQueue` = promise 链，**结构上只能串行**）。
  *
- * 用户硬要求：「并发跑推理不太合适」。所有 LLM 调用都过这里。
- * 之所以做成模块级单例：即使注册了多个 LLM provider，总量仍是 1 并发。
+ * ## 为什么必须换掉（坑 24 最纯粹的形态）
+ * 用户要求"**并发固定可改**"（默认 1，但要能改）。而原实现：
+ * ```ts
+ * class SerialQueue { tail = Promise.resolve(); }        // ← promise 链
+ * export const LLM_QUEUE = new SerialQueue();            // ← 没有"上限"这个维度
+ * ```
+ * ⟹ **执行机制本身就没有"并发"这个维度** —— 就算把配置/钳制全改对，**改配置也不生效**。
+ * 前几次死旋钮是"某处忘了读"；这次是"**机制不存在**"，更难发现（因为回显是对的）。
+ *
+ * ## 语义（**默认 1，可配，有上限**）
+ * - 默认 **1**（用户最初的硬要求："并发跑推理不太合适"）
+ * - 上限 **4**（`COURSE_KB_LLM_CONCURRENCY_MAX` 可调）：> 4 意义不大（上游会限流，
+ *   且**我们的降级链/探测/抽取都按并发=1 设计过**）
+ * - ★ 非法值（0/负数/非数字）→ **回落 1**（**绝不许变 0**：0 并发 = 永远不跑）
+ * - ★ **生效方式：需重启**（进程内单例，provider 层组装时定；改配置不热生效）
+ *
+ * ## 风险（如实告知，别让运维以为"调大就更快"）
+ * 并发 > 1 时：① 上游可能限流（429）② 探测/降级链的假设是"同一时刻只有一个请求"
+ * ③ 单次调用可能更慢（共享带宽/CPU）—— **收益不确定，先小步调**。
  */
-export class SerialQueue {
-  private tail: Promise<unknown> = Promise.resolve();
-  private depth = 0;
+export class LlmSemaphore {
+  private limit: number;
+  private running = 0;
+  /** 等待队列（FIFO —— 保证**公平**：长任务不会饿死短任务） */
+  private readonly waiters: (() => void)[] = [];
+  /** 观测：历史峰值并发（`/capabilities` 与测试据此断言"真的同时跑了几路"） */
+  private peak = 0;
 
-  get pending(): number {
-    return this.depth;
+  constructor(limit = 1) {
+    this.limit = LlmSemaphore.clamp(limit);
   }
 
-  run<T>(task: () => Promise<T>): Promise<T> {
-    this.depth++;
-    const next = this.tail.then(task, task).finally(() => {
-      this.depth--;
-    });
-    // 让链继续，即使本次失败
-    this.tail = next.catch(() => undefined);
-    return next as Promise<T>;
+  /** 夹到 [1, max]（**0/负数/非数字 → 1**，不是 0）。 */
+  static clamp(want: number, max = 4): number {
+    if (!Number.isFinite(want)) return 1;
+    const n = Math.floor(want);
+    if (n < 1) return 1;
+    return Math.min(n, Math.max(1, max));
+  }
+
+  get concurrency(): number {
+    return this.limit;
+  }
+  get inFlight(): number {
+    return this.running;
+  }
+  get pending(): number {
+    return this.waiters.length;
+  }
+  /** 历史峰值（★ 断言"真的同时跑 N 路"靠它，而不是断言"我们读了配置"） */
+  get peakInFlight(): number {
+    return this.peak;
+  }
+
+  /** 运行时调整（**只在测试/启动装配时用**；生产靠重启生效）。 */
+  setLimit(n: number, max = 4): void {
+    this.limit = LlmSemaphore.clamp(n, max);
+    this.drain();
+  }
+
+  private drain(): void {
+    while (this.running < this.limit && this.waiters.length > 0) {
+      const next = this.waiters.shift();
+      if (!next) break;
+      this.running += 1;
+      this.peak = Math.max(this.peak, this.running);
+      next();
+    }
+  }
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.running >= this.limit) {
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve); // 槽位释放时 `drain()` 会 resolve 我们
+      });
+    } else {
+      this.running += 1;
+      this.peak = Math.max(this.peak, this.running);
+    }
+    try {
+      return await task();
+    } finally {
+      this.running -= 1;
+      this.drain();
+    }
   }
 }
 
-/** 进程内唯一队列（并发 = 1 的落点） */
-export const LLM_QUEUE = new SerialQueue();
+/** 进程内唯一队列（**默认并发 = 1**；`setLimit` 只在启动装配/测试时调用）。 */
+export const LLM_QUEUE = new LlmSemaphore(1);
+
+/**
+ * 兼容旧名（文档/测试里按 `SerialQueue` 引用过）。
+ * @deprecated 用 `LlmSemaphore` —— `SerialQueue` 这个名字**已不能描述其行为**（现在可并发）。
+ */
+export const SerialQueue = LlmSemaphore;
 
 // ─────────────────────────────────────────────────────────────
 // 凭据脱敏

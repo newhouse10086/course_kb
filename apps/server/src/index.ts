@@ -16,7 +16,7 @@ import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import path from 'node:path';
 
-import { loadConfig, ensureDirs, redact, materializePiModels } from './config.ts';
+import { loadConfig, ensureDirs, redact, materializePiModels, resolveLlmConcurrency } from './config.ts';
 // ★ 运行日志落盘（见 src/logging/index.ts 的缺口说明）
 import { createAppLogging, type AppLogging } from './logging/index.ts';
 import type { ServerConfig } from './config.ts';
@@ -29,6 +29,7 @@ import type { SearchHit } from './store/search.ts';
 import { TaskEventBus } from './tasks/bus.ts';
 import { TaskQueue } from './tasks/queue.ts';
 import { createHandlers, createAvailabilityResolver } from './tasks/handlers.ts';
+import { createTaskWatchdog } from './tasks/watchdog.ts';
 import type { ExtractAvailability } from './tasks/handlers.ts';
 import { createWorkerExtractor } from './tasks/extract.ts';
 import type { CompleteJsonFn } from './tasks/extract.ts';
@@ -39,6 +40,8 @@ import { createWorkerRunner } from './worker/runner.ts';
 import type { WorkerRunnerWithRaw } from './worker/runner.ts';
 import { probeWorker } from './worker/probe.ts';
 import { registerCapabilityRoutes, SERVER_VERSION } from './routes/capabilities.ts';
+import { LLM_QUEUE } from './providers/llm/openai_compatible.ts';
+import { registerCollectionRoutes } from './routes/collections.ts';
 import { registerDocumentRoutes } from './routes/documents.ts';
 import { registerCardRoutes } from './routes/cards.ts';
 import { registerSearchRoutes } from './routes/search.ts';
@@ -97,6 +100,16 @@ ull = 本次未启用落盘） */
   availabilityWarmUp: () => void;
   /** ★ 只读：当前可用性三态（诊断用；detecting 也必须如实可见） */
   peekAvailability: () => Promise<ExtractAvailability>;
+  /**
+   * ★★ v8 看门狗：判死超时任务 + 自愈孤儿 `extracting` 文档。
+   * **只应由 `main()` 在 `listen()` 之后调用**（pit 34：`buildApp` 里不放启动副作用）。
+   */
+  taskWatchdog: () => {
+    stale: { killed: string[]; alive: string[] };
+    docs: { healed: string[]; keptRunning: string[] };
+  };
+  /** 看门狗判死阈值（ms）—— 诊断/测试断言用，与 queue 的心跳周期**同源** */
+  taskStaleMs: number;
   close(): Promise<void>;
 }
 
@@ -743,11 +756,25 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
     throw new Error(`RBAC 引导失败：${redact(err instanceof Error ? err.message : String(err))}`);
   }
 
+  /**
+   * ★★ v8 看门狗判死阈值（ms）。**一处算出、两处注入**（queue 的心跳周期 + watchdog 的判死线）
+   * —— 两处不一致会造出"一边续命一边判死"的自相矛盾（最难查的那类）。
+   *
+   * 默认 30 分钟：**必须大于单步最长耗时**（OCR 434 页 ~40 分钟的步骤靠运行期心跳续命，
+   * 不是靠"阈值大"）。`COURSE_KB_TASK_STALE_MS` 可覆盖（配置读法不进 config.ts：那条写域不在我手上）。
+   */
+  const taskStaleMs = Math.max(
+    1_000,
+    Number(cfg.env.COURSE_KB_TASK_STALE_MS ?? '') > 0 ? Number(cfg.env.COURSE_KB_TASK_STALE_MS) : 30 * 60 * 1000,
+  );
+
   const queue = new TaskQueue({
     repo,
     bus,
     handlers,
     concurrency: cfg.taskConcurrency,
+    // ★ 心跳周期 = min(30s, staleMs/3)，与看门狗同源
+    staleMs: taskStaleMs,
     // RBAC §5：配额按角色（学生 1 / 教师 2 / 管理员不限）
     resolveQuota: (userId) => {
       const roles = repo.rbac.rolesOf(userId);
@@ -755,6 +782,40 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       return taskQuota(user);
     },
   });
+
+  /**
+   * ★★ 看门狗（v8）：判死超时 running 任务 + 自愈孤儿 `extracting` 文档。
+   *
+   * 为什么**不在 `buildApp` 里跑**（pit 34 的教训）：`buildApp` 是测试/嵌入式入口，
+   * 在里面做"启动副作用"会改变所有嵌入用法的可观测状态（我刚在预热上踩过一次）。
+   * ⟹ 暴露到 `BuiltApp.taskWatchdog`，由 `main()` 在 **listen() 之后** 调一次。
+   */
+  const watchdog = createTaskWatchdog({ repo, staleMs: taskStaleMs, logger: logging });
+
+  /**
+   * ★★ **LLM 并发接线**（用户要求"并发固定可改"；零件由 `backend-api` 提供：
+   * `LlmSemaphore` + `resolveLlmConcurrency`，此处只**接线**，不改它的实现）。
+   *
+   * ```
+   * ① 默认 = 1（用户最初的硬要求："并发跑推理不太合适"）—— 不配就与改动前**行为一致**
+   * ② 配 3 → 真的同时跑 3 个（`setLimit` 作用于进程内唯一队列 `LLM_QUEUE`）
+   * ③ ★ 非法值（0 / 负数 / 非数字 / 超上限）→ **拒绝启动**并给出可读 reason
+   *    —— **绝不静默截断**：运维设了 99 却按 4 跑，他会以为"调大有效但不够快"（"看起来成功"最危险）
+   * ④ 生效方式 = **重启**（进程内单例；改配置不热生效）—— `/capabilities` 读的是**真值**
+   * ```
+   */
+  const llmConc = resolveLlmConcurrency(cfg.env);
+  if (llmConc.rejected) {
+    // ★ 启动期拒绝：此时 Fastify 还没建，直接抛（`main()` 会打印并退出）
+    throw new Error(
+      `LLM 并发配置非法，拒绝启动：${llmConc.rejected}`,
+    );
+  }
+  // ← 注入：删掉接线（回到默认 1）
+  process.stderr.write(
+    `[llm] 并发 = ${LLM_QUEUE.concurrency}（默认 1；上限 ${llmConc.max}；` +
+      `${llmConc.requested === null ? '未显式配置' : `显式配置 ${llmConc.requested}`}；改配置需重启）\n`,
+  );
 
   const deps: AppDeps = {
     cfg,
@@ -974,6 +1035,7 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       );
     }
   }
+  registerCollectionRoutes(app, deps);
   registerDocumentRoutes(app, deps);
   registerCardRoutes(app, deps);
   registerSearchRoutes(app, deps);
@@ -994,6 +1056,22 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       availabilityWarmUp();
     },
     peekAvailability: () => availabilityResolver.current(),
+    taskWatchdog: () => {
+      const r = watchdog.runStartup();
+      logging?.info(
+        {
+          event: 'task-watchdog',
+          killed: r.stale.killed.length,
+          alive: r.stale.alive.length,
+          docs_healed: r.docs.healed.length,
+          docs_kept_running: r.docs.keptRunning.length,
+          stale_ms: taskStaleMs,
+        },
+        'startup watchdog sweep done',
+      );
+      return r;
+    },
+    taskStaleMs,
     async close() {
       // 顺序很重要：先中止在跑的 worker，再**等任务收尾写完 tasks 行**，最后关 DB。
       // 原错误写法：stop() 后立刻 db.close() → 任务收尾写入撞上已关闭连接，
@@ -1059,6 +1137,22 @@ export async function main(): Promise<void> {
   // ★★ 坑 32：**服务起来之后**再后台预热 LLM 可用性探测（不阻塞任何请求）。
   //   这样第一个抽取任务通常已拿到结果；最差也只是如实显示"检测中"（不再白等 68 秒）。
   built.availabilityWarmUp();
+
+  // ★★ v8 看门狗：**启动先扫一遍**（用户实测：关机重启后 running 任务永远不动 → 队列被堵死）。
+  //   ① 判死"心跳超时"的 running 任务并释放队列 ② 自愈"没有任何 running 任务"的 extracting 文档。
+  //   ⚠️ 两件事都**如实记日志**（不许静默改状态）；判据见 `tasks/watchdog.ts` 头部注释。
+  try {
+    const swept = built.taskWatchdog();
+    if (swept.stale.killed.length > 0 || swept.docs.healed.length > 0) {
+      process.stdout.write(
+        `[watchdog] 判死超时任务 ${swept.stale.killed.length} 个（心跳新鲜保留 ${swept.stale.alive.length} 个）；` +
+          `自愈 extracting 文档 ${swept.docs.healed.length} 个（真在跑的保留 ${swept.docs.keptRunning.length} 个）\n`,
+      );
+    }
+  } catch (err) {
+    // 看门狗失败**不能**让服务起不来（它是自愈，不是主链路），但必须如实报
+    process.stderr.write(`[watchdog] 启动扫描失败：${err instanceof Error ? err.message : String(err)}\n`);
+  }
   const base = `http://${cfg.host}:${cfg.port}`;
   process.stdout.write(
     [
