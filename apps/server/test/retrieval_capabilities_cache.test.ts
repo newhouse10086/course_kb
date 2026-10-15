@@ -272,7 +272,9 @@ test('★ 缓存机制本身仍生效（修实时性不许把缓存整个删掉�
   //    "首次不命中"会因测试顺序而随机失败（我第一版就是这样）。
   const initial = await getCaps('?refresh=1');
   assert.equal(initial.cached, false, 'refresh=1 必须绕过/重建缓存');
-  assert.equal(initial.cache_ttl_ms, 15_000, 'TTL 契约（15s）');
+  // ★ TTL 由 15s → **300s**（Lead 裁定：`/capabilities` 默认深探测，每个 configured provider
+  //   都是一次真实上游调用；15s TTL 等于没有缓存 → 轮询 = 持续烧钱，与 `/models` 同一类放大器）
+  assert.equal(initial.cache_ttl_ms, 300_000, 'TTL 契约（5 分钟）');
 
   const second = await getCaps();
   assert.equal(second.cached, true, 'TTL 内应命中缓存（性能优化必须保留）');

@@ -131,6 +131,14 @@ export interface SwitchRequest {
   username?: string | null;
   /** 覆盖等待上限（测试用） */
   drainTimeoutMs?: number;
+  /**
+   * ★ **强制重新探测**（默认 false = TTL 内复用缓存）。
+   *
+   * 为什么默认不强制：`probe()` 是**真发一次计费请求**。原先切换/幂等切换都无条件
+   * `force:true` → 每次切换必然多花一次调用（哪怕 1 秒前刚探过）。
+   * 需要"立刻确认它现在真的可用"时才传 true（调用方**显式**为这次付费）。
+   */
+  forceProbe?: boolean;
 }
 
 export interface ResumePlan {
@@ -509,7 +517,12 @@ export class ModelSwitcher {
 
     // ── 幂等：切到当前模型 → 不切，但**仍探测一次**（"确认它还能用"是合理诉求）──
     if (model === from) {
-      const probe = await this.o.catalog.probe(model, { force: true });
+      /**
+       * ★ **不再无条件 `force: true`**（成本修复）：TTL 内的缓存可直接复用 ——
+       * 否则"切到自己"这种幂等操作每次都会**真发一次计费请求**。
+       * 想强制刷新 → 传 `forceProbe: true`（显式付费，调用方知情）。
+       */
+      const probe = await this.o.catalog.probe(model, { force: req.forceProbe === true });
       if (!probe.available) {
         this.auditEvent(req, from, model, 'failed', probe.reason);
         throw new ApiError('E_MODEL_PROBE', `当前模型 ${model} 探测失败：${probe.reason}`, {
@@ -631,7 +644,9 @@ export class ModelSwitcher {
       this.o.store.apply(next, { persist: true, warnings: [], ignored: [] });
 
       // ── 真探测新模型；不通 → 回滚 + 502 ──
-      const probe = await this.o.catalog.probe(model, { force: true });
+      // ★ 成本修复：TTL 内的缓存可复用（`force` 只在显式 `forceProbe` 时给）——
+      //   原来无条件 `force:true` 让"切换"必然多花一次调用（哪怕刚探过）。
+      const probe = await this.o.catalog.probe(model, { force: req.forceProbe === true });
       this.o.catalog.invalidate();
       if (!probe.available) {
         this.o.store.apply({ ...next, llm: { ...next.llm, active: from } }, { persist: true, warnings: [], ignored: [] });

@@ -273,6 +273,9 @@ export function createSettingsRoutes(deps: SettingsRoutesDeps): (app: FastifyIns
           mode: mode as SwitchMode,
           userId: me.id,
           username: me.username,
+          // ★ 默认 false：TTL 内复用探测缓存（`probe()` 是**真计费请求**）。
+          //   只有调用方显式要"现在就确认它可用"时才传 true —— 代价因此**由调用方知情**。
+          forceProbe: b.forceProbe === true,
         });
         // drain 超时 = 200 + state:'timeout'（**没切**，如实说明）。UI 应据此提示而不是当成功。
         const status = result.state === 'timeout' ? 200 : 200;

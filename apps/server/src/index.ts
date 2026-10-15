@@ -610,6 +610,36 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   let bootstrapState: 'initialized' | 'not_initialized' = repo.rbac.countUsers() > 0
     ? 'initialized'
     : 'not_initialized';
+  /**
+   * ★ **"设了变量但解析不了"必须拒绝启动**（不许静默退化成"没设"）。
+   *
+   * ## 为什么（真机排查过一次）
+   * `web-ui` 在全新库上设了 `COURSE_KB_BOOTSTRAP_ADMIN=admin:Admin2026lab` 却看到
+   * `[auth] 尚无任何用户` → 一度以为是"启动路径不读这个变量"。
+   * 我实测复现：**变量真的到达进程时，启动路径会正常创建管理员并打印创建日志**
+   * （`/capabilities.auth.bootstrap = initialized` + 用该口令登录 200）→ 契约成立。
+   * 那次失败是**环境问题**（变量没进进程 / 看的是旧进程日志 —— 坑 26）。
+   *
+   * 但这次排查暴露了一个**真实的静默面**：变量存在却**格式不对**（如漏了冒号）时，
+   * `parseBootstrapAdmin` 返回 null → 与"根本没设"走同一条日志 → **运维会以为变量没生效**。
+   * ⟹ 现在：**设了但解析不了 → 直接抛错拒绝启动**（同"弱口令拒绝启动"的原则）。
+   */
+  const bootstrapRaw = cfg.env.COURSE_KB_BOOTSTRAP_ADMIN;
+  const bootstrapVarPresent = typeof bootstrapRaw === 'string' && bootstrapRaw.trim() !== '';
+  if (bootstrapVarPresent && !cfg.auth.bootstrapAdmin) {
+    throw new Error(
+      'RBAC 引导失败：COURSE_KB_BOOTSTRAP_ADMIN 已设置但格式不合法（应为「用户名:口令」，且用户名非空）—— ' +
+        '拒绝带着"以为设了却没生效"的状态启动',
+    );
+  }
+  // ★ 让"变量到底有没有进进程"在日志里**一眼可见**（口令永不回显）
+  if (bootstrapVarPresent) {
+    process.stderr.write(
+      `[auth] COURSE_KB_BOOTSTRAP_ADMIN 已设置（用户名 ${cfg.auth.bootstrapAdmin!.username}；仅当库里零用户时生效）\n`,
+    );
+  } else {
+    process.stderr.write('[auth] 未设置 COURSE_KB_BOOTSTRAP_ADMIN（全新库需 `npm run create-admin` 或设置该变量）\n');
+  }
   try {
     const boot = await bootstrapAdmin(repo, cfg.auth);
     if (boot?.created) {

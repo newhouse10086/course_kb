@@ -46,6 +46,21 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def kill_port_owner(port: int) -> None:
+    """杀掉仍监听该端口的进程（`npm start` 的 terminate 杀不掉 node 子进程 —— 实测）"""
+    try:
+        out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                              f'(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue'
+                              f' | Select-Object -First 1).OwningProcess'],
+                             capture_output=True, text=True, timeout=30)
+        pid = (out.stdout or '').strip()
+        if pid.isdigit():
+            subprocess.run(['powershell', '-NoProfile', '-Command', f'Stop-Process -Id {pid} -Force'], timeout=30)
+            log(f'收尾：按端口杀掉残留实例 PID={pid}')
+    except Exception as e:
+        log(f'收尾清理失败（不致命）：{e}')
+
+
 def check_settings(path: Path) -> tuple[bool, str]:
     """★ 启动前断言：active 必须是便宜的 flash，兜底链不许含 kimi"""
     try:
@@ -89,8 +104,16 @@ def main() -> int:
         'COURSE_KB_DB': str(data / 't.sqlite3'),
         'COURSE_KB_SETTINGS_FILE': str(tmp / 'settings.json'),
         'COURSE_KB_PORT': str(PORT),
+        # ★ 隔离实例是**全新库**：服务端日志明确提示"[auth] 尚无任何用户：请用 COURSE_KB_BOOTSTRAP_ADMIN=用户名:口令"
+        #   → 不加这个，登录必然 401（第一版就是这样白跑了一轮，好在没调 LLM）
+        'COURSE_KB_BOOTSTRAP_ADMIN': 'admin:Admin2026lab',
     }
     log(f'隔离实例：data={data} · settings={tmp / "settings.json"} · port={PORT}')
+    # ★ 全新库没有用户；`COURSE_KB_BOOTSTRAP_ADMIN` 实测**没生效**（登录仍 401）→ 用官方 CLI 建管理员
+    ca = subprocess.run(['npm', 'run', 'create-admin', '--', 'admin', 'Admin2026lab'],
+                        cwd=str(REPO / 'apps' / 'server'), env=env, capture_output=True, text=True, shell=True)
+    tail = ((ca.stdout or '') + (ca.stderr or '')).strip().splitlines()
+    log('create-admin：' + (' / '.join(tail[-3:]) if tail else f'exit={ca.returncode}'))
     server = subprocess.Popen(['npm', 'start'], cwd=str(REPO / 'apps' / 'server'), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True)
     proxy = None
@@ -123,6 +146,19 @@ def main() -> int:
         with Chrome(chrome) as ch:
             ch.navigate(f'{base}/#/login?next=/video', timeout=180)
             ch.wait_for("!!document.getElementById('login-report')", timeout=120, interval=0.3)
+            # ★ 隔离实例实测：登录连续失败会 `429 E_RATELIMIT（请 N 秒后再试）` → **必须按提示等**
+            for attempt in range(3):
+                rep = str(ch.evaluate("(document.getElementById('login-report')||{}).textContent||''"))
+                if 'E_RATELIMIT' in rep:
+                    import re as _re
+                    m = _re.search(r'请\s*(\d+)\s*秒', rep)
+                    wait_s = int(m.group(1)) + 2 if m else 30
+                    log(f'登录被限流，等 {wait_s}s 后重试（第 {attempt + 1}/3 次）')
+                    time.sleep(wait_s)
+                    ch.navigate(f'{base}/#/login?next=/video', timeout=120)
+                    ch.wait_for("!!document.getElementById('login-report')", timeout=120, interval=0.3)
+                    continue
+                break
             ch.evaluate("(() => { const u=document.querySelector('[data-testid=\"login-username\"]');"
                         " u.value='admin'; u.dispatchEvent(new Event('input',{bubbles:true}));"
                         " const p=document.querySelector('[data-testid=\"login-password\"]');"
@@ -130,6 +166,8 @@ def main() -> int:
             time.sleep(0.5)
             ch.evaluate("document.querySelector('[data-testid=\"login-submit\"]').click()")
             ch.wait_for("location.hash.includes('/video')", timeout=180, interval=0.3)
+            # ★ 登录必须真的成功（否则后面等 WS 是白等）—— 断言会话接口可用
+            log('登录后页面：' + str(ch.evaluate("(document.querySelector('[data-testid=\"login-report\"]')||{}).textContent||''"))[:160])
             ch.wait_for("!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=180, interval=0.5)
             # 打开抽屉（视频页 → assistant=video）
             for _ in range(3):
@@ -187,6 +225,8 @@ def main() -> int:
                     p.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     p.kill()
+        # ★ `npm start` 的 terminate **不会**杀掉 node 子进程（实测：端口仍在监听）→ 按端口补杀
+        kill_port_owner(PORT)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

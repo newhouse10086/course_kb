@@ -87,6 +87,24 @@ export interface ModelsResult {
   probedAt: number;
   /** 端点模型发现（`GET /models`）的结果 —— 失败也如实上报，不影响其它字段 */
   discovery: { ok: boolean; reason: string; count: number };
+  /**
+   * ★ **本次真发出去的探测调用**（模型 id 列表）—— 让"看列表"的**代价可见**。
+   *
+   * 背景（真实成本缺陷）：原先 `list()` 会对**所有候选**（active + fallbacks + 端点发现的全部模型）
+   * 逐个 `probe()` —— 而 `probe()` 是**真发一次 `chat/completions`**（计费！）。
+   * 用户点一下"模型列表"就会花掉 8+ 次 LLM 调用；实测某平台 kimi-k3 被调 **263 次**，
+   * 归因正是这条路径（会话文件里 kimi = 0，说明调用全来自探测）。
+   *
+   * 现在默认**只探 `active`**；`?deep=1` 才全探。**`probeCalls` 必须等于 `probed.length`**
+   * （自述与生效同源 —— 坑 21：不许自述与真实调用不符）。
+   */
+  probed: string[];
+  /** 本次真发出去的探测调用**次数**（= `probed.length`；缓存命中不算） */
+  probeCalls: number;
+  /** 因成本隔离而**未探测**的模型 id（默认路径下 = fallbacks + 端点发现的其它模型） */
+  skippedProbe: string[];
+  /** 缓存 TTL（ms）—— 让调用方知道"多久内再问不会再花钱" */
+  ttlMs: number;
   /** 凭据是否齐备（≠ 可用；铁律 R1） */
   configured: boolean;
   reason: string;
@@ -137,7 +155,14 @@ export class ModelCatalog {
   }
 
   private ttl(): number {
-    return this.opts.ttlMs ?? 60_000;
+    /**
+     * ★ TTL 由 60s 提到 **5 分钟**（真实成本缺陷修复的一部分）。
+     *
+     * 理由：`probe()` 是**真发一次计费请求**。60s 的缓存意味着"UI 每分钟轮询一次 =
+     * 每分钟烧一次调用"（配合原先"全候选都探"更是 ×8）。5 分钟内重复问同一个模型
+     * **零调用**；要立刻刷新走 `?deep=1`（**显式付费**，代价在响应里可见）。
+     */
+    return this.opts.ttlMs ?? 300_000;
   }
 
   private get creds(): { baseUrl: string; apiKey: string; model: string; providerId: string; configured: boolean } | null {
@@ -326,12 +351,46 @@ export class ModelCatalog {
     const discovery = await this.discoverModels({ force: input.deep === true });
     for (const id of discovery.models) add(id, 'endpoint');
 
+    /**
+     * ★★ **探测的成本隔离**（真实缺陷修复，见 `ModelsResult.probed` 的注释）。
+     *
+     * - 默认：**只探 `active`** —— 一个"看看有哪些模型"的只读请求**只花 1 次调用**
+     * - `?deep=1`：全探（候选数 = 调用数），**并且响应里如实标注花了多少**
+     *
+     * `fallbacks` 与端点发现的其它模型**只做"配置存在性"上报，不做真探测**：
+     * 兜底模型平时**不该产生任何调用**（真正降级时才由降级链自己去探）。
+     */
     const deep = input.deep === true;
+    const toProbe = deep ? new Set(sources.keys()) : new Set(input.active ? [input.active] : []);
+    const probed: string[] = [];
+    const skippedProbe: string[] = [];
     const models: ModelEntry[] = [];
     for (const [id, srcSet] of sources) {
       const hit = this.cache.get(id);
       const cached = Boolean(hit && !deep && this.now() - hit.checkedAt < this.ttl());
+      if (!toProbe.has(id)) {
+        // ★ **未探测**：如实标注（不是"不可用"，也不是"可用"）—— 坑 10/22：不许假装
+        skippedProbe.push(id);
+        models.push({
+          id,
+          providerId: creds?.providerId ?? '',
+          runtime: 'cloud',
+          configured: Boolean(creds?.configured),
+          available: false,
+          latencyMs: 0,
+          reason: '未探测（默认只探当前生效模型；要看全部请用 ?deep=1 —— 每个模型都会真发一次计费请求）',
+          active: id === input.active,
+          fallback: input.fallbacks.includes(id),
+          sources: [...srcSet],
+          cached: false,
+          probe: 'skipped',
+          judgedBy: 'provider.healthCheck',
+        });
+        continue;
+      }
       const p = await this.probe(id, { force: deep });
+      // ★ 只有**缓存未命中**才算真调用（`probeCalls` 与 `probed` 同源，不许自述不符）
+      if (!cached) probed.push(id);
       models.push({
         id,
         providerId: creds?.providerId ?? '',
@@ -367,6 +426,11 @@ export class ModelCatalog {
       discovery: { ok: discovery.ok, reason: discovery.reason, count: discovery.models.length },
       configured: Boolean(creds?.configured),
       reason: creds?.configured ? '' : (creds ? 'LLM 凭据不完整（缺 base_url / api_key / model）' : '没有启用中的 LLM provider'),
+      // ★ 成本可见：探了谁、花了多少次、跳过了谁、缓存多久（`probeCalls` 与 `probed` 同源）
+      probed,
+      probeCalls: probed.length,
+      skippedProbe,
+      ttlMs: this.ttl(),
     };
   }
 }

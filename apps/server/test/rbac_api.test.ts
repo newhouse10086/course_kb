@@ -1220,7 +1220,11 @@ test('★ 缓存命中时 auth/settings/retrieval 必须**实时**（HTTP 级：
     );
     assert.deepEqual(
       hit.body.live_fields,
-      ['auth', 'settings', 'retrieval', 'search'],
+      // ★ `probe_calls` / `probe_detail` 也是**实时**的：它们描述**本次请求的探测代价** ——
+      //   若进缓存，第二次请求会谎报"又探了 N 次"（自述与生效不符，坑 21）。
+      //   （Lead 裁定 ⑤：`/capabilities` 默认深探测 = 每个 configured provider 一次真实上游调用，
+      //     TTL 由 15s 提到 300s，代价用这两个字段如实可见。）
+      ['auth', 'settings', 'retrieval', 'search', 'probe_calls', 'probe_detail'],
       '★ 实时字段必须显式可见（承诺实时的字段全在这里）',
     );
     assert.deepEqual(hit.body.unclassified_fields, [], '★ 不许有未分类字段');

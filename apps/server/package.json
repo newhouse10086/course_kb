@@ -15,7 +15,9 @@
     "test:backend": "node --test --test-force-exit --test-concurrency=1 test/store_*.test.ts test/routes_*.test.ts test/rbac_*.test.ts test/sse_*.test.ts test/worker_*.test.ts",
     "test:worker": "node --test --test-force-exit test/worker_framing.test.ts",
     "test:e2e:agent": "node --test --test-force-exit test/e2e/agent_kb.e2e.ts",
-    "test:e2e:audio": "node test/e2e/openrouter_audio.e2e.mjs"
+    "test:e2e:audio": "node test/e2e/openrouter_audio.e2e.mjs",
+    "test:e2e:ocr": "node test/e2e/openrouter_ocr.e2e.mjs",
+    "test:e2e:bootstrap": "node test/e2e/bootstrap_admin.e2e.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^1.2.0",

@@ -132,7 +132,22 @@ function llmBlock(deps: AppDeps, caps: Record<string, unknown> | undefined): Rec
  * - `?refresh=1`（或 `?deep=1`）**强制绕过缓存**重新探测
  * - 只缓存**成功**的响应；出错不缓存（避免把一次故障钉在 TTL 里）
  */
-const CAPS_TTL_MS = 15_000;
+/**
+ * 昂贵探测的缓存 TTL：**5 分钟**（原 15s）。
+ *
+ * ## 为什么必须显著长于轮询间隔（真实成本缺陷）
+ * `/capabilities` **默认走深探测**（`deep = q.deep !== '0'`）→ registry 对**每个 configured provider**
+ * 强制 `healthCheck()`（`force:true`）→ **每个 provider = 一次真实上游调用**（LLM/ASR/TTS/OCR）。
+ * 而 15s 的 TTL **等于没有缓存**：前端按 15s 轮询 → **每 15s 烧一轮探测**。
+ * 与 `/models` 原先"全候选都探"是**同一类放大器**（实测某平台 kimi-k3 被调 263 次）。
+ *
+ * ⟹ 昂贵且慢变的探测结果缓存 5 分钟；`?refresh=1` 显式强制重探（**调用方显式付费**），
+ *    响应里的 `probe_calls` 让代价可见。
+ *
+ * ⚠️ **只作用于 `CACHEABLE_FIELDS`** —— `auth` / `settings` / `retrieval` / `search`
+ * 仍在 `LIVE_FIELDS` 里**每次实时重算**（坑 19：不许把"承诺实时"的字段冻住）。
+ */
+const CAPS_TTL_MS = 300_000;
 
 /**
  * ★★ **只有这些字段允许"陈旧"**（走缓存）；**其余一律实时重算** —— fail-safe 方向。
@@ -183,7 +198,16 @@ const CACHEABLE_FIELDS = [
 ] as const;
 
 /** 缓存命中时**必须实时重算**的字段（都很便宜）。 */
-const LIVE_FIELDS = ['auth', 'settings', 'retrieval', 'search'] as const;
+/**
+ * ★ **必须实时的字段**（每次请求都重算，绝不来自缓存）。
+ *
+ * `auth` / `settings` / `retrieval` / `search` 承诺"实时"（坑 19 一轮踩了 3 次：
+ * `auth.bootstrap` / `settings.activeModel` / `retrieval.dataReady`）。
+ *
+ * `probe_calls` / `probe_detail` 也在这里：它们描述**本次请求的代价**，
+ * 缓存命中时必须报 0（若进缓存，第二次请求会谎报"又探了 N 次"—— 自述与生效不符，坑 21）。
+ */
+const LIVE_FIELDS = ['auth', 'settings', 'retrieval', 'search', 'probe_calls', 'probe_detail'] as const;
 
 export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): void {
   let capsCache: { at: number; key: string; body: Record<string, unknown> } | null = null;
@@ -263,6 +287,9 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
             cached: true,
             cached_age_ms: age,
             cache_ttl_ms: CAPS_TTL_MS,
+            // ★ 命中缓存 = **本次一次真探测都没有**（如实报 0，与 `/models` 同一原则）
+            probe_calls: 0,
+            probe_detail: { note: '命中缓存，本次未做任何真探测' },
             cacheable_fields: [...CACHEABLE_FIELDS],
             live_fields: [...LIVE_FIELDS],
             unclassified_fields: [],
@@ -279,9 +306,27 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
 
       let providerCaps: Record<string, unknown> | undefined;
       let providersError: string | null = deps.providersError;
+      /**
+       * ★ **成本计数**：本次请求真探测了几次（与 `/models` 的 `probeCalls` 同一原则 —— 代价必须可见）。
+       *
+       * 判据同源（坑 21）：`probe_calls` 由**实际发生的探测**推导 ——
+       * `deep` 时 registry 会对**每个 `configured` 的 provider** 强制 `healthCheck()`（`force:true`，
+       * 绕过它自己的缓存）→ 每个 = **一次真实上游调用**（LLM/ASR/TTS/OCR/翻译都算）。
+       * 未配置的 provider **不探测**（registry 直接返回）→ 不计入。
+       */
+      let probeCalls = 0;
+      let probeDetail: Record<string, number> = {};
       if (deps.providers) {
         try {
           providerCaps = (await deps.providers.capabilities({ deep })) as Record<string, unknown>;
+          if (deep) {
+            const byKind = (providerCaps.providers ?? {}) as Record<string, { configured?: boolean }[]>;
+            for (const [kind, list] of Object.entries(byKind)) {
+              const n = Array.isArray(list) ? list.filter((p) => p.configured === true).length : 0;
+              if (n > 0) probeDetail[kind] = n;
+              probeCalls += n;
+            }
+          }
         } catch (err) {
           providersError = redact(err instanceof Error ? err.message : String(err));
         }
@@ -409,6 +454,9 @@ export function registerCapabilityRoutes(app: FastifyInstance, deps: AppDeps): v
         ...body,
         cached: false,
         cache_ttl_ms: CAPS_TTL_MS,
+        // ★ 成本可见（与 `/models` 的 `probeCalls` 同一原则）：本次真探测了几次
+        probe_calls: probeCalls,
+        probe_detail: probeDetail,
         // 如实报出分类：前端/验收脚本能看出"哪些字段允许陈旧、哪些每次实时"
         cacheable_fields: [...CACHEABLE_FIELDS],
         live_fields: [...LIVE_FIELDS],

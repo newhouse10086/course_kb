@@ -495,7 +495,8 @@ test('PUT：`{settings:{...}}` 包一层也接受（前端两种写法都行）'
 
 test('GET /models：每个模型都有 available/latencyMs/reason，且来自**真探测**', async () => {
   await withCtx({}, async (ctx) => {
-    const r = await req(ctx, 'GET', '/api/v1/models', { as: 'teacher' });
+    // ★ `?deep=1`：**显式**全探（默认只探 active —— 探测是真计费请求，见 settings_models_cost.test.ts）
+    const r = await req(ctx, 'GET', '/api/v1/models?deep=1', { as: 'teacher' });
     assert.equal(r.status, 200);
     const models = r.body.models as {
       id: string; available: boolean; latencyMs: number; active: boolean; sources: string[]; probe: string;
@@ -531,7 +532,7 @@ test('★ GET /models：模型探测不通 → available:false + **可读 reason
       },
     },
     async (ctx) => {
-      const r = await req(ctx, 'GET', '/api/v1/models', { as: 'admin' });
+      const r = await req(ctx, 'GET', '/api/v1/models?deep=1', { as: 'admin' });
       const models = r.body.models as { id: string; available: boolean; reason: string }[];
       const bad = models.find((m) => m.id === MODEL_B);
       assert.ok(bad, '应有 model-beta');
@@ -605,7 +606,7 @@ test('GET /models：/models 发现失败 → discovery.ok=false 且**不影响**
   await withCtx(
     { discovery: { status: 404, body: '{"error":"not found"}' } },
     async (ctx) => {
-      const r = await req(ctx, 'GET', '/api/v1/models', { as: 'admin' });
+      const r = await req(ctx, 'GET', '/api/v1/models?deep=1', { as: 'admin' });
       assert.equal(r.status, 200);
       const disc = r.body.discovery as Record<string, unknown>;
       assert.equal(disc.ok, false);

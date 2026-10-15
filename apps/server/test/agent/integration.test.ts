@@ -25,6 +25,19 @@ import { SYSTEM_PROMPT_MARKERS, type AgentFrame } from '../../src/agent/stream.t
 /** 每轮最长等待（模型慢/重试都需要时间；实测 403 走 3 次重试约 25s） */
 const ROUND_TIMEOUT_MS = 150_000;
 
+/**
+ * ★ **真调 LLM 的测试只在显式开启时跑** —— 否则每次 `npm test` 都会：
+ *   ① **烧真实额度**（用户明确要求控制成本）
+ *   ② **flaky**：实测撞过 `E_PI_TIMEOUT`（一次 28.5s 后整轮失败）
+ * 与 `test:e2e:audio` / `test:e2e:agent` **同一处理方式**（真机 e2e 不进默认套件）。
+ *
+ * 开启：`COURSE_KB_LLM_E2E=1 npm test`（或 `npm run test:e2e:llm`）
+ *
+ * ⚠️ **原错误写法**：这些测试**无条件**在默认套件里跑 →
+ *    `npm test` 每次都花额度，且网络/上游一抖动就红（把"环境抖动"报成"代码回归"）。
+ */
+const REAL_LLM = process.env.COURSE_KB_LLM_E2E === '1';
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -56,7 +69,7 @@ test('真实 loadSdk：pi SDK 1.2.0 可加载，导出可用', async () => {
   console.log(`    [measure] SDK 首次加载 ${sdk.loadMs}ms，version=${sdk.version}`);
 });
 
-test('★ 真实会话一轮：结束信号时序 + system 提示词不外泄 + 持久化可观测', async () => {
+test('★ 真实会话一轮：结束信号时序 + system 提示词不外泄 + 持久化可观测', { skip: !REAL_LLM }, async () => {
   const chatDir = mkdtempSync(join(tmpdir(), 'agent-real-'));
   const manager = new AgentSessionManager({
     sessionDir: chatDir, // 真落盘（验证 session_file 可观测）
@@ -146,7 +159,7 @@ test('★ 真实会话一轮：结束信号时序 + system 提示词不外泄 + 
   rmSync(chatDir, { recursive: true, force: true });
 });
 
-test('★ 真实 abort：运行中中断 → 本轮结束、回到空闲（aborted 字段是布尔）', async () => {
+test('★ 真实 abort：运行中中断 → 本轮结束、回到空闲（aborted 字段是布尔）', { skip: !REAL_LLM }, async () => {
   const manager = new AgentSessionManager({ sessionDir: null, tools: [] });
   const session = await manager.getOrCreate('integration-real-abort');
   const frames: AgentFrame[] = [];
