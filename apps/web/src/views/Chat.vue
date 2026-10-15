@@ -137,6 +137,18 @@ watch(() => props.context, (v) => { pageContext.value = { ...(v || {}) } }, { de
 const contextResolved = ref<{ doc_title?: string; unit_title?: string }>({})
 const contextDropped = ref<Array<{ field: string; value?: string; reason?: string }>>([])
 const contextUsed = ref<Record<string, unknown>>({})
+/**
+ * ★ 坑 21（扩展）：`context` 帧的 `used/resolved` 是**自述**，必须有"真的用上了"的**证据**。
+ *   证据来源（可核验）：本轮 `retrieval.sources`（真检索命中）或 kb 工具帧（真读了卡片）。
+ */
+const contextEvidence = computed(() => {
+  const hits = retrieval.value?.hits || 0
+  const kbTools = roundTools.value.filter((x) => x.tool === 'kb_search' || x.tool === 'kb_get')
+  return { hits, kbTools: kbTools.length, has: hits > 0 || kbTools.length > 0 }
+})
+const contextClaim = computed(() => !!(contextResolved.value.doc_title || contextResolved.value.unit_title))
+/** 声明了参考、但本轮**没有任何证据** → 如实提示（不许让用户以为"它看过我这一节"） */
+const contextUnverified = computed(() => contextClaim.value && !contextEvidence.value.has)
 const toolsSource = ref('')
 const TOOLS_SOURCE_LABEL: Record<string, string> = {
   'disabled-by-role': '按角色/缺省关闭（无工具 —— **这是正确的安全状态**）',
@@ -593,9 +605,16 @@ void _esc
       <div v-if="contextResolved.doc_title || contextResolved.unit_title || contextDropped.length"
            class="small ctx-bar" data-testid="context-used"
            :data-doc="contextResolved.doc_title || ''" :data-unit="contextResolved.unit_title || ''">
-        <b>正在参考：</b>
+        <b>服务端声明参考：</b>
         <span>{{ contextResolved.doc_title || '（未解析到文档）' }}</span>
         <span v-if="contextResolved.unit_title"> › {{ contextResolved.unit_title }}</span>
+        <!-- ★ 自述字段必须有证据（坑 21）：有检索/工具证据才算"真的用上了" -->
+        <span v-if="contextEvidence.has" class="pill ok" data-testid="context-evidence">
+          有证据：检索命中 {{ contextEvidence.hits }} 条{{ contextEvidence.kbTools ? ` / kb 工具 ${contextEvidence.kbTools} 次` : '' }}
+        </span>
+        <span v-else class="pill warn" data-testid="context-unverified">
+          未验证：本轮没有检索/工具证据（声明与实际可能不一致，以回答为准）
+        </span>
         <span v-if="contextDropped.length" class="bad-text" data-testid="context-dropped">
           ｜已忽略：{{ contextDropped.map((d) => `${d.field}（${d.reason || '未找到或无权访问'}）`).join('、') }}
         </span>

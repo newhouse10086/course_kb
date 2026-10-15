@@ -18,7 +18,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def run_cli(job: str, payload: dict | None = None, timeout: int = 120):
+def run_cli(job: str, payload: dict | None = None, timeout: int = 120,
+            env_extra: dict | None = None):
     blob = json.dumps({"job": job, **(payload or {})}, ensure_ascii=False)
     args = [sys.executable, "-m", "worker.cli", "--job", job]
     if len(blob) < 7000:
@@ -28,6 +29,7 @@ def run_cli(job: str, payload: dict | None = None, timeout: int = 120):
     env = {k: v for k, v in os.environ.items()
            if k.upper() not in ("PYTHONIOENCODING", "PYTHONUTF8")}
     env["PYTHONUTF8"] = "0"
+    env.update(env_extra or {})
     proc = subprocess.run(args, input=(blob if len(blob) >= 7000 else None),
                           capture_output=True, cwd=str(ROOT), timeout=timeout, text=True,
                           encoding="utf-8", env=env)
@@ -275,3 +277,71 @@ def test_logs_job_shape_and_isolation(session: dict) -> None:
 
     code, _d, last = run_cli("sandbox.logs", {**session, "request_user_id": "u_other"})
     assert code == 1 and last["code"] == "E_LOG_ISOLATION"
+
+# ═══════════════════════════════════════════════════════════════════════
+# ① 多引擎契约（本机可验部分）：未安装引擎 → 明确错误，**不静默回退 sqlite**
+# ═══════════════════════════════════════════════════════════════════════
+@pytest.mark.parametrize("engine", ["mysql", "postgres", "opengauss"])
+def test_unavailable_engine_never_falls_back_to_sqlite(tmp_path, engine: str) -> None:
+    """★ 指定未安装引擎必须**明确失败**，绝不静默回退 sqlite。
+
+    静默回退 = 学生以为在练 PG、其实在练 SQLite —— 典型"看起来成功"。
+    判据不只是错误码：**沙箱目录里不许出现任何 sqlite 文件**（回退的物理证据）。
+    """
+    root = tmp_path / "sbroot"
+    code, d, last = run_cli("sandbox.exec", {"engine": engine, "user_id": "u1",
+                                             "session_id": "s1", "root": str(root),
+                                             "sql": "SELECT 1"})
+    assert code == 1, d
+    assert last["code"] == "E_ENGINE_UNAVAILABLE"
+    assert engine in last["msg"]
+    detail = str(last.get("detail", ""))
+    assert "deploy-lab-db" in detail or "LAB_DB_DEPLOY" in detail
+    files = [p for p in root.rglob("*") if p.is_file()] if root.exists() else []
+    assert files == [], f"出现文件 → 疑似静默回退到 sqlite：{files}"
+
+
+def test_engine_and_dialect_labels_match_actual_engine(tmp_path) -> None:
+    """①-3 方言标注：engine/dialect 字段必须与实际执行的引擎一致。"""
+    root = tmp_path / "sbroot"
+    base = {"engine": "sqlite", "user_id": "u1", "session_id": "s1", "root": str(root),
+            "dataset": "sc"}
+    code, init, _ = run_cli("sandbox.init", base)
+    assert code == 0 and init["engine"] == "sqlite" and init["dialect"] == "sqlite"
+    code, sch, _ = run_cli("sandbox.schema", base)
+    assert sch["engine"] == "sqlite" and sch["dialect"] == "sqlite"
+    assert {tb["name"] for tb in sch["tables"]} == {"students", "courses", "enrollments"}
+    code, ex, _ = run_cli("sandbox.exec", {**base, "sql": "SELECT COUNT(*) AS n FROM students"})
+    assert ex["engine"] == "sqlite" and ex["rows"] == [[6]]
+    # 未安装引擎的 schema 也必须拒（不能拿 sqlite 的 schema 冒充 PG）
+    code, _d, last = run_cli("sandbox.schema", {**base, "engine": "postgres"})
+    assert code == 1 and last["code"] == "E_ENGINE_UNAVAILABLE"
+
+
+def test_credentials_are_reported_missing_but_never_echoed() -> None:
+    """①-4 凭据：如实报缺失（点名变量），且**绝不回显**其值。"""
+    secret = "SUPER_SECRET_PW_9f3a"
+    code, d, _ = run_cli("sandbox.engines", {}, env_extra={
+        "LAB_DB_ENGINE": "postgres", "LAB_DB_HOST": "127.0.0.1", "LAB_DB_PORT": "5432",
+        "LAB_DB_NAME": "labdb", "LAB_DB_USER": "labadmin", "LAB_PG_PASSWORD": secret})
+    assert code == 0
+    pg = [e for e in d["engines"] if e["id"] == "postgres"][0]
+    assert pg["available"] is False and "psql" in pg["reason"]     # 本机无 psql → 如实
+    assert pg["target"] == {"host": "127.0.0.1", "port": 5432, "database": "labdb"}
+    assert secret not in json.dumps(d, ensure_ascii=False)
+
+    code2, d2, _ = run_cli("sandbox.engines", {}, env_extra={
+        "LAB_DB_ENGINE": "mysql", "LAB_DB_HOST": "127.0.0.1"})
+    my = [e for e in d2["engines"] if e["id"] == "mysql"][0]
+    assert "LAB_MYSQL_PASSWORD" in my["reason"]        # 点名缺哪个变量
+    assert secret not in json.dumps(d2, ensure_ascii=False)
+
+
+def test_engines_report_declares_log_layers_honestly() -> None:
+    """①-1（附带）：日志层能力也要如实 —— sqlite 只有 L1，server 引擎 layers 为空。"""
+    code, d, _ = run_cli("sandbox.engines", {})
+    by_id = {s["id"]: s for s in d["logSources"]}
+    assert by_id["sqlite"]["layers"] == ["L1"] and by_id["sqlite"]["available"] is True
+    for eng in ("mysql", "postgres", "opengauss"):
+        assert by_id[eng]["layers"] == [] and by_id[eng]["available"] is False
+        assert by_id[eng]["reason"]

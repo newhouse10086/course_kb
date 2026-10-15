@@ -185,6 +185,13 @@ def ensure_default_log_sources(root: SandboxRoots | None = None) -> list[str]:
     return list(_LOG_SOURCES)
 
 
+def _embedded_ids() -> frozenset[str]:
+    """嵌入式引擎集合（**唯一事实源在 engine.py**，惰性导入避免循环依赖）。"""
+    from worker.sandbox.engine import EMBEDDED_ENGINE_IDS
+
+    return EMBEDDED_ENGINE_IDS
+
+
 def get_log_source(engine_id: str = "sqlite",
                    root: SandboxRoots | None = None) -> LogSource | None:
     """取日志源；``root`` 给了就用它重建 SQLite 日志源。
@@ -194,7 +201,8 @@ def get_log_source(engine_id: str = "sqlite",
     """
     ensure_default_log_sources(root)
     key = (engine_id or "sqlite").lower()
-    if root is not None and key == "sqlite":
+    if root is not None and key in _embedded_ids():
+        # 嵌入式引擎的日志源要绑定 root（L1 = 该会话的 audit JSONL）
         _LOG_SOURCES["sqlite"] = SqliteLogSource(root=root)
     return _LOG_SOURCES.get(key)
 
@@ -233,8 +241,25 @@ class _UnavailableLogSource:
         return []
 
 
+def _runtime_of(engine_id: str) -> str:
+    """取引擎运行时类型（``embedded`` / ``server``）。
+
+    ⚠️ 取不到时（引擎未注册 / 名字写错）返回 **``"server"``（保守）**：
+    于是文案是"读不到该引擎日志（原因：…）"而不是"日志可读但没记录"。
+    宁可说"读不到"，也不能把未知引擎说成"可读" —— 那是"看起来成功"。
+    """
+    try:
+        from worker.sandbox.engine import get_engine
+
+        runtime = getattr(get_engine(engine_id).info, "runtime", "server")
+        return str(getattr(runtime, "value", runtime) or "server")
+    except Exception:  # noqa: BLE001 - 任何异常都按保守处理
+        return "server"
+
+
 def status_fact(entries: list[dict[str, Any]], *, engine_id: str = "sqlite",
-                reason: str = "") -> tuple[str, str]:
+                reason: str = "", runtime: str | None = None,
+                layers: tuple[str, ...] = ()) -> tuple[str, str]:
     """把"日志状态"变成**中文事实句** —— 直接给调用方/模型用。
 
     为什么不能只给一个英文状态词（``ok``/``empty``/``unavailable``）：
@@ -242,9 +267,14 @@ def status_fact(entries: list[dict[str, Any]], *, engine_id: str = "sqlite",
     "我暂时读不到该实例的引擎日志" —— **事实说错**，学生会以为系统坏了。
     给中文事实句 + 明确的"≠ 读不到"，模型才不容易编。
 
+    :param runtime: ``embedded`` / ``server``；**不传就按引擎注册表推导**
+        （默认值刻意不用 ``embedded`` —— 那会把未知引擎说成"可读"）
     :return: ``(status, fact)``，``status ∈ {"ok","empty","unavailable"}``
     """
-    if engine_id != "sqlite":
+    # ★ 判据是**运行时/能力**，不是引擎 id（原写法 `engine_id != "sqlite"` 会把
+    #   任何新引擎都当"读不到"，而且要求改代码才能支持新引擎）
+    rt = runtime if runtime is not None else _runtime_of(engine_id)
+    if rt != "embedded" or (layers and "L1" not in layers):
         return "unavailable", (f"读不到该引擎的日志（原因：{reason or '该引擎的日志源 adapter 尚未接入'}）"
                               "——请如实说明，不要假装看过")
     if not entries:

@@ -588,3 +588,50 @@ worker 外壳统一保证协议格式与退出码。
 * 日志层次：SQLite **只有 L1**（引擎原文报错 + 我们的 audit_log）；
   **没有 L2/L3**（嵌入式引擎无实例视图、无日志文件）→ `boundary` 字段明确要求 agent
   「读不到引擎日志就如实说，不许假装看过」。
+
+## 11. 多引擎沙箱：**已验证 / 未验证**清单（如实交付的一部分）
+
+> 本机事实：**没有 MySQL / PostgreSQL / openGauss**，**没有 Docker**（不装）。
+> 所以「未验证」里**能验的部分已全部验掉**（契约层、错误路径、脚本自检），
+> 真连真跑的部分**列成可照做的步骤** —— 运维照着跑就能验，而不是只看到"未验证"四个字。
+
+### 11.1 已在本机验证（真跑，不是推断）
+
+| # | 项目 | 判据（实测） |
+|---|---|---|
+| 1 | 引擎注册表如实上报 | `sandbox.engines` → mysql/postgres/opengauss `available:false` + reason 指向 `docs/LAB_DB_DEPLOY.md §4.x`；sqlite `available:true` |
+| 2 | **未安装引擎不静默回退** | 三引擎 `sandbox.exec` → **exit 1 + `E_ENGINE_UNAVAILABLE`**；且沙箱目录**没有产生任何文件**（回退的物理证据） |
+| 3 | 方言标注与实际引擎一致 | `sandbox.init/schema/exec` 均报 `engine:"sqlite"` + `dialect:"sqlite"`；`schema` 指定 postgres → `E_ENGINE_UNAVAILABLE`（不拿 sqlite 的 schema 冒充） |
+| 4 | 凭据如实报缺失、**绝不回显** | 设 `LAB_PG_PASSWORD=<秘密>` 跑 → 输出里**搜不到该值**；缺密码时 reason 点名 `LAB_MYSQL_PASSWORD` |
+| 5 | 日志层能力如实 | `logSources`: sqlite `layers:["L1"]`、available；三 server 引擎 `layers:[]` + reason |
+| 6 | 可插拔性（**结构断言**） | 核心模块（exec/guard/schema/datasets/history/errmsg）**零** `engine == "..."` 分支；新增引擎只需 `register_engine()`（测试断言 `register_engine` 只接受一个对象） |
+| 7 | 结果里的 `engine` 标签**不硬编码** | 改前 `exec.py` 4 处写死 `"sqlite"`（接 MySQL 后标签会撒谎）→ 现在由引擎实例透传，测试直接断言 `execute(..., engine_id="mysql")` 返回 `engine:"mysql"` |
+| 8 | 部署脚本语法 | `bash -n scripts/deploy-lab-db.sh` → **exit 0** |
+| 9 | 部署脚本 `--dry-run` | sqlite/mysql/postgres → exit 0（打印 `[dry-run]` 命令，密码打码 `'***'`）；**opengauss → exit 3**（Ubuntu 上明确拒绝 + 理由） |
+| 10 | 部署脚本 `--check` 真自检 | sqlite → **exit 0**，真建表/插入/更新/回读/删除 + 报真实版本 3.45.1；mysql/postgres（有凭据、无客户端）→ **exit 4** `找不到 mysql/psql 客户端` |
+| 11 | 缺凭据 / 缺 TTY 的错误路径 | 无 TTY → exit 2 + `请改用：LAB_MYSQL_PASSWORD='...' ./scripts/deploy-lab-db.sh mysql` |
+| 12 | **缺 sudo / 缺包管理器** | 无 sudo → exit **1** + `需要 root 权限，但没有 sudo 命令。请以 root 身份运行；或加 --check 只做自检`；无 apt/dnf → exit **3** + `本机既没有 apt-get 也没有 dnf/yum…请按 docs/LAB_DB_DEPLOY.md §4 手工安装` |
+| 13 | 幂等性设计 | 代码证据：`CREATE USER IF NOT EXISTS`/`CREATE TABLE IF NOT EXISTS`、`pg_roles` 存在性检查 + `RAISE NOTICE '已存在 → 已更新密码与权限（幂等）'`、`pg_hba.conf` 行级 `grep -qF` 跳过、`.env` **upsert 不动其它键**、安装步骤 `已装则 apt/dnf 直接跳过`；脚本头声明"重复跑不报错、不重复建号" |
+| 14 | 退出码语义 | `EXIT_OK=0 / EXIT_FAIL=1 / EXIT_USAGE=2 / EXIT_UNSUPPORTED=3 / EXIT_SELFCHECK=4`（实测各分支与常量一致） |
+
+### 11.2 未验证清单（**照做就能验**）
+
+| 项目 | 为什么本机验不了 | 在有 DB 的机器上怎么验（具体命令） | 风险 |
+|---|---|---|---|
+| MySQL 真实执行（CRUD/事务/权限） | 本机无 MySQL；不装 Docker、不改系统 | `LAB_MYSQL_PASSWORD='…' bash scripts/deploy-lab-db.sh mysql -y`（末尾自检须 exit 0）→ 再 `python -m worker.cli --job sandbox.exec --in '{"engine":"mysql","user_id":"u1","session_id":"s1","sql":"SELECT 1 AS x"}'` → 期望 `engine:"mysql"`、`ok:true` | **高** |
+| PostgreSQL 真实执行 | 同上 | `LAB_PG_PASSWORD='…' bash scripts/deploy-lab-db.sh postgres -y` → `sandbox.schema`/`sandbox.exec` 同断言（`engine:"postgres"`） | **高** |
+| openGauss 真实执行 | 官方只支持 openEuler/CentOS；本机 Ubuntu + WSL | 在 openEuler 虚机/容器里 `bash scripts/deploy-lab-db.sh opengauss --check --host <host> --port 5432`；再跑同一批 `sandbox.exec` | 中 |
+| 服务器引擎上的**危险语句负例**（ATTACH / `load_extension` / 多语句 / GRANT） | 无 DB → 现在只会得到 `E_ENGINE_UNAVAILABLE`，**验不到**闸在真引擎上的行为 | 装好后跑 §10.2 那批负例 → 期望 `E_SQL_FORBIDDEN` / `E_SQL_MULTI`（**不是** `E_ENGINE_UNAVAILABLE`） | 中 |
+| 方言差异（`AUTO_INCREMENT` / `NOW()` / `LIMIT` 写法） | 无 DB | 用 MySQL 方言 SQL 打 `sandbox.exec`（engine=mysql）→ 期望引擎**原生**错误，且 `hints` **不再**给"MySQL 的 NOW() 应写成 `datetime('now')`"这类**反向**提示（提示目前由 `dialect_hints()` 按 SQLite 目标生成，接 MySQL 后需要按目标方言分派） | 中 |
+| 跨调用事务拒绝在 server 引擎上同样生效 | 无 DB（逻辑在 `exec.py`，与引擎无关，但未在真 server 引擎上跑过） | 装好后单发 `{"engine":"mysql","sql":"BEGIN"}` → 期望 `E_SQL_UNSUPPORTED` + `who:"rules"` | 低 |
+| L2/L3 日志（slow log / `pg_stat_statements`） | adapter 未接入 + 无 DB | 按 `docs/LAB_DB_DEPLOY.md §8` 接 adapter → `sandbox.logs` 期望 `layers` 含 L2/L3、`status:"ok"`；`boundary` 不再说"该引擎没有 L2/L3" | 中 |
+| `--check` 的**真连通**（客户端在 + 服务在跑） | 本机无客户端 → 现在只验到"找不到客户端"这一层 | 装好后 `bash scripts/deploy-lab-db.sh mysql --check` → 期望 **exit 0** + 真查询回读（不是只看客户端存在） | 中 |
+| 部署脚本在 debian / rocky / openEuler 各分支的真安装 | 本机只有 WSL Ubuntu，且**不该改系统** | 目标发行版上先 `--dry-run` 核对命令 → 再真跑 → 期望 exit 0 且末尾自检通过（幂等：再跑一次输出一致） | 中 |
+| Node/TS 侧 `/capabilities.sandbox` 端到端 | `apps/server/**` 属 T-BACKEND 写域 | 由 backend-api 在真 HTTP 上验（worker 层字段已验：见 11.1 第 1/5 条） | 低 |
+
+### 11.3 结论（一句话）
+
+**契约层与错误路径：已验证**（14 项真跑）。
+**真连真跑：未验证**（10 项，逐项给了可执行命令）。
+没有任何一项是"看起来成功"—— 未安装引擎一律 `E_ENGINE_UNAVAILABLE`、缺客户端一律 exit 4、缺 sudo/包管理器一律 exit 1/3，**全部如实失败**。
+

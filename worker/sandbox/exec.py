@@ -54,12 +54,17 @@ def _popen_kwargs() -> dict[str, Any]:
 def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
             timeout_ms: int = 5_000, user_id: str = "", session_id: str = "",
             allow_multi: bool = False, root: str | Path | None = None,
-            max_db_bytes: int | None = None, record_history: bool = True) -> dict[str, Any]:
+            max_db_bytes: int | None = None, record_history: bool = True,
+            engine_id: str = "sqlite") -> dict[str, Any]:
     """执行一条（或一批显式分隔的）SQL，返回 ``ExecResult`` 形状的字典。
 
     结果里有两个**给人看**的额外字段（S4 答疑要用）：
     * ``error.message`` —— **引擎原文**（一字不改）
     * ``error.hint``    —— 本地确定性解读（如"表不存在 → 先看 sqlite_master"）
+
+    ⚠️ **原错误写法**：结果里的 ``engine`` 字段曾**硬编码 "sqlite"** ——
+    一旦接入 MySQL/PG，标签就会**撒谎**（学生以为在练 MySQL，结果里写着 sqlite）。
+    现在由调用方（引擎实例）传入 ``engine_id``，**标签只能来自真正执行的引擎**。
     """
     roots = SandboxRoots.resolve(root)
     path = roots.validate(db_path)
@@ -70,7 +75,7 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     if not verdict.ok:
         result = {
             "columns": [], "rows": [], "rowCount": 0, "elapsedMs": 0,
-            "engine": "sqlite", "hints": hints, "ok": False,
+            "engine": engine_id, "hints": hints, "ok": False,
             "killedBy": None, "hardKilled": False,
             "error": {"code": verdict.code, "message": verdict.msg, "raw": verdict.msg,
                       "hint": "该语句被沙箱安全策略拒绝（并非 SQL 写错）",
@@ -96,7 +101,7 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
                     code="E_SQL_UNSUPPORTED", kind=verdict.kind, elapsed_ms=0, row_count=0)
         return {
             "columns": [], "rows": [], "rowCount": 0, "elapsedMs": 0,
-            "engine": "sqlite", "hints": hints, "ok": False,
+            "engine": engine_id, "hints": hints, "ok": False,
             "killedBy": None, "hardKilled": False, "txUnsupported": True,
             "error": {
                 "code": "E_SQL_UNSUPPORTED",
@@ -155,7 +160,7 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
     if timed_out:
         result = {
             "columns": [], "rows": [], "rowCount": 0, "elapsedMs": elapsed_ms,
-            "engine": "sqlite", "hints": hints, "hardKilled": True, "killedBy": "process",
+            "engine": engine_id, "hints": hints, "hardKilled": True, "killedBy": "process",
             "error": {
                 "code": "E_SQL_TIMEOUT",
                 "message": f"执行超过 {timeout_ms}ms，**进程已被硬杀**（进程级超时）",
@@ -189,14 +194,16 @@ def execute(*, db_path: str | Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS,
             "hint": "沙箱执行体自身出错；这不是学生 SQL 的问题",
         }
         result = {"columns": [], "rows": [], "rowCount": 0, "elapsedMs": elapsed_ms,
-                  "engine": "sqlite", "hints": hints, "error": err}
+                  "engine": engine_id, "hints": hints, "error": err}
         if record_history:
             _record(roots, user_id, session_id, sql=sql, ok=False, error=err["message"],
                     code=err["code"], kind=verdict.kind, elapsed_ms=elapsed_ms, row_count=0)
         return result
 
     result = dict(parsed)
-    result.setdefault("engine", "sqlite")
+    # ★ 标签以**父进程传入的 engine_id 为准**（原错误写法：setdefault("engine","sqlite")）
+    #   子进程（runner）不设这个字段，所以 setdefault 会让 MySQL 的结果写着 sqlite
+    result["engine"] = engine_id
     result["hints"] = hints or result.get("hints") or []
     result.setdefault("elapsedMs", elapsed_ms)
     if proc.returncode not in (0,) and not result.get("error"):

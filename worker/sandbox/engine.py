@@ -31,6 +31,11 @@ from typing import Any, Protocol, runtime_checkable
 #: 会据此宣称"支持事务"。而"每次执行独立进程"是**两条安全属性的前提**：
 #: ① 硬超时能真杀（死循环不拖死服务）② 学生之间天然隔离（无共享连接状态）。
 #: → 我们选择**保住安全属性**，把能力说清楚，并把可用路径（同一次调用内）指出来。
+#: ★ **嵌入式引擎集合**（唯一事实源）：只有它们接受"文件系统 root / 每会话一个库文件"。
+#: 业务逻辑**不许**再写 `engine == "sqlite"` —— 需要区分时问
+#: `EngineInfo.capabilities["dbPath"]` 或本集合（注册表内部用）。
+EMBEDDED_ENGINE_IDS: frozenset[str] = frozenset({"sqlite"})
+
 TRANSACTIONS_SQLITE: dict[str, Any] = {
     "same_call": True,
     "cross_call": False,
@@ -59,6 +64,8 @@ class EngineInfo:
     capabilities: dict[str, Any] = field(default_factory=lambda: {
         "crud": True, "ddl": True, "transactions": TRANSACTIONS_SQLITE,
         "procedures": False, "maxRowsDefault": 200,
+        #: 是否接受文件系统 db_path（嵌入式引擎才有；server 引擎连的是服务）
+        "dbPath": True,
     })
     target: dict[str, Any] = field(default_factory=dict)   # **脱敏**：不含密码
 
@@ -154,7 +161,8 @@ def get_engine(engine_id: str = "sqlite", root: str | Path | None = None) -> Dat
     key = (engine_id or "sqlite").lower()
     if key not in _REGISTRY:
         raise KeyError(key)
-    if root is not None and key == "sqlite":
+    if root is not None and key in EMBEDDED_ENGINE_IDS:
+        # 嵌入式引擎按 root 重建实例（每会话一个库文件）；server 引擎不需要 root
         _REGISTRY["sqlite"] = SQLiteEngine(root)
     return _REGISTRY[key]
 
@@ -202,7 +210,8 @@ class SQLiteEngine:
             available=True,
             capabilities={"crud": True, "ddl": True,
                           "transactions": dict(TRANSACTIONS_SQLITE),
-                          "procedures": False, "maxRowsDefault": 200},
+                          "procedures": False, "maxRowsDefault": 200,
+                          "dbPath": True},
         )
 
     # ── 路径 ──────────────────────────────────────────────────────────
@@ -298,6 +307,9 @@ class SQLiteEngine:
             # ★ 必须把引擎自己的根目录传下去：否则 driver 会用**默认**根去校验路径
             #   （payload 指定的 root 被忽略 → E_SANDBOX_PATH，或写到别的地方）
             root=str(self._roots.root),
+            # ★ 结果里的 engine 标签只能来自**真正执行的引擎**
+            #   （原错误写法：exec.py 里硬编码 "sqlite" → 接 MySQL 后标签会撒谎）
+            engine_id=self.info.id,
         )
 
     def list_datasets(self) -> list[dict[str, Any]]:
@@ -352,7 +364,8 @@ class _ServerEngineStub:
             available=False, reason=self._reason(),
             capabilities={"crud": True, "ddl": True,
                           "transactions": dict(TRANSACTIONS_SERVER),
-                          "procedures": procedures, "maxRowsDefault": 500},
+                          "procedures": procedures, "maxRowsDefault": 500,
+                          "dbPath": False},   # server 引擎没有本地库文件
             # 脱敏：只有 host/port/database（不含密码、不含账号等凭据）
             target={k: v for k, v in (("host", host or None), ("port", port or None),
                                       ("database", database or None)) if v},

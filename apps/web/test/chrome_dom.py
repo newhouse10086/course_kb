@@ -508,7 +508,14 @@ def main() -> int:
                 ("lab", "lab?load=1", 'data-ctx-keys="session_id"'),
             ]
             for name, route, want_ctx in pages:
-                dump_dom(driver, url(normal, route), READY_VIEW)
+                # ⚠️ 这里**不能**用 READY_VIEW（它只认 selftest-report/docs-report）——
+                #    无自检的页面（settings/lab/graph）会一直等到超时。小助手是全局的，用它当就绪信号。
+                dump_dom(driver, url(normal, route),
+                         "!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=120)
+                if want_ctx == 'data-ctx-keys="session_id"':
+                    # Lab 的 session_id 要等沙箱会话建立后才写入
+                    driver.ch.wait_for("(document.querySelector('[data-testid=\"assistant-dock\"]')?.dataset.ctxKeys || '').includes('session_id')",
+                                       timeout=120, interval=0.3)
                 dom = driver.ch.outer_html()
                 ok(f"{name}：小助手浮动入口存在", 'data-testid="assistant-fab"' in dom, f"{name} 无入口")
                 ok(f"{name}：入口标出所在页", f'data-page="/{name}"' in dom)
@@ -525,7 +532,8 @@ def main() -> int:
         run_view("全局小助手 / 六个页面都能打开", check_dock_everywhere)
 
         def check_dock_chat() -> None:
-            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"), READY_VIEW)
+            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"),
+                     "!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=120)
             driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
             driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"chat-input\"]')", timeout=30, interval=0.2)
             # 在抽屉里真发一条 → 真流式回答（走同一个 WS）

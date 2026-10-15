@@ -815,7 +815,8 @@ def job_sandbox_exec(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
 
     eng = _sandbox_engine(payload)
     user_id, session_id = _sandbox_ids(payload)
-    if payload.get("db_path") and getattr(eng.info, "id", "") == "sqlite":
+    # ★ 用能力判断而不是引擎 id：只有嵌入式引擎才有"文件系统 db_path"这回事
+    if payload.get("db_path") and eng.info.capabilities.get("dbPath"):
         expected = eng.db_path_for(user_id, session_id)
         given = Path(str(payload["db_path"]))
         if os.path.abspath(str(given)) != os.path.abspath(str(expected)):
@@ -895,7 +896,14 @@ def job_sandbox_logs(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
     from worker.sandbox import logs as logs_mod
     from worker.sandbox.paths import SandboxRoots
 
+    from worker.sandbox import engine as engine_mod
+
     engine_id = str(opt(payload, "engine", "sqlite") or "sqlite").lower()
+    # 引擎的运行时类型（embedded/server）决定日志边界文案 —— 不按 id 猜
+    try:
+        eng_info = engine_mod.get_engine(engine_id).info
+    except KeyError:
+        eng_info = None
     roots = SandboxRoots.resolve(opt(payload, "root"))
     # ★ 必须把 root 传进去：否则读到的是仓库默认目录的历史（payload 的 root 被忽略）
     source = logs_mod.get_log_source(engine_id, roots)
@@ -915,8 +923,13 @@ def job_sandbox_logs(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
         raise _Fail("E_LOG_ISOLATION", str(exc), "A 学生不能看 B 学生的 SQL 日志") from exc
     except ValueError as exc:
         raise PayloadError(str(exc)) from exc
+    # 运行时/层数从**引擎与日志源自己**取（不按 id 猜）
+    runtime = getattr(getattr(eng_info, "runtime", None), "value", None) or \
+        str(getattr(eng_info, "runtime", "server"))
     status, fact = logs_mod.status_fact(entries, engine_id=engine_id,
-                                        reason=source.info.reason)
+                                        reason=source.info.reason,
+                                        runtime=str(runtime),
+                                        layers=tuple(source.info.layers or ()))
     out: dict[str, Any] = {
         "source": source.info.to_dict(),
         "entries": entries,
@@ -927,9 +940,9 @@ def job_sandbox_logs(payload: dict[str, Any], emit: Emitter) -> dict[str, Any]:
         "fact": fact,
         "auditLogged": True,      # 本次读取已写审计（§8.5.5），但不作为日志内容返回
     }
-    if engine_id == "sqlite":
+    if str(runtime) == "embedded":
         # 精确表述：不是"拿不到"，是**嵌入式引擎根本没有这两层**
-        out["boundary"] = ("该引擎**没有** L2/L3：SQLite 是嵌入式引擎，"
+        out["boundary"] = (f"该引擎**没有** L2/L3：{engine_id} 是嵌入式引擎，"
                            "既没有实例级统计视图、也没有日志文件（不是权限或网络问题）；"
                            "L1（引擎原文报错 + audit_log）已在上面的 entries 里")
     else:

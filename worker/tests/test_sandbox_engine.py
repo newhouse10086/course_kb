@@ -456,6 +456,81 @@ def test_capabilities_shape_is_typed() -> None:
             assert "同一次" in tx["note"] or "未接入" in tx["note"], tx["note"]
 
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# ④ 可插拔性：**结构断言**（把"新增引擎只改配置不改核心"变成可执行的）
+# ═══════════════════════════════════════════════════════════════════════
+#: 这些模块是**业务核心**（执行/安全/自省/数据集/审计/报错解读）——
+#: 它们**不许**按引擎 id 分支，否则新增引擎就得改它们（可插拔性就是假的）。
+CORE_MODULES = ("exec.py", "guard.py", "schema.py", "datasets.py", "history.py", "errmsg.py")
+#: 引擎 id 字面量（出现比较即为违规）
+ENGINE_IDS = ("sqlite", "mysql", "postgres", "opengauss")
+
+
+def test_business_logic_has_no_engine_id_branches() -> None:
+    """★ 核心模块里不许出现 `engine == "sqlite"` 这类分支。
+
+    改前实测：`exec.py` 里 **4 处硬编码 `"engine": "sqlite"`**（接 MySQL 后标签会撒谎）、
+    `logs.py::status_fact` 用 `engine_id != "sqlite"` 判文案、`cli.py` 用 id 判 db_path 校验。
+    现在这些全部改成**能力/运行时判断**（`capabilities["dbPath"]`、`runtime == "embedded"`）。
+    本测试防止回退 —— 它测的不是"值"，而是**结构**。
+    """
+    import re
+
+    sandbox_dir = Path(engine_mod.__file__).parent
+    pattern = re.compile(r'(==|!=)\s*[f]?["\'](' + "|".join(ENGINE_IDS) + r')["\']')
+    offenders: list[str] = []
+    for name in CORE_MODULES:
+        for i, line in enumerate((sandbox_dir / name).read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if pattern.search(code):
+                offenders.append(f"{name}:{i}: {line.strip()}")
+    assert not offenders, (
+        "核心模块出现引擎 id 分支（新增引擎要改核心 = 可插拔性是假的）：\n  "
+        + "\n  ".join(offenders))
+
+
+def test_new_engine_only_touches_the_registry() -> None:
+    """新增引擎的**唯一**改动点 = 注册一个实现了 Protocol 的对象（不改核心）。"""
+    import inspect
+
+    # ① 注册接口足够小：register_engine 只接受一个对象
+    sig = inspect.signature(engine_mod.register_engine)
+    assert list(sig.parameters) == ["engine"], sig
+    # ② Protocol 是结构化类型（duck typing）→ 不需要继承基类
+    assert isinstance(FakeEngine(), engine_mod.DatabaseEngine)
+    # ③ 核心模块里**不出现** fake/新引擎的名字（证明核心对具体引擎无感）
+    sandbox_dir = Path(engine_mod.__file__).parent
+    for name in CORE_MODULES:
+        body = (sandbox_dir / name).read_text(encoding="utf-8")
+        assert "fake" not in body.lower() or "fake" not in body, f"{name} 引用了具体引擎名"
+
+
+def test_exec_engine_label_is_threaded_not_hardcoded() -> None:
+    """★ 结果里的 ``engine`` 标签必须**来自调用方**（原写法硬编码 "sqlite"）。
+
+    接入 MySQL/PG 后若标签仍写 sqlite，学生看到的"我在练 MySQL"就是假的 ——
+    正是"看起来成功"的一类。这里直接调底层 execute 证明标签是**参数**。
+    """
+    import tempfile
+
+    from worker.sandbox import exec as exec_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "lbl.sqlite3"
+        # 用非 sqlite 的标签调用（纯标签验证；真实引擎不会这么调）
+        out = exec_mod.execute(db_path=db, sql="SELECT 1 AS x", root=tmp,
+                               engine_id="mysql", record_history=False)
+        assert out["engine"] == "mysql", out["engine"]
+        # 默认仍是 sqlite（向后兼容）
+        out2 = exec_mod.execute(db_path=db, sql="SELECT 1 AS x", root=tmp,
+                                record_history=False)
+        assert out2["engine"] == "sqlite"
+        # 出错路径的标签也要透传（不是只有成功路径对）
+        out3 = exec_mod.execute(db_path=db, sql="SELECT * FROM 没有的表", root=tmp,
+                                engine_id="postgres", record_history=False)
+        assert out3["ok"] is False and out3["engine"] == "postgres"
+
 def test_engines_report_json_roundtrip_keeps_shape() -> None:
     """能力上报经 JSON 序列化后形状不变（Node 拿到的就是这份）。"""
     import json as _json
