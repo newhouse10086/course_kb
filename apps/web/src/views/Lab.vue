@@ -14,6 +14,7 @@
  */
 import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { setAssistantContext } from '../composables/useAssistantContext'
 import { api } from '../api/client'
 import { postSse } from '../api/sse'
 import { useCaps } from '../composables/useCaps'
@@ -164,6 +165,15 @@ async function loadDatasets() {
   }
 }
 
+/**
+ * ★ 小助手上下文（Lead 裁定）：把**沙箱会话 id** 带上 —— 这样"问助教"能直接看这位学生的 SQL 与报错。
+ * ⚠️ 只传 id（不传 SQL/报错文本）：客户端传的东西不可信，服务端按 userId 校验归属后自己取。
+ */
+function syncAssistantContext() {
+  const sid = session.value?.sessionId
+  setAssistantContext(sid ? { session_id: sid } : {}, sid ? `沙箱会话 ${sid.slice(0, 18)}…` : '')
+}
+
 async function openSession() {
   busy.value = true
   try {
@@ -175,6 +185,7 @@ async function openSession() {
     runError.value = null
     history.value = []
     note.value = `沙箱已就绪：${s.sessionId}（数据集 ${s.dataset} · 引擎 ${s.engine}${s.created ? ' · 新建' : ' · 复用'}）`
+    syncAssistantContext()
     // 服务端有权威的审计历史（教学追溯）→ 拉回来展示，别只显示本地那几条
     try {
       const h = await api.sandboxHistory(s.sessionId)

@@ -496,6 +496,76 @@ def main() -> int:
             ok("wiki：why 里是可读的命中原因（bigram 命中「索引」）", "bigram 命中" in why_dom, "why 未显示可读原因")
             ok("wiki：命中项带 title/score", "聚簇索引" in why_dom and "score" in why_dom)
 
+        # ============ 9b-2. 全局 chat 小助手：**每个页面**都能打开（用户明确需求） ============
+        def check_dock_everywhere() -> None:
+            # 六个页面（含我新做的 Settings / Lab）逐个断言：浮动入口存在 + 抽屉能开
+            pages = [
+                ("wiki", f"wiki?doc={DOC_PDF}&unit={UNIT}", 'data-ctx-keys="doc_id,unit_id"'),
+                ("graph", f"graph?doc={DOC_PDF}", 'data-ctx-keys="doc_id"'),
+                ("video", f"video?doc={DOC_VIDEO}", 'data-ctx-keys="doc_id"'),
+                ("docs", "docs", ""),
+                ("settings", "settings", ""),
+                ("lab", "lab?load=1", 'data-ctx-keys="session_id"'),
+            ]
+            for name, route, want_ctx in pages:
+                dump_dom(driver, url(normal, route), READY_VIEW)
+                dom = driver.ch.outer_html()
+                ok(f"{name}：小助手浮动入口存在", 'data-testid="assistant-fab"' in dom, f"{name} 无入口")
+                ok(f"{name}：入口标出所在页", f'data-page="/{name}"' in dom)
+                driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+                driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"]')", timeout=30, interval=0.2)
+                drawer = driver.ch.outer_html()
+                ok(f"{name}：抽屉能打开且内含对话组件", 'data-testid="assistant-drawer"' in drawer and 'data-testid="chat-input"' in drawer)
+                if want_ctx:
+                    ok(f"{name}：带对页面上下文（{want_ctx}）", want_ctx in drawer,
+                       f"{name} 上下文缺失：{want_ctx}")
+                # 关掉，避免影响后续用例
+                driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-close\"]').click()")
+
+        run_view("全局小助手 / 六个页面都能打开", check_dock_everywhere)
+
+        def check_dock_chat() -> None:
+            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"), READY_VIEW)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"chat-input\"]')", timeout=30, interval=0.2)
+            # 在抽屉里真发一条 → 真流式回答（走同一个 WS）
+            driver.ch.evaluate("(() => { const d=document.querySelector('[data-testid=\"assistant-drawer\"]');"
+                               " const t=d.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='这一节讲什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => d.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-text\"]')",
+                               timeout=60, interval=0.3)
+            dom = driver.ch.outer_html()
+            ok("小助手：能发消息并流式回答", 'data-testid="assistant-text"' in dom)
+            ok("小助手：显示正在参考（服务端解析出的真实标题）",
+               'data-testid="context-used"' in dom and "MySQL 26.7 Reference Manual" in dom, "未显示 context 帧的 resolved 标题")
+
+        run_view("全局小助手 / 真发消息 + 上下文回显", check_dock_chat)
+
+        # ============ 9b-3. tools 自述字段与实际值**同源**（AGENTS.md 坑 21） ============
+        def check_tools_consistency() -> None:
+            # chat 模式：source=disabled-by-role ⇒ tools 必须为空
+            dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='一致性检查'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            driver.ch.wait_for("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.source === 'disabled-by-role'",
+                               timeout=60, interval=0.2)
+            tools = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.tools || ''")
+            ok("chat：tools_source=disabled-by-role ⇒ tools 必须为空（同源断言）",
+               str(tools).strip() == "", f"tools={tools}")
+            # agent 模式：source=kb-readonly ⇒ tools 必须含 KB 工具（反向断言：说开了就真开）
+            driver.ch.evaluate("document.querySelector('[data-testid=\"mode-agent\"]').click()")
+            driver.ch.wait_for("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.source === 'kb-readonly'",
+                               timeout=60, interval=0.2)
+            tools2 = driver.ch.evaluate("document.querySelector('[data-testid=\"session-tools\"]')?.dataset.tools || ''")
+            ok("agent：tools_source=kb-readonly ⇒ tools 必须含 kb_search/kb_get（同源断言）",
+               "kb_search" in str(tools2) and "kb_get" in str(tools2), f"tools={tools2}")
+            ok("agent：自述只读时绝不含危险工具（反向断言）",
+               not any(x in str(tools2) for x in ("bash", "read", "edit", "write")), f"tools={tools2}")
+
+        run_view("工具自述 vs 实际（同源断言，坑 21）", check_tools_consistency)
+
         # ============ 9c. 模式选择器（chat / agent）—— 用户需求，两个正交控件 ============
         def check_mode_switch() -> None:
             dom = dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)

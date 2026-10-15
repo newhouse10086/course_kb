@@ -277,11 +277,24 @@ function onEvent(e: ChatServerEvent) {
     case 'thinking_delta':
       updateLast((m) => { m.thinking += String((e as any).delta || '') })
       break
-    case 'tool_start':
-      updateLast((m) => m.tools.push({ id: String((e as any).id), tool: String((e as any).tool), args: (e as any).args, done: false }))
-      // ★ 同轮归组：wiki 那次"去查 sqlite"就是这条，不显示用户就不知道它做了额外工作
-      roundTools.value = [...roundTools.value, { id: String((e as any).id), tool: String((e as any).tool), args: (e as any).args, done: false }]
+    case 'tool_start': {
+      /**
+       * ★ **按 call id 分组**（backend-api/Lead 2026-10-15）：
+       *   同一次工具调用可能被重复发 `tool_start`（帧层重复）→ **同 id 不重复显示**；
+       *   id 不同 = 模型真的调了两次 → **如实显示两次**（去重会变成谎报）。
+       *   这样不依赖"重复发 vs 真调两次"的结论，天然正确。
+       */
+      const tid = String((e as any).id)
+      updateLast((m) => {
+        const exist = m.tools.find((x) => x.id === tid)
+        if (exist) { exist.args = (e as any).args ?? exist.args; return }
+        m.tools.push({ id: tid, tool: String((e as any).tool), args: (e as any).args, done: false })
+      })
+      roundTools.value = roundTools.value.some((x) => x.id === tid)
+        ? roundTools.value
+        : [...roundTools.value, { id: tid, tool: String((e as any).tool), args: (e as any).args, done: false }]
       break
+    }
     case 'tool_update':
       updateLast((m) => {
         const t = m.tools.find((x) => x.id === (e as any).id)
