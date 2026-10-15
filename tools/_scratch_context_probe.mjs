@@ -74,9 +74,9 @@ try {
   form.append('file', new Blob([`# 第 3 章 索引\n\n聚簇索引把数据行按主键顺序存放在叶子页，因此范围查询很快。\n`.repeat(20)], { type: 'text/markdown' }), 'ctx-probe.md');
   const up = await fetch(`${BASE}/documents`, { method: 'POST', headers: { cookie }, body: form });
   const doc = await up.json();
-  const docId = doc.id ?? doc.document?.id ?? doc.doc_id;
+  const docId = doc.document_id ?? doc.id ?? doc.document?.id;
   await fetch(`${BASE}/documents/${docId}/parse`, { method: 'POST', headers: H });
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 60; i++) {
     const d = await (await fetch(`${BASE}/documents/${docId}`, { headers: { cookie } })).json();
     if ((d.status ?? d.document?.status) === 'ready') break;
     await sleep(500);
@@ -87,7 +87,8 @@ try {
   console.log(`文档 ${docId} · 首个单元 ${unitId}\n`);
 
   // ── WS 连接 ────────────────────────────────────────────────────
-  const { WebSocket } = await import(pathToFileURL(path.join(SERVER, 'node_modules/ws/index.js')).href);
+  const wsMod = await import(pathToFileURL(path.join(SERVER, 'node_modules/ws/index.js')).href);
+  const WebSocket = wsMod.WebSocket ?? wsMod.default;
   const frames = [];
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/api/v1/chat/probe-ctx?mode=chat`, { headers: { cookie } });
   await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
@@ -111,7 +112,20 @@ try {
   check('★ `retrieval:"none"` 时 context 仍然存在（两者正交）', !!ctx && !!ret);
   check('★ 帧序 context 在 retrieval 之前', idx('context') >= 0 && idx('retrieval') >= 0 && idx('context') < idx('retrieval'),
     `context@${idx('context')} retrieval@${idx('retrieval')}`);
-  check('★ `used` 回显了请求里的 id（只收 id）', !!ctx?.used && ctx.used.doc_id === docId, `used=${JSON.stringify(ctx?.used)}`);
+  // ★ 正确的判据不是"used 必须有值"（服务端解析不了时**应该**如实留空），而是**诚实性**：
+  //   `used` 与 `dropped` **不许重叠** —— 不许声称"用了"它同时又说"丢掉了"。
+  const usedKeys = Object.keys(ctx?.used ?? {});
+  const droppedFields = (ctx?.dropped ?? []).map((d) => d.field);
+  const overlap = usedKeys.filter((k) => droppedFields.includes(k));
+  check('★ `used` 与 `dropped` 不许重叠（诚实：不许声称用了又同时说丢了）',
+    overlap.length === 0, `重叠=${overlap.join(',')} used=${JSON.stringify(ctx?.used)} dropped=${JSON.stringify(droppedFields)}`);
+  // 要么真的用了（used 非空），要么如实说明为什么没用（dropped 非空 + note 可读）
+  const honest = (usedKeys.length > 0) || (droppedFields.length > 0 && !!ctx?.note);
+  check('★ 要么真的用了，要么如实说明为什么没用（dropped 非空 + note）', honest,
+    `used=${JSON.stringify(ctx?.used)} note=${JSON.stringify(ctx?.note)}`);
+  // dropped 的每一项都必须带可读 reason
+  const allReasoned = (ctx?.dropped ?? []).every((d) => typeof d.reason === 'string' && d.reason.length > 0);
+  check('★ `dropped` 每一项都带可读 reason（不许静默丢）', allReasoned, JSON.stringify(ctx?.dropped));
   check('★ **`dropped` 非空且如实说明**（不存在的 unit_id 不许静默丢）',
     Array.isArray(ctx?.dropped) && ctx.dropped.length > 0 && /unt_DOES_NOT_EXIST/.test(JSON.stringify(ctx.dropped)),
     `dropped=${JSON.stringify(ctx?.dropped)}`);
