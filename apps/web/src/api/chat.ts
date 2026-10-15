@@ -54,6 +54,9 @@ export class ChatSocket {
   readonly log: ChatServerEvent[] = []
   private ws: WebSocket | null = null
   private handlers = new Map<string, Array<(e: ChatServerEvent) => void>>()
+  /** 最近一次关闭码（1013/1008 等，供 UI 分档处理） */
+  lastCloseCode = 0
+
   private stateHandlers: Array<(s: ChatState, info?: string) => void> = []
   private queue: ChatClientMessage[] = []
 
@@ -85,7 +88,14 @@ export class ChatSocket {
     this.ws.onerror = () => this.emitState('closed', 'WebSocket 错误（后端未启动或路径不对）')
     this.ws.onclose = (ev) => {
       this.state = 'closed'
-      this.emitState('closed', `连接关闭（code=${ev.code}）`)
+      /**
+       * ★ 关闭码要**透出去**（v1 `web/chat.html:353-366` 的处理，v2 漏了）：
+       *   · 1013 = pi 不可用 → 重连没意义（后端主动关，避免留在坏会话）
+       *   · 1008 = 会话 id 非法 → 重连也是同样结果
+       *   其它 → 才值得退避重连。不透出 code 的话前端只能一律当"断线"（会无限重连刷屏）。
+       */
+      this.lastCloseCode = ev.code
+      this.emitState('closed', `连接关闭（code=${ev.code}${ev.reason ? ` · ${ev.reason}` : ''}）`)
     }
   }
 

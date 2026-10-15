@@ -350,17 +350,19 @@ export function capabilitiesPayload(degraded = false) {
      * 前端只读它，**不按 user.roles 推断**（本轮已因"按预期形状读"吃过亏）。
      * 模式是**会话级**的（工具集在建会话时确定）→ 切模式要 `?mode=` 重连。
      */
+    // ⚠️ 这里**不能引用 CFG** —— `capabilitiesPayload()` 在模块顶层，而 CFG 在 WS 处理函数作用域内
+    //    （第一版引用 CFG.agent_roles → `CFG is not defined` → 500 → 整个练习台被门控，实测踩到）
     chat_modes: {
       modes: ['chat', 'agent'], default: 'chat',
       tools: { chat: [], agent: ['kb_search', 'kb_get'] },
-      allowed_roles: { agent: CFG.agent_roles },
+      allowed_roles: { agent: (globalThis.__MOCK_CFG__?.agent_roles) || ['admin', 'teacher', 'student'] },
       kb: { available: true, readonly: true, scoped_by: 'userId' },
       note: '模式是会话级的：请用 ?mode=agent 连接；未知 mode → 明确报错',
     },
     retrieval: {
       modes: ['none', 'wiki', 'kg', 'rag'], default: 'none',
       summary: {
-        any_available: true, any_data: !CFG.empty_kb, empty_kb: CFG.empty_kb,
+        any_available: true, any_data: !(globalThis.__MOCK_CFG__?.empty_kb), empty_kb: !!(globalThis.__MOCK_CFG__?.empty_kb),
         hint: '检索能力已就绪，但知识库当前为空（未抽取）→ 先上传资料并跑抽取，否则任何检索都必然 0 命中',
       },
     },
@@ -473,6 +475,7 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     agent_roles: ['admin', 'teacher'],
     /** 知识库为空（agent 必然 0 命中 → 前端要如实提示"先上传并抽取"） */
     empty_kb: false }
+  globalThis.__MOCK_CFG__ = CFG   // capabilitiesPayload() 在顶层，靠它读到 fixture 开关
   /** 模型/设置/sandbox 的运行期状态（真后端在 settings.json + SQLite 里） */
   const STATE = {
     activeModel: 'deepseek-v4.1-flash',

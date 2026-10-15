@@ -91,6 +91,13 @@ const sessionTools = ref<string[]>([])
 const chatMode = ref<'chat' | 'agent'>('chat')
 /** 后端**实际**给的模式（不信自己选的） */
 const backendMode = ref('')
+/** ① 关闭码分档用：是否还要自动重连（1013/1008 → false） */
+const canReconnect = ref(true)
+const reconnectCount = ref(0)
+const closeCode = ref(0)
+/** ④ 会话是否落盘（ready.persistence）—— 不落盘要**事前**说清"刷新就没了" */
+const persistence = ref('')
+const persistenceReason = ref('')
 const modeNote = ref('')
 /**
  * ★ `/capabilities.chat_modes` —— **服务端权威清单**（backend-api 实测）：
@@ -271,6 +278,9 @@ function onEvent(e: ChatServerEvent) {
       toolsSource.value = String((e as any).tools_source || '')
       // ★ pi-bridge 新增 `ready.tools_warning`（只在危险工具被显式开启时出现）：
       //   **不用匹配枚举值，直接看有没有** —— 有就显示成醒目横幅（等价于"能把服务器 shell 交给浏览器用户"）
+      // ④ 落盘状态（v1 chat.html:382-386 的诚实提示；v2 有字段但界面没用）
+      persistence.value = String((e as any).persistence || '')
+      persistenceReason.value = String((e as any).persistence_reason || '')
       const w = String((e as any).tools_warning || '')
       if (w) toolsWarningFromFrame.value = w
       // ★ 模式回显：`agent_mode`（不是 `mode`）——把自己选的与后端给的**分开显示**
@@ -283,6 +293,28 @@ function onEvent(e: ChatServerEvent) {
         modeNote.value = `你选了 agent，但后端本会话没有给知识库工具${toolsWarning.value ? `：${toolsWarning.value}` : ''}`
       }
       break
+    /**
+     * ② `message_end` 是**权威**（契约）：用它的完整文本**替换** delta 拼接结果。
+     *    只用 delta 拼接时，模型中途失败会留下**半截文本且没有任何解释**。
+     *    空回复 + stopReason='error' → 给一行占位说明（v1 chat.html:408-424 的做法）。
+     */
+    case 'message_end': {
+      const msg = (e as any).message
+      const role = String((e as any).role || msg?.role || '')
+      if (role !== 'assistant') break
+      const parts = Array.isArray(msg?.content) ? msg.content : []
+      const full = parts.filter((x: any) => x?.type === 'text').map((x: any) => String(x.text || '')).join('')
+      const stopReason = String(msg?.stopReason || (e as any).stopReason || '')
+      updateLast((m) => {
+        if (full) m.text = full
+        if (!full && !m.tools.length && !m.error) {
+          m.error = { code: 'E_EMPTY', msg: stopReason === 'error'
+            ? '（本轮没有产出内容，失败原因见下方错误提示）'
+            : '（本轮没有产出内容）' }
+        }
+      })
+      break
+    }
     case 'text_delta':
       updateLast((m) => { m.text += String((e as any).delta || '') })
       break
@@ -347,10 +379,17 @@ function onEvent(e: ChatServerEvent) {
       roundTools.value = []
       whyOpen.value = false
       break
-    case 'error':
-      updateLast((m) => { m.error = { code: (e as any).code, msg: (e as any).msg } })
+    case 'error': {
+      const code = String((e as any).code || '')
+      updateLast((m) => { m.error = { code, msg: (e as any).msg } })
+      // ③ 结束运行态（否则错误后按钮**一直停在"运行中"**，用户只能刷新）
       busy.value = false
+      if (code === 'E_PI_UNAVAILABLE' || code === 'E_PI_EXIT') {
+        stateNote.value = `连接异常：${code}${(e as any).msg ? ` —— ${(e as any).msg}` : ''}`
+        canReconnect.value = false
+      }
       break
+    }
     case 'settled':
       // ★ 一轮结束的唯一信号（§7.3.1）
       busy.value = false
@@ -466,8 +505,42 @@ onMounted(async () => {
 /** 建连（模式走 URL 查询参数） */
 function startSocket() {
   socket = new ChatSocket(sessionId, undefined, chatMode.value)
-  socket.onState((s, info) => { state.value = s; if (info) stateNote.value = info })
+  socket.onState((s, info) => {
+    state.value = s
+    if (info) stateNote.value = info
+    if (s === 'closed') onClosed()
+  })
   socket.on('*', onEvent)
+}
+
+/**
+ * ① 关闭码分档（v1 `web/chat.html:353-366`）：
+ *   1013 = pi 不可用 / 1008 = 会话 id 非法 → **不再重连**（重连必然同样失败，只会刷屏）
+ *   其它 → 指数退避 500ms×2^n（封顶 8s，最多 6 次）
+ * ⚠️ 原错误写法：一律当"断线"处理 → 非法 session id 时无限重连、用户看不到真因。
+ */
+function onClosed() {
+  const code = socket?.lastCloseCode || 0
+  closeCode.value = code
+  if (code === 1013) {
+    canReconnect.value = false
+    stateNote.value = 'pi 不可用（后端主动关闭 1013）—— 不自动重连；请先看能力横幅里的原因'
+    return
+  }
+  if (code === 1008) {
+    canReconnect.value = false
+    stateNote.value = '会话 id 非法（1008）—— 不自动重连；点「新会话」重新开始'
+    return
+  }
+  if (!canReconnect.value || props.embedded) return
+  if (reconnectCount.value >= 6) {
+    stateNote.value = `${stateNote.value}｜已重连 6 次仍失败，停止自动重连`
+    return
+  }
+  reconnectCount.value++
+  const delay = Math.min(500 * 2 ** (reconnectCount.value - 1), 8000)
+  stateNote.value = `断线，${delay}ms 后第 ${reconnectCount.value}/6 次重连…`
+  setTimeout(() => { if (canReconnect.value) reconnect() }, delay)
 }
 
 onBeforeUnmount(() => socket?.close())
@@ -550,10 +623,11 @@ void _esc
   <div class="chat-layout">
     <div class="panel chat-head">
       <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
-        <b>pi AI 助教</b>
+        <b>{{ props.title }}</b>
         <span class="pill" :class="state === 'open' ? 'ok' : 'bad'" data-testid="ws-state">{{ state }}</span>
         <span v-if="model" class="pill blue">{{ model }}</span>
         <span v-if="stateNote" class="small faint" data-testid="ws-note">{{ stateNote }}</span>
+        <span v-if="closeCode" class="small faint mono" data-testid="ws-close-code">code={{ closeCode }}</span>
         <span class="small" :class="toolsSource === 'dangerous-opt-in' ? 'tools-danger' : 'faint'"
               data-testid="session-tools" :data-tools="sessionTools.join(',')" :data-source="toolsSource">
           工具：{{ sessionTools.length ? sessionTools.join(', ') : '无' }}
@@ -595,6 +669,11 @@ void _esc
         </span>
       </div>
       <div v-if="modeNote" class="note warn" style="margin-top: 6px" data-testid="mode-note">{{ modeNote }}</div>
+      <!-- ④ 诚实降级：本轮**不落盘** → 刷新就没了（事前说清，别等学生发现对话丢了） -->
+      <div v-if="persistence && persistence !== 'native'" class="small faint" style="margin-top: 4px"
+           data-testid="persistence-note" :data-persistence="persistence">
+        本轮对话**不落盘**（persistence={{ persistence }}{{ persistenceReason ? ` · ${persistenceReason}` : '' }}）—— 刷新页面后这段对话不会保留。
+      </div>
       <div v-if="!agentAllowed" class="small faint" style="margin-top: 4px" data-testid="agent-blocked">{{ agentBlockReason }}</div>
       <!-- ★ 知识库为空：agent 必然 0 命中 → 如实提示"先上传并抽取"，别让它看起来像检索坏了 -->
       <div v-if="kbEmpty" class="note warn" style="margin-top: 6px" data-testid="kb-empty">
