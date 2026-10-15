@@ -272,9 +272,23 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
 
   /**
    * 物化后的 pi 会话管理器（`agentDir` = `data/pi-agent/`）。
-   * **chat 与 /sandbox/ask 必须共用同一个** —— 否则答疑走 pi 的默认会话 → 全局默认模型 + 失效 key → 403。
+   *
+   * ⚠️ **chat 与 /sandbox/ask 各自一个**（不是共用）—— 因为 `systemPrompt` 是**管理器级**的
+   * （`getOrCreate` 不接受按会话的 systemPrompt），而两个入口需要**不同**的提示词。
+   * 共用会让后装配的覆盖前一个（坑 24 的"看起来配了其实没生效"）。
+   * 但它们**共用同一份 `agentDir`/`model`** —— 否则答疑会走 pi 全局默认模型 + 失效 key → 403。
    */
   let agentManager: unknown = null;
+  /** 会话层模块（chat 与 ask 都要用 → **必须在分支外**声明，否则块作用域取不到） */
+  const sessionMod = await tryImport<{
+    AgentSessionManager?: new (opts: Record<string, unknown>) => unknown;
+  }>('./agent/session.ts');
+  /** 提示词模块（渲染契约；见下方"模块存在却无调用方"的注释） */
+  const promptsMod = await tryImport<{
+    CHAT_ASSISTANT_SYSTEM_PROMPT?: string;
+    VIDEO_ASSISTANT_SYSTEM_PROMPT?: string;
+    withRenderContract?: (base: string) => string;
+  }>('./agent/prompts.ts');
 
   if (opts.chatFactory !== undefined) {
     chatFactory = opts.chatFactory;
@@ -295,10 +309,29 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
       const sessionMod = await tryImport<{
         AgentSessionManager?: new (opts: Record<string, unknown>) => unknown;
       }>('./agent/session.ts');
+      /**
+       * ★ **渲染契约系统提示词**（坑 24 的又一实例：模块存在、却**没有任何调用方**）。
+       *
+       * `agent/prompts.ts` 早就导出了 `CHAT_ASSISTANT_SYSTEM_PROMPT`（内含 `RENDER_CONTRACT`：
+       * 公式用 `$...$` 而非 `\(...\)`、代码块带语言、导图/引用格式…），
+       * 但 **chat 会话从没传过 `systemPrompt`** → 模型跑的是 pi 默认的 coding 提示词 →
+       * 前端做的 KaTeX/高亮/导图渲染**没有内容可渲**（渲染层白做）。
+       *
+       * 判据：**"提示词存在"和"提示词生效"是两件事** —— 断言必须打在"真的进了发给 SDK 的请求"上。
+       */
+      const chatSystemPrompt = promptsMod.mod?.CHAT_ASSISTANT_SYSTEM_PROMPT;
+      const videoSystemPrompt = promptsMod.mod?.VIDEO_ASSISTANT_SYSTEM_PROMPT;
       const piModels = materializePiModels(cfg);
       if (piModels && typeof sessionMod.mod?.AgentSessionManager === 'function') {
         try {
-          const manager = new sessionMod.mod.AgentSessionManager({
+          /**
+           * ★ **两个入口两套提示词**（`systemPrompt` 是**管理器级**的 —— `getOrCreate` 不接受按会话的
+           * systemPrompt，见 `session.ts:1163`）→ 所以建**两个管理器**，由路由按 `?assistant=` 选：
+           * - `chat`（默认）：`CHAT_ASSISTANT_SYSTEM_PROMPT`（通用助教）
+           * - `video`：`VIDEO_ASSISTANT_SYSTEM_PROMPT`（按视频文稿回答；含「▶ 时间」跳转语义）
+           * 两者都**内含渲染契约**（`prompts.ts` 已把 `RENDER_CONTRACT` 嵌进去）。
+           */
+          const baseOpts = {
             // ★ 必须给 `agentDir`（而不是只给 `modelsPath`）：pi 的**凭据**读的是 `<agentDir>/auth.json`，
             //   与 `models.json`（模型目录）是两件事。只给 modelsPath 会得到
             //   "No API key found for <provider>"；而 auth.json 形状不对时更糟 —— **静默挂死**（180s 零帧）。
@@ -307,12 +340,27 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
             // ★ 只读知识库工具（`kb_search`/`kb_get`）—— **必须在建管理器时注入**，
             //   否则 `ready.tools` 会是 `[]`（代码以为开了、实际没注册）
             kb,
+          };
+          const manager = new sessionMod.mod.AgentSessionManager({
+            ...baseOpts,
+            // ★ 渲染契约（`agent/prompts.ts`；未接入时**如实降级**为"没有系统提示词"，不假装有）
+            ...(typeof chatSystemPrompt === 'string' && chatSystemPrompt !== '' ? { systemPrompt: chatSystemPrompt } : {}),
           });
+          const videoManager =
+            typeof videoSystemPrompt === 'string' && videoSystemPrompt !== ''
+              ? new sessionMod.mod.AgentSessionManager({ ...baseOpts, systemPrompt: videoSystemPrompt })
+              : manager; // 视频提示词缺失 → **沿用 chat**（如实降级，不假装有专用提示词）
           agentManager = manager;
-          chatFactory = (connOpts) => createConn({ ...connOpts, manager } as never);
+          // ★ 按连接选管理器：`?assistant=video` → 视频提示词；其它 → chat
+          chatFactory = (connOpts) =>
+            createConn({
+              ...connOpts,
+              manager: (connOpts as { assistant?: unknown }).assistant === 'video' ? videoManager : manager,
+            } as never);
           process.stderr.write(
             `[agent] 模型与凭据已绑定项目配置：${piModels.modelRef}` +
-              `（agentDir → ${path.relative(cfg.root, piModels.agentDir)}，apiKey 只写 data/，不回显）\n`,
+              `（agentDir → ${path.relative(cfg.root, piModels.agentDir)}，apiKey 只写 data/，不回显）` +
+              `｜系统提示词：chat=${typeof chatSystemPrompt === 'string' ? '✓' : '✗'} video=${videoManager !== manager ? '✓' : '复用 chat'}\n`,
           );
         } catch (err) {
           chatFactory = createConn;
@@ -421,7 +469,47 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
   // 动态接入 → 未就绪时 `/sandbox/ask` 如实 503（不假装能答疑）。
   const askMod = await tryImport<{
     createAskHandler?: (deps: Record<string, unknown>) => AppDeps['sandboxAsk'];
+    ASK_SYSTEM_PROMPT?: string;
   }>('./sandbox/ask.ts');
+  /**
+   * ★ **答疑专用管理器**（与 chat 管理器分开）—— 因为 `systemPrompt` 是**管理器级**的
+   * （`AgentSessionManager` 的 `getOrCreate` 不接受按会话的 systemPrompt，见 session.ts:1163）。
+   *
+   * 两个入口需要**不同**的系统提示词：
+   * - chat / 视频助手：`CHAT_ASSISTANT_SYSTEM_PROMPT`（含渲染契约）
+   * - 沙箱答疑：`withRenderContract(ASK_SYSTEM_PROMPT)`（SQL 纠错语境）+ `tools: []` + 不读项目 AGENTS.md
+   *
+   * ⚠️ 共用同一个管理器会让**后装配的那个**覆盖另一个 —— 这正是坑 24 的"看起来配了其实没生效"。
+   */
+  let askManager: unknown = null;
+  if (typeof askMod.mod?.ASK_SYSTEM_PROMPT === 'string' && typeof sessionMod.mod?.AgentSessionManager === 'function') {
+    const piModelsForAsk = materializePiModels(cfg);
+    if (piModelsForAsk) {
+      try {
+        const withContract = promptsMod.mod?.withRenderContract;
+        const base = askMod.mod.ASK_SYSTEM_PROMPT;
+        const askPrompt = typeof withContract === 'function' ? withContract(base) : base;
+        const m = new sessionMod.mod.AgentSessionManager({
+          agentDir: piModelsForAsk.agentDir,
+          model: piModelsForAsk.modelRef,
+          systemPrompt: askPrompt,
+          tools: [], // 教学答疑不需要任何文件/命令工具（安全 + 快）—— 与 ask.ts 自建时一致
+          noContextFiles: true, // 不把项目 AGENTS.md 塞进系统提示词
+          sessionDir: path.join(cfg.root, 'data', 'chat', 'ask'),
+          onDiagnostic: () => {
+            /* 由 ask.ts 的 handler 层转发；这里静默避免噪音（与 ask.ts 自建时一致） */
+          },
+        });
+        (m as { startReaper?: () => void }).startReaper?.();
+        askManager = m;
+        process.stderr.write('[agent] 答疑管理器已装配（ASK 系统提示词 + 渲染契约 + tools:[]）\n');
+      } catch (err) {
+        process.stderr.write(
+          `[agent] 答疑管理器装配失败（${redact(err instanceof Error ? err.message : String(err))}）→ 由 ask.ts 自建\n`,
+        );
+      }
+    }
+  }
   let sandboxAsk: AppDeps['sandboxAsk'] = null;
   if (typeof askMod.mod?.createAskHandler === 'function') {
     try {
@@ -441,7 +529,10 @@ export async function buildApp(opts: BuildOptions = {}): Promise<BuiltApp> {
          * pi 的**全局默认模型**（`~/.pi/agent`，key 已失效）→ 上游 401/403，
          * 而 `/capabilities` 里 `providers.llm=amr(available=True)` 仍然正常（那是 providers 层，另一条路径）。
          */
-        manager: agentManager ?? undefined,
+        // ⚠️ 必须传**答疑专用**管理器（见下方 `askManager`）：`ask.ts` 的 `deps.manager` **优先于**它自建的
+        //    （`ask.ts:1196`），我早前把 chat 管理器传进来 → **覆盖了答疑自己的系统提示词与 tools:[]**
+        //    （ask 的渲染契约因此失效）。这里改传 askManager，两边的提示词各归其位。
+        manager: askManager ?? undefined,
         // schema 与最近执行都走 **worker job**（与 /sandbox/schema、/sandbox/history 同源 → 不会有两套真相）
         getSchema: async (sessionId: string) => {
           const owner = ownerOf(sessionId);

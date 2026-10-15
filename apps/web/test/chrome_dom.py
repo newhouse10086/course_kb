@@ -496,6 +496,52 @@ def main() -> int:
             ok("wiki：why 里是可读的命中原因（bigram 命中「索引」）", "bigram 命中" in why_dom, "why 未显示可读原因")
             ok("wiki：命中项带 title/score", "聚簇索引" in why_dom and "score" in why_dom)
 
+        # ============ 9b-1. 富文本渲染：公式（KaTeX）/ 代码块 / 未闭合容错 / 失败如实 ============
+        def check_rich_text() -> None:
+            # ★ fixture 开关要走 `/_fixture/config`（不是页面 URL 上的 query）—— 第一版写错了，
+            #   结果拿到的是默认回答（没有公式），e2e 白等 60s（"看着像渲染坏了，其实是夹具没开"）
+            cfg = api("/api/v1/_fixture/config?rich=1")
+            # 夹具必须真的生效（否则会白等 60s，看起来像渲染坏了）—— 先断言再继续
+            ok("富文本夹具已生效（rich_answer=true）", bool((cfg.get("config") or {}).get("rich_answer")),
+               json.dumps(cfg, ensure_ascii=False)[:200])
+            dump_dom(driver, url(normal, "chat?selftest=0"),
+                     "!!document.getElementById('chat-report')", timeout=120)
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='讲讲复杂度'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
+            # 限定在**助手**消息内取富文本（用户消息也会渲染 RichText）
+            ASSIST = "document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"rich-text\"]')"
+            # ⚠️ 必须等**这一轮流式结束**再断言：只等 math≠0 会拿到中途快照
+            #    （第一版就是这样 → "代码块/未闭合/失败"全红，其实渲染是对的）
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-text\"] [data-testid=\"code-unclosed\"]')",
+                               timeout=120, interval=0.3)   # 并发跑 vitest 时 60s 偶发不够（实测 flaky）
+            rich = driver.ch.evaluate("(() => { const r=" + ASSIST + ";"
+                                      " return JSON.stringify({math:r.dataset.math, fail:r.dataset.mathFail,"
+                                      " code:r.dataset.code, unclosed:r.dataset.unclosed, blocks:r.dataset.blocks}) })()")
+            st = json.loads(rich)
+            ok("公式：行内 + 块级都渲染成 KaTeX（data-math>0）", int(st["math"]) >= 3, rich)
+            ok("公式：中文 \\text{} 能渲染（不报错）", int(st["fail"]) >= 1 and int(st["math"]) >= 3, rich)
+            ok("公式失败：坏公式被如实标记（data-math-fail≥1）", int(st["fail"]) >= 1, rich)
+            dom = driver.ch.outer_html()
+            ok("公式失败：显示原文 + 「公式渲染失败」提示（不静默）",
+               'data-testid="rich-text"' in dom and "公式渲染失败" in dom)
+            ok("公式失败：原文仍在（学生不会看到空白）", '\\frac{1}{$' in dom or "frac" in dom)
+            ok("KaTeX 真渲染出 DOM（.katex 存在）", "katex" in dom)
+            ok("代码块：标了语言（sql）", 'data-lang="sql"' in dom)
+            ok("代码块：未闭合围栏**照样按代码块渲染**并标注（不整段崩成纯文本）",
+               'data-unclosed="1"' in dom and "代码围栏未闭合" in dom, "未闭合容错未生效")
+            ok("代码块：有复制按钮 + 行数", 'data-testid="code-copy"' in dom and "data-lines=" in dom)
+            # 注入安全：模型输出里的 HTML 必须被转义（不能出现可执行标签）
+            driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='<img src=x onerror=alert(1)>'; t.dispatchEvent(new Event('input',{bubbles:true})); return 1 })()")
+            time.sleep(0.3)
+            safe = driver.ch.evaluate("(() => { const r=" + ASSIST + ";"
+                                      " return r ? r.querySelectorAll('img,script,iframe').length : -1 })()")
+            ok("注入安全：模型输出里的 HTML 被转义（页面无 img/script/iframe）", int(safe) == 0, f"危险节点数={safe}")
+            api("/api/v1/_fixture/config?rich=0")   # 复位，别影响后续用例
+
+        run_view("富文本 / 公式 + 代码块 + 未闭合容错 + 失败如实", check_rich_text)
+
         # ============ 9b-2. 全局 chat 小助手：**每个页面**都能打开（用户明确需求） ============
         def check_dock_everywhere() -> None:
             # 六个页面（含我新做的 Settings / Lab）逐个断言：浮动入口存在 + 抽屉能开
@@ -548,12 +594,51 @@ def main() -> int:
             ok("小助手：显示正在参考（服务端解析出的真实标题）",
                'data-testid="context-used"' in dom and "MySQL 26.7 Reference Manual" in dom, "未显示 context 帧的 resolved 标题")
 
+        def check_assistant_entry() -> None:
+            # 视频页：小助手的 WS 必须带 `assistant=video`（否则跑的是通用提示词 —— 契约不生效）
+            dump_dom(driver, url(normal, f"video?doc={DOC_VIDEO}"),
+                     "!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=180)
+            # 点开抽屉（视频页可能有覆盖层 → 失败重试一次；实测偶发点不中）
+            opened = False
+            for _ in range(3):
+                driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+                time.sleep(1.0)
+                if driver.ch.evaluate("!!document.querySelector('[data-testid=\"assistant-drawer\"]')"):
+                    opened = True
+                    break
+            ok("视频页：小助手抽屉能打开", opened)
+            # 抽屉里的对话组件渲染出会话头（entry 标记 + ws 状态）
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-entry\"]')",
+                               timeout=120, interval=0.3)
+            driver.ch.wait_for("document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"ws-state\"]')?.textContent === 'open'",
+                               timeout=120, interval=0.3)
+            ok("视频页小助手：WS 已连上（能渲染会话头）", "ws-state" in driver.ch.outer_html())
+            # 发一轮，断言 mock 回显的 assistant 入口是 video
+            driver.ch.evaluate("(() => { const d=document.querySelector('[data-testid=\"assistant-drawer\"]');"
+                               " const t=d.querySelector('[data-testid=\"chat-input\"]');"
+                               " t.value='讲一下页分裂'; t.dispatchEvent(new Event('input',{bubbles:true}));"
+                               " setTimeout(()=>d.querySelector('[data-testid=\"chat-send\"]').click(),150); return 1 })()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-text\"]')", timeout=60, interval=0.3)
+            entry = driver.ch.evaluate("(document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-entry\"]')||{}).dataset?.entry || ''")
+            ok("视频页小助手：入口 = video（系统提示词含渲染契约）", str(entry) == "video", f"entry={entry}")
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-close\"]').click()")
+            # 非视频页：入口 = chat
+            dump_dom(driver, url(normal, f"wiki?doc={DOC_PDF}&unit={UNIT}"),
+                     "!!document.querySelector('[data-testid=\"assistant-fab\"]')", timeout=120)
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-fab\"]').click()")
+            driver.ch.wait_for("!!document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-entry\"]')", timeout=60, interval=0.3)
+            entry2 = driver.ch.evaluate("(document.querySelector('[data-testid=\"assistant-drawer\"] [data-testid=\"assistant-entry\"]')||{}).dataset?.entry || ''")
+            ok("Wiki 页小助手：入口 = chat", str(entry2) == "chat", f"entry={entry2}")
+            driver.ch.evaluate("document.querySelector('[data-testid=\"assistant-close\"]').click()")
+
+        run_view("助手入口 / video 页用视频提示词（assistant=video）", check_assistant_entry)
+
         run_view("全局小助手 / 真发消息 + 上下文回显", check_dock_chat)
 
         # ============ 9b-3. tools 自述字段与实际值**同源**（AGENTS.md 坑 21） ============
         def check_tools_consistency() -> None:
             # chat 模式：source=disabled-by-role ⇒ tools 必须为空
-            dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)
+            dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
             driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
                                " t.value='一致性检查'; t.dispatchEvent(new Event('input',{bubbles:true}));"
                                " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
@@ -576,7 +661,7 @@ def main() -> int:
 
         # ============ 9c. 模式选择器（chat / agent）—— 用户需求，两个正交控件 ============
         def check_mode_switch() -> None:
-            dom = dump_dom(driver, url(normal, "chat?selftest=0"), READY_VIEW)
+            dom = dump_dom(driver, url(normal, "chat?selftest=0"), "!!document.getElementById('chat-report')", timeout=120)
             ok("模式分段控件存在（chat / agent）",
                'data-testid="mode-select"' in dom and 'data-testid="mode-chat"' in dom and 'data-testid="mode-agent"' in dom)
             ok("说清两者差异（快/能翻原文）", 'data-testid="mode-explain"' in dom and "kb_search" in dom)
@@ -595,7 +680,7 @@ def main() -> int:
             driver.ch.evaluate("document.querySelector('[data-testid=\"mode-agent\"]').click()")
             driver.ch.wait_for("!!document.querySelector('[data-testid=\"mode-note\"]')", timeout=20, interval=0.2)
             note = driver.ch.evaluate("document.querySelector('[data-testid=\"mode-note\"]').textContent")
-            ok("切模式如实提示上下文会重新开始", "上下文会重新开始" in str(note), str(note)[:120])
+            ok("切模式如实提示上下文重新开始", "上下文重新开始" in str(note), str(note)[:120])
             driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
                                " t.value='再讲一次聚簇索引'; t.dispatchEvent(new Event('input',{bubbles:true}));"
                                " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")
@@ -619,7 +704,7 @@ def main() -> int:
         # ============ 9d. context 帧：服务端解析出的真实标题 + dropped 如实显示 ============
         def check_context_frame() -> None:
             # 带一个**不存在**的 unit_id → 后端应丢进 dropped 并如实显示
-            dump_dom(driver, url(normal, "chat?selftest=0&doc=" + DOC_PDF + "&unit=unt_not_exist_zzz"), READY_VIEW)
+            dump_dom(driver, url(normal, "chat?selftest=0&doc=" + DOC_PDF + "&unit=unt_not_exist_zzz"), "!!document.getElementById('chat-report')", timeout=120)
             driver.ch.evaluate("(() => { const t=document.querySelector('[data-testid=\"chat-input\"]');"
                                " t.value='这一节讲什么？'; t.dispatchEvent(new Event('input',{bubbles:true}));"
                                " setTimeout(() => document.querySelector('[data-testid=\"chat-send\"]').click(), 150); return 1 })()")

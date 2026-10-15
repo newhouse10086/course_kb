@@ -13,6 +13,7 @@
  *      真实媒体路径下必须断言 `video.currentTime ≈ 目标时间`。
  *   ② 重跑入口不是摆设 → 真提交 + TaskStream（SSE 主 + 轮询兜底），transport 如实上报。
  */
+import RichText from '../components/RichText.vue'
 import { setAssistantContext } from '../composables/useAssistantContext'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -586,7 +587,9 @@ async function runSelftest() {
           <span class="pill" :class="summary.source.startsWith('derived') ? 'orange' : summary.source === 'none' ? 'bad' : 'ok'">{{ summary.source }}</span>
           <span class="pill">{{ chapterCount }} 章</span>
         </div>
-        <div v-if="summary.text" class="small" style="margin-top: 6px; white-space: pre-wrap">{{ summary.text }}</div>
+        <!-- ★ 视频 AI 解析产出的总结常带**公式 / 代码块** → 用富文本渲染（KaTeX + 代码块） -->
+        <RichText v-if="summary.text" class="small" style="margin-top: 6px" :text="summary.text"
+                  data-testid="video-summary-rich" :stats="queryFlag('selftest')" />
         <div v-else class="note warn" style="margin-top: 6px" data-testid="transcript-empty">
           后端未产出全文总结（<code>summary</code> 字段缺失），且文稿章节也没有 summary。按 F6-S5 这里应由 LLM 给出整篇摘要 ——
           当前如实显示为空，不编造。

@@ -21,6 +21,12 @@ const route = useRoute()
 const { caps } = useCaps()
 const open = ref(false)
 
+/**
+ * ★ 助手入口（backend-api 接线）：**视频页用 `video`** → 系统提示词是视频助手提示词（含渲染契约）；
+ *   其余页面用通用对话助手。⚠️ 是连接级参数 → 切页面时组件会以新入口重连。
+ */
+const assistantEntry = computed<'chat' | 'video'>(() => (route.path === '/video' ? 'video' : 'chat'))
+
 const ctxKeys = computed(() => Object.keys(assistantContext.value || {}))
 const hasCtx = computed(() => ctxKeys.value.length > 0)
 /** 本地标签：立刻告诉用户"我这一页在参考什么"（服务端解析结果随后覆盖） */
@@ -77,7 +83,7 @@ function toggle() {
 
       <!-- ★ 与 /chat 整页**共用同一个组件**（embedded 跳过页面级副作用） -->
       <div class="assist-body">
-        <Chat embedded :context="assistantContext" title="小助手" />
+        <Chat embedded :context="assistantContext" :assistant="assistantEntry" title="小助手" :key="assistantEntry" />
       </div>
       <div class="small faint assist-foot">
         带上下文的问答：只传 id（文档/章节/沙箱会话），服务端解析成真实内容后再用 ——

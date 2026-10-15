@@ -13,6 +13,7 @@ import type { FastifyInstance } from 'fastify';
 
 import type { AppDeps, ChatConnectionLike } from '../app-deps.ts';
 import { redact } from '../config.ts';
+import { auditRenderFormat, type RenderAudit } from '../agent/prompts.ts';
 import { safeJsonStringify } from '../tasks/bus.ts';
 
 interface WsLike {
@@ -49,6 +50,26 @@ export const AGENT_ALLOWED_ROLES = ['admin', 'teacher', 'student'] as const;
 export function canUseAgentMode(roles: string[] | undefined | null): boolean {
   if (!Array.isArray(roles)) return false;
   return roles.some((r) => (AGENT_ALLOWED_ROLES as readonly string[]).includes(r));
+}
+
+/**
+ * ★ **助手入口**（决定用哪套系统提示词）—— 服务端校验，与 `mode` 同样**不静默降级**。
+ *
+ * - `chat`（默认）：通用助教提示词（`CHAT_ASSISTANT_SYSTEM_PROMPT`）
+ * - `video`：视频助手提示词（`VIDEO_ASSISTANT_SYSTEM_PROMPT`，按视频文稿回答）
+ *
+ * 为什么放在**连接参数**（`?assistant=`）而不是 prompt 帧：`systemPrompt` 是**管理器级**的
+ * （`AgentSessionManager.getOrCreate` 不接受按会话的 systemPrompt）→ 必须在建会话时定。
+ */
+export const ASSISTANTS = ['chat', 'video'] as const;
+export type Assistant = (typeof ASSISTANTS)[number];
+
+export function validateAssistant(raw: unknown): { ok: true; assistant: Assistant } | { ok: false; got: unknown } {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, assistant: 'chat' };
+  if (typeof raw === 'string' && (ASSISTANTS as readonly string[]).includes(raw)) {
+    return { ok: true, assistant: raw as Assistant };
+  }
+  return { ok: false, got: raw };
 }
 
 export function validateMode(raw: unknown): { ok: true; mode: ChatMode } | { ok: false; got: unknown } {
@@ -136,6 +157,28 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
     }
     const mode = modeCheck.mode;
 
+    // ★ 助手入口（决定系统提示词）：`?assistant=video` → 视频提示词；未知值 → **明确报错**
+    const assistantRaw = (req.query as Record<string, unknown> | undefined)?.assistant;
+    const assistantCheck = validateAssistant(assistantRaw);
+    if (!assistantCheck.ok) {
+      try {
+        socket.send(
+          safeJsonStringify({
+            type: 'error',
+            code: 'E_BADREQUEST',
+            msg: `未知的助手入口：${JSON.stringify(assistantCheck.got)}`,
+            hint: `assistant 只接受 ${ASSISTANTS.map((a) => `'${a}'`).join(' | ')}；缺省 = 'chat'。` +
+              '（它决定用哪套系统提示词，是**会话级**的：请用 ?assistant=… 重连）',
+          }),
+        );
+        socket.close(1008, 'invalid assistant');
+      } catch {
+        /* 已断开 */
+      }
+      return;
+    }
+    const assistant = assistantCheck.assistant;
+
     // ★ 角色策略：`agent` 模式需要允许的角色（**服务端判定**，客户端无法影响）
     if (mode === 'agent' && !canUseAgentMode(user?.roles)) {
       try {
@@ -156,6 +199,8 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
 
     let chat: ChatConnectionLike | null = null;
     let closed = false;
+    /** 本轮渲染契约审计结果（`settled` 时由 `send` 填充；见 `auditRenderFormat`） */
+    let renderAudit: RenderAudit | null = null;
 
     /**
      * ★ 早到的客户端帧必须**缓冲**，不能丢。
@@ -203,11 +248,27 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
     });
 
     try {
+      /**
+       * ★ 累积本轮回答文本，供**渲染契约**事后审计（`auditRenderFormat`）。
+       *
+       * 为什么在路由层做：`onAnswerAudit` 只给引用/检索状态，**没有正文**；
+       * 而正文只经过 `send` 这一处（`text_delta`）。这里累积 → `settled` 时审计 → 写进 audit_log，
+       * 于是"模型没按契约输出"**能被观测到**（不靠人眼看）。
+       */
+      let roundText = '';
       chat = await deps.chatFactory!({
         sessionId,
+        // ★ 助手入口 → 工厂据此选**视频/通用**提示词的管理器（见 index.ts 的两个管理器）
+        assistant,
         send: (frame) => {
           if (closed) return;
           try {
+            const f = frame as { type?: unknown; delta?: unknown };
+            if (f?.type === 'text_delta' && typeof f.delta === 'string') roundText += f.delta;
+            if (f?.type === 'settled') {
+              // 审计是**只上报**（不改回答）：违规也照常返回给前端，只是留痕
+              renderAudit = auditRenderFormat(roundText);
+            }
             // ⚠️ WS 帧**有长度前缀**，本不会像 SSE 那样被 U+2028/U+2029 错切 ——
             //    这里统一走 `safeJsonStringify` 是为了**不依赖协议特性**：
             //    全仓的 JSON→线协议出口（任务 SSE / 沙箱答疑 SSE / 聊天 WS）都用同一个函数，
@@ -277,6 +338,16 @@ export function registerChatRoute(app: FastifyInstance, deps: AppDeps): boolean 
                 retrieval_mode: a.retrievalMode,
                 retrieval_status: a.retrievalStatus,
                 retrieval_reason: a.retrievalReason,
+                // ★ 渲染契约审计（`agent/prompts.ts::auditRenderFormat`）——
+                //   **客观判据**：模型有没有按契约输出（`$...$` 而非 `\(...\)`、代码块带语言且闭合…）。
+                //   只上报、不改回答：违规也照常返回前端，但**能被观测到**（否则只能靠人眼看）。
+                ...(renderAudit
+                  ? {
+                      render_format_ok: renderAudit.ok,
+                      render_violations: renderAudit.violations.slice(0, 10),
+                      render_observed: renderAudit.observed,
+                    }
+                  : { render_format_ok: null, render_audit_note: '本轮无正文（无 text_delta）→ 未审计' }),
               },
             });
           } catch {

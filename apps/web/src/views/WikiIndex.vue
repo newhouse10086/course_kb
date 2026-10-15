@@ -342,16 +342,18 @@ const _esc = esc
 const _fmtSpan = fmtSpan
 const _linkify = linkify
 
-watch(() => route.query.doc, (v, old) => {
 // ★ 小助手上下文：**只传 id**（doc + 当前这一节 unit）
 watch([() => route.query.doc, unitId], () => {
   const d = String(route.query.doc || '')
-  const u = String(unitId.value || '')
+  // 页面加载早期 unitId 还是 null → 用 URL 里的 unit 兜底（仍是 id，不是自由文本）
+  const u = String(unitId.value || route.query.unit || '')
   setAssistantContext(
     { ...(d ? { doc_id: d } : {}), ...(u ? { unit_id: u } : {}) },
     [d ? '当前文档' : '', u ? '当前章节' : ''].filter(Boolean).join(' / '),
   )
 }, { immediate: true })
+
+watch(() => route.query.doc, (v, old) => {
   if (v && v !== old) {
     // ⚠️ 换文档时**必须清掉上一次的检索结果**：页面不会重载，旧命中会留在屏幕上，
     //    看起来像"在新文档里搜到了"，其实是另一份文档的结果（对着真后端实测踩到）

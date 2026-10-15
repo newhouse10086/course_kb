@@ -11,9 +11,11 @@
  *   · pi / 模型任一不可用 → 禁用输入并写明 reason（不允许点了才报错）
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ChatSocket, type ChatServerEvent } from '../api/chat'
 import { useCaps } from '../composables/useCaps'
 import { esc } from '../utils/text'
+import RichText from '../components/RichText.vue'
 import { queryFlag, testBarrier, testBarrierDone, writeReport } from '../utils/report'
 
 interface ToolCall { id: string; tool: string; args?: unknown; partial?: string; ok?: boolean; duration_ms?: number; done: boolean; result_text?: string }
@@ -31,8 +33,16 @@ const props = withDefaults(defineProps<{
   context?: Record<string, string | number>
   /** 抽屉标题（如"小助手 · 知识库"） */
   title?: string
-}>(), { embedded: false, context: () => ({}), title: 'pi AI 助教' })
+  /**
+   * 助手入口（backend-api 2026-10-15 接线）：决定**系统提示词**
+   *   · `chat`（缺省）→ 通用对话助手提示词
+   *   · `video` → 视频助手提示词（**含渲染契约**：公式 `$…$`、代码块标语言并闭合、导图层级、不许编造公式）
+   * ⚠️ 是**连接级**参数 → 变化时必须重连（会丢上下文，与 `?mode=` 同一取舍）。
+   */
+  assistant?: 'chat' | 'video'
+}>(), { embedded: false, context: () => ({}), title: 'pi AI 助教', assistant: 'chat' })
 
+const route = useRoute()
 const { caps, error: capsError } = useCaps()
 const sessionId = `web-${Math.random().toString(36).slice(2, 10)}`
 const input = ref('')
@@ -98,6 +108,15 @@ const closeCode = ref(0)
 /** ④ 会话是否落盘（ready.persistence）—— 不落盘要**事前**说清"刷新就没了" */
 const persistence = ref('')
 const persistenceReason = ref('')
+/** pi-bridge 新字段（诚实降级类）：模型来源 / 会话恢复 / 自动重启 */
+const modelSource = ref('')
+const modelWarning = ref('')
+const resumed = ref<boolean | null>(null)
+const restoredMessages = ref<number | null>(null)
+const resumeReason = ref('')
+const restarted = ref(false)
+/** agent 模式但 kb 工具装不上时，后端给的原因原文（`kb_tools_warning`） */
+const kbToolsWarning = ref('')
 const modeNote = ref('')
 /**
  * ★ `/capabilities.chat_modes` —— **服务端权威清单**（backend-api 实测）：
@@ -139,6 +158,20 @@ const retrievalChoice = ref<'none' | 'wiki' | 'kg' | 'rag'>('none')
 const pageContext = ref<Record<string, string | number>>({ ...props.context })
 // 上下文变化（页面切换 / 小助手打开时）→ 下一轮带上
 watch(() => props.context, (v) => { pageContext.value = { ...(v || {}) } }, { deep: true })
+/**
+ * 整页 `/chat?doc=…&unit=…` 也带上下文（**只取 id**）：
+ *   · 抽屉里的实例用 props.context（由页面写入）
+ *   · 整页实例没有 props → 从 URL 取，同样只传 id
+ */
+if (!props.embedded) {
+  const r = useRoute()
+  const sync = () => {
+    const d = String(r.query.doc || '')
+    const u = String(r.query.unit || '')
+    pageContext.value = { ...(d ? { doc_id: d } : {}), ...(u ? { unit_id: u } : {}) }
+  }
+  watch(() => [r.query.doc, r.query.unit], sync, { immediate: true })
+}
 
 /** 服务端**实际用了**哪些上下文（第 11 种帧 `context`）—— 显示"正在参考：…" */
 const contextResolved = ref<{ doc_title?: string; unit_title?: string }>({})
@@ -281,6 +314,16 @@ function onEvent(e: ChatServerEvent) {
       // ④ 落盘状态（v1 chat.html:382-386 的诚实提示；v2 有字段但界面没用）
       persistence.value = String((e as any).persistence || '')
       persistenceReason.value = String((e as any).persistence_reason || '')
+      // ★ pi-bridge 新字段：模型来源（回落时要能解释"为什么模型不对"）
+      modelSource.value = String((e as any).model_source || '')
+      modelWarning.value = String((e as any).model_warning || '')
+      // ★ 刷新后历史是否恢复（false + reason 要**如实说**，别让用户以为"对话凭空没了"）
+      resumed.value = typeof (e as any).resumed === 'boolean' ? (e as any).resumed : null
+      restoredMessages.value = Number.isFinite((e as any).restoredMessages) ? Number((e as any).restoredMessages) : null
+      resumeReason.value = String((e as any).resumeReason || '')
+      restarted.value = (e as any).restarted === true
+      // ★ kb 工具装不上（`tools_source='kb-unavailable'`）：用**后端给的原因原文**
+      kbToolsWarning.value = String((e as any).kb_tools_warning || '')
       const w = String((e as any).tools_warning || '')
       if (w) toolsWarningFromFrame.value = w
       // ★ 模式回显：`agent_mode`（不是 `mode`）——把自己选的与后端给的**分开显示**
@@ -289,8 +332,9 @@ function onEvent(e: ChatServerEvent) {
       if (backendMode.value && backendMode.value !== chatMode.value) {
         modeNote.value = `你选的是 ${chatMode.value}，后端实际按 ${backendMode.value} 执行`
       } else if (chatMode.value === 'agent' && !sessionTools.value.includes('kb_search')) {
-        // 知识库未接入 / 角色限制：**如实说"没有可用工具"**，不假装 agent 生效
-        modeNote.value = `你选了 agent，但后端本会话没有给知识库工具${toolsWarning.value ? `：${toolsWarning.value}` : ''}`
+        // 知识库未接入 / 角色限制：**如实说"没有可用工具"**（优先用后端给的 `kb_tools_warning` 原文）
+        const why = kbToolsWarning.value || toolsWarning.value
+        modeNote.value = `你选了 agent，但后端本会话没有给知识库工具（tools_source=${toolsSource.value || '未上报'}）${why ? `：${why}` : ''}`
       }
       break
     /**
@@ -381,7 +425,8 @@ function onEvent(e: ChatServerEvent) {
       break
     case 'error': {
       const code = String((e as any).code || '')
-      updateLast((m) => { m.error = { code, msg: (e as any).msg } })
+      // `detail` 一并显示（排障用；pi-bridge 的 error 帧字段清单）
+      updateLast((m) => { m.error = { code, msg: [(e as any).msg, (e as any).detail].filter(Boolean).join(' —— ') } })
       // ③ 结束运行态（否则错误后按钮**一直停在"运行中"**，用户只能刷新）
       busy.value = false
       if (code === 'E_PI_UNAVAILABLE' || code === 'E_PI_EXIT') {
@@ -394,6 +439,14 @@ function onEvent(e: ChatServerEvent) {
       // ★ 一轮结束的唯一信号（§7.3.1）
       busy.value = false
       settledCount.value++
+      // ★ `synthetic`/`disposition`：**"本轮没真正启动"不能当正常结束**（如实标注）
+      const synthetic = (e as any).synthetic === true
+      const disposition = String((e as any).disposition || '')
+      const abortSource = String((e as any).abort_source || '')
+      if (synthetic || disposition) {
+        stateNote.value = `本轮未真正启动运行（synthetic=${synthetic}${disposition ? ` · disposition=${disposition}` : ''}）`
+      }
+      if (abortSource) stateNote.value = `已中断（abort_source=${abortSource}）`
       updateLast((m) => {
         if ((e as any).aborted) m.text += m.text ? '\n（已中断）' : '（已中断）'
         if (!m.text && !m.tools.length && !m.error) m.error = { code: 'E_EMPTY', msg: '本轮没有产生任何文本或工具调用（后端 error 事件缺失？）' }
@@ -504,7 +557,7 @@ onMounted(async () => {
 
 /** 建连（模式走 URL 查询参数） */
 function startSocket() {
-  socket = new ChatSocket(sessionId, undefined, chatMode.value)
+  socket = new ChatSocket(sessionId, undefined, chatMode.value, props.assistant)
   socket.onState((s, info) => {
     state.value = s
     if (info) stateNote.value = info
@@ -626,6 +679,9 @@ void _esc
         <b>{{ props.title }}</b>
         <span class="pill" :class="state === 'open' ? 'ok' : 'bad'" data-testid="ws-state">{{ state }}</span>
         <span v-if="model" class="pill blue">{{ model }}</span>
+        <!-- ★ 助手入口（backend-api 接线）：video = 视频助手提示词（含渲染契约）；可核验 -->
+        <span class="pill" :class="props.assistant === 'video' ? 'orange' : ''" data-testid="assistant-entry"
+              :data-entry="props.assistant">{{ props.assistant === 'video' ? '视频助手提示词' : '通用助手提示词' }}</span>
         <span v-if="stateNote" class="small faint" data-testid="ws-note">{{ stateNote }}</span>
         <span v-if="closeCode" class="small faint mono" data-testid="ws-close-code">code={{ closeCode }}</span>
         <span class="small" :class="toolsSource === 'dangerous-opt-in' ? 'tools-danger' : 'faint'"
@@ -669,6 +725,23 @@ void _esc
         </span>
       </div>
       <div v-if="modeNote" class="note warn" style="margin-top: 6px" data-testid="mode-note">{{ modeNote }}</div>
+      <!-- ★ pi-bridge 新字段：模型来源回落 / 会话恢复 / 自动重启 / kb 工具装不上 —— 都如实说 -->
+      <div v-if="modelWarning || (modelSource && modelSource !== 'explicit')" class="small faint" style="margin-top: 4px"
+           data-testid="model-source" :data-model-source="modelSource">
+        模型来源：{{ modelSource || '未上报' }}{{ modelWarning ? ` —— ${modelWarning}` : '' }}
+      </div>
+      <div v-if="resumed === false" class="small faint" style="margin-top: 4px" data-testid="resume-note">
+        本会话**没有恢复历史**（resumed=false{{ resumeReason ? ` · ${resumeReason}` : '' }}）—— 刷新后对话会重新开始。
+      </div>
+      <div v-else-if="resumed === true" class="small faint" style="margin-top: 4px" data-testid="resume-note">
+        已恢复历史消息 {{ restoredMessages ?? '?' }} 条。
+      </div>
+      <div v-if="restarted" class="note warn" style="margin-top: 4px" data-testid="restarted">
+        pi 进程曾自动重启 —— 连接已恢复，但**上一轮可能被截断**。
+      </div>
+      <div v-if="kbToolsWarning" class="note warn" style="margin-top: 4px" data-testid="kb-tools-warning">
+        知识库工具不可用：{{ kbToolsWarning }}
+      </div>
       <!-- ④ 诚实降级：本轮**不落盘** → 刷新就没了（事前说清，别等学生发现对话丢了） -->
       <div v-if="persistence && persistence !== 'native'" class="small faint" style="margin-top: 4px"
            data-testid="persistence-note" :data-persistence="persistence">
@@ -774,7 +847,12 @@ void _esc
             <span v-else class="pill" :class="t.ok ? 'ok' : 'bad'">{{ t.ok ? '成功' : '失败' }} {{ t.duration_ms ?? '—' }}ms</span>
             <div v-if="t.partial" class="evidence">{{ t.partial.slice(0, 160) }}</div>
           </div>
-          <div v-if="m.text" class="text" :data-testid="m.role === 'assistant' ? 'assistant-text' : ''">{{ foldToolMarkers(m.text).text }}</div>
+          <!-- ★ 富文本：公式（KaTeX）/ 代码块（语言 + 复制 + 未闭合容错）/ 普通文本（已转义）
+               ⚠️ 外层 div 才带 `assistant-text`：直接把同名 testid 传给组件会**覆盖组件内部的
+               `rich-text` testid**（Vue 属性透传会合并/覆盖根元素属性）→ e2e 就找不到 rich-text 了。 -->
+          <div v-if="m.text" class="text" :data-testid="m.role === 'assistant' ? 'assistant-text' : ''">
+            <RichText :text="foldToolMarkers(m.text).text" :stats="queryFlag('selftest')" />
+          </div>
           <!-- ⚠️ 模型把原始 tool 标记写进正文（pi-bridge 实测：tools:[] 时工具调用退化成文本）→ 折叠并如实告知 -->
           <div v-if="m.role === 'assistant' && foldToolMarkers(m.text).folded > 0" class="small faint"
                data-testid="tool-marker-folded" :data-count="foldToolMarkers(m.text).folded">

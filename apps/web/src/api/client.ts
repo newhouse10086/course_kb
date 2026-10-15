@@ -257,8 +257,16 @@ export const api = {
    * `?mode=chat|agent` —— pi 把 mode 编进会话 key，**工具集在建会话时确定**；
    * 帧里带 `mode` 只做一致性校验。所以**切模式必须重连**（会丢上下文，这是有意取舍）。
    */
-  chatWsUrl: (sessionId: string, mode?: 'chat' | 'agent') => {
-    const q = mode ? `?mode=${mode}` : ''
+  /**
+   * §7.2 对话 WS。
+   * ★ 两个**连接级**参数（都在建会话时定，切了要重连）：
+   *   · `?mode=chat|agent` —— 工具集（能不能调 kb_search/kb_get 读原文）
+   *   · `?assistant=chat|video` —— **系统提示词**（video 带视频助手提示词 + 渲染契约）
+   * 非法值 → 后端 `E_BADREQUEST` + close(1008)，**不静默降级**。
+   */
+  chatWsUrl: (sessionId: string, mode?: 'chat' | 'agent', assistant?: 'chat' | 'video') => {
+    const qs = [mode ? `mode=${mode}` : '', assistant ? `assistant=${assistant}` : ''].filter(Boolean)
+    const q = qs.length ? `?${qs.join('&')}` : ''
     if (typeof location === 'undefined') return `ws://127.0.0.1:8787/api/v1/chat/${sessionId}${q}`
     const h = location.hash || ''
     const i = h.indexOf('?')

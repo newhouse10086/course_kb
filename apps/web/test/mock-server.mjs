@@ -474,7 +474,9 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
     /** agent 模式允许的角色（服务端权威；默认 admin+teacher，student 只给 chat） */
     agent_roles: ['admin', 'teacher'],
     /** 知识库为空（agent 必然 0 命中 → 前端要如实提示"先上传并抽取"） */
-    empty_kb: false }
+    empty_kb: false,
+    /** 助手回答用"含公式/代码/未闭合围栏"的样例（e2e ?rich=1） */
+    rich_answer: false }
   globalThis.__MOCK_CFG__ = CFG   // capabilitiesPayload() 在顶层，靠它读到 fixture 开关
   /** 模型/设置/sandbox 的运行期状态（真后端在 settings.json + SQLite 里） */
   const STATE = {
@@ -582,6 +584,7 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         if (q.has('retrieval')) CFG.retrieval = q.get('retrieval')
         if (q.has('agent_roles')) CFG.agent_roles = String(q.get('agent_roles')).split(',').filter(Boolean)
         if (q.has('empty_kb')) CFG.empty_kb = ['1', 'true'].includes(q.get('empty_kb'))
+        if (q.has('rich')) CFG.rich_answer = ['1', 'true'].includes(q.get('rich'))
         if (q.has('kg_hit')) CFG.kg_hit = ['1', 'true'].includes(q.get('kg_hit'))
         if (q.has('running_llm')) { CFG.running_llm = ['1', 'true', 'yes'].includes(q.get('running_llm')); STATE.runningLlmTask = CFG.running_llm }
         return json({ config: { ...CFG, uploads: CFG.uploads.length } })
@@ -1063,10 +1066,20 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
         try { ws.close(1008, 'bad mode') } catch { /* ignore */ }
         return
       }
+      // ★ 助手入口（backend-api 接线）：决定**系统提示词**；非法值**建连即拒**（不静默降级）
+      const rawAssistant = u.searchParams.get('assistant')
+      const assistant = rawAssistant === null || rawAssistant === '' ? 'chat' : rawAssistant
+      if (!['chat', 'video'].includes(assistant)) {
+        send({ type: 'error', code: 'E_BADREQUEST', msg: `未知的助手入口："${assistant}"`,
+          hint: "assistant 只接受 'chat' | 'video'；缺省 = 'chat'。请用 ?assistant=… 重连" })
+        try { ws.close(1008, 'bad assistant') } catch { /* ignore */ }
+        return
+      }
       const isAgent = connMode === 'agent'
       send({ type: 'ready', session_id: sessionId, model: 'deepseek-v4.1-flash', mode: 'sdk', agent_mode: connMode,
         tools: isAgent ? ['kb_search', 'kb_get'] : [],
-        tools_source: isAgent ? 'kb-readonly' : 'disabled-by-role' })
+        tools_source: isAgent ? 'kb-readonly' : 'disabled-by-role',
+        assistant, system_prompt: assistant === 'video' ? 'VIDEO_ASSISTANT_SYSTEM_PROMPT(+RENDER_CONTRACT)' : 'CHAT_ASSISTANT_SYSTEM_PROMPT(+RENDER_CONTRACT)' })
       let timer = null
       const clear = () => { if (timer) { clearTimeout(timer); timer = null } }
       ws.on('message', (raw) => {
@@ -1097,7 +1110,28 @@ export function startMockServer({ degraded = false, port = 0, dist = DIST } = {}
             else dropped.push({ field: 'unit_id', value: String(ctx.unit_id), reason: '未找到或无权访问' })
           }
           send({ type: 'context', used: ctx, resolved, dropped, note: '' })
-          const text = '聚簇索引把整行数据放在 B+ 树的叶子节点上，因此按主键范围扫描非常快；二级索引只存主键值，查询非索引列时要"回表"。'
+          /**
+           * ★ 助手回答（mock）：**故意包含公式 / 代码块 / 未闭合围栏 / 中文 \text{}** ——
+           * 用来断言前端富文本渲染（KaTeX 成功与失败、代码块容错、转义安全）。
+           */
+          const text = CFG.rich_answer
+            ? [
+              '聚簇索引把整行数据放在 B+ 树的叶子节点上。',
+              '',
+              '行内公式：$O(\\log n)$；块级公式：',
+              '$$T(n) = \\sum_{i=1}^{n} \\log i = \\Theta(n \\log n)$$',
+              '中文混排：$\\text{聚簇索引} \\to \\text{回表}$',
+              '坏公式（KaTeX 必失败）：$\\frac{1}{$',
+              '',
+              '```sql',
+              'SELECT * FROM students WHERE id = 1;',
+              '```',
+              '',
+              '未闭合围栏（模型漏了结尾的 ```）：',
+              '```python',
+              'print("hello")',
+            ].join('\n')
+            : '聚簇索引把整行数据放在 B+ 树的叶子节点上，因此按主键范围扫描非常快；二级索引只存主键值，查询非索引列时要"回表"。'
           const chunks = msg.type === 'steer' ? ['（插话）', '好的，', '换个更短的例子。'] : text.match(/[\s\S]{1,6}/g)
           let i = 0
           // 真实 pi 会先流 thinking_delta（契约 §7.2 的第 9 种帧之一）→ mock 也要发，

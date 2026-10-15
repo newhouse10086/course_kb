@@ -128,6 +128,26 @@ npm test               # unit + e2e
 - App 挂载时**后台预热** `/capabilities`（不阻塞路由）
 - 顶栏显示「更新于 X 秒前」（`cached_age_ms`）+「重新探测」走 **`?refresh=1`**；不因 `cached:true` 就当作数据不可信
 
+## 3A-4. 富文本渲染：公式 / 代码块 / 思维导图（用户需求：AI 生成内容要渲染好）
+
+`src/utils/rich.ts` + `src/components/RichText.vue`（Chat 助手正文、Video 总结都用它 —— **一套实现**）
+
+| 能力 | 实现 | 诚实点 |
+|---|---|---|
+| **公式** | **KaTeX**（`katex@^0.16.47`，纯前端、无服务端依赖）：行内 `$…$`、块级 `$$…$$`、中文 `\text{聚簇索引}` | ★ **解析失败 → 显示原文 + 「公式渲染失败：<KaTeX 原因>」**（**不静默**；学生看到空白会以为内容丢了）<br>模型若用 `\(…\)` / `\[…\]` → 也渲染，但**标注"契约要求 $…$"** |
+| **代码块** | 语言标签 + 复制按钮 + 长代码折叠（>24 行才套 `<details>`）+ 行数 | ★ **未闭合围栏容错**：模型漏了结尾 ``` → **照样按代码块渲染到最后**并标注"代码围栏未闭合"，**不整段崩成纯文本** |
+| **思维导图** | `MindMap.vue`（自写 markmap 解析，`utils/markmap.ts`） | 节点带时间戳 → 「▶ 07:30」按钮**点了跳视频位置**；折叠/展开；与章节、字幕同一 `seek` 通道 |
+
+**安全**：模型输出是**不可信输入** → 先 `esc()` 转义，再只拼我们自己生成的标签（**不引入通用 markdown 库、不做裸 `v-html`**）。
+e2e 断言：助手消息里 `img/script/iframe` 数量必须为 **0**。
+
+**依赖说明**：新增 `katex` —— 公式排版没有可替代的成熟方案；纯前端、无服务端依赖、无网络请求（字体随包发布）。
+
+**提示词侧**（`pi-bridge` 的写域）：`apps/server/src/agent/prompts.ts` 有 `RENDER_CONTRACT`（公式定界符、代码块标语言、导图层级、引用锚点、**不许编造公式**）
+与客观判据 `auditRenderFormat` / `auditNoFabricatedFormula`。
+⚠️ **chat/视频路径的系统提示词尚未接线**（需 backend-api 在构造 `AgentSessionManager` 时传 `systemPrompt`）——
+**"提示词写了" ≠ "生效了"**（同坑 24）。
+
 ## 3B. 模型设置（教师 / admin）—— `docs/SETTINGS_AND_SANDBOX.md` §2
 
 > ⚠️ 本页依赖的 `/models`、`/settings/*` **真后端还没实现（404）** → 真后端下本页显示"未实现"；下表的数字是**契约 mock** 下跑出来的（等 backend-api 就绪后同样适用，前端无需改动）。—— `docs/SETTINGS_AND_SANDBOX.md` §2

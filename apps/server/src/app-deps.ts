@@ -89,6 +89,13 @@ export type ChatConnectionFactory = (opts: {
    */
   allowTools?: boolean;
   /**
+   * ★ **助手入口**（决定用哪套系统提示词）：`'chat'`（默认，通用助教）/ `'video'`（视频助手）。
+   *
+   * 为什么在**连接参数**里：`systemPrompt` 是**管理器级**的（`getOrCreate` 不接受按会话的），
+   * 必须在建会话时定；路由按 `?assistant=` 校验后传下来（未知值 → 明确报错，**不静默降级**）。
+   */
+  assistant?: 'chat' | 'video';
+  /**
    * ★ **对话模式**（Lead 裁定）：`'chat'`（纯问答，无工具）/ `'agent'`（只读知识库工具）。
    *
    * 由 `routes/chat.ts` **服务端校验**（只接受这两个值；未知值 → 明确报错，**不静默降级**），

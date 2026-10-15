@@ -60,10 +60,10 @@ export class ChatSocket {
   private stateHandlers: Array<(s: ChatState, info?: string) => void> = []
   private queue: ChatClientMessage[] = []
 
-  constructor(sessionId: string, url?: string, mode?: 'chat' | 'agent') {
+  constructor(sessionId: string, url?: string, mode?: 'chat' | 'agent', assistant?: 'chat' | 'video') {
     this.sessionId = sessionId
-    // 模式是**连接级**参数（`?mode=`）；不传 = 后端缺省 chat
-    this.url = url || api.chatWsUrl(sessionId, mode)
+    // `mode`（工具集）与 `assistant`（系统提示词）都是**连接级**参数；不传 = 后端缺省 chat
+    this.url = url || api.chatWsUrl(sessionId, mode, assistant)
     try {
       this.ws = new WebSocket(this.url)
     } catch (e) {

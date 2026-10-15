@@ -1,3 +1,5 @@
+// ★ KaTeX 样式（公式渲染必需）
+import 'katex/dist/katex.min.css'
 import { createApp } from 'vue'
 import App from './App.vue'
 import { router } from './router'
