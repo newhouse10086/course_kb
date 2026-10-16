@@ -1,0 +1,111 @@
+{
+  "version": "1.0",
+  "description": "LLM 批量抽取的边类型枚举（封闭）。LLM 只能输出此表中的 etype。",
+  "layers": {
+    "L0": { "name": "思想层", "desc": "判据与守恒律，不是知识点" },
+    "L1": { "name": "机制层", "desc": "内核机制：索引/日志/并发/优化器" },
+    "L2": { "name": "实现层", "desc": "产品与国产化实现" },
+    "L3": { "name": "领域层", "desc": "业务域实例（可执行产物）" }
+  },
+  "transitive": ["DEPENDS_ON", "PART_OF"],
+  "edge_types": {
+    "DEPENDS_ON": {
+      "transitive": true,
+      "desc": "学习前置：掌握 B 是理解 A 的前提",
+      "direction": "src 依赖 dst",
+      "example": { "src": "S3.normalization.3nf", "dst": "S3.fd.basic", "why": "不懂函数依赖无法判定 3NF" },
+      "extract_hint": "文中出现『必须先/前提/基础是』或讲解顺序明显在前"
+    },
+    "PART_OF": {
+      "transitive": true,
+      "desc": "组成归属：A 是 B 的组成部分",
+      "direction": "src 属于 dst",
+      "example": { "src": "S4.sql.having", "dst": "S4.sql.select", "why": "HAVING 是 SELECT 语句的子句" },
+      "extract_hint": "『包括/由…组成/其中一个子句』"
+    },
+    "REALIZES": {
+      "transitive": false,
+      "desc": "思想→机制：某机制是为了实现某思想/原理",
+      "direction": "机制 REALIZES 思想",
+      "example": { "src": "S4.view", "dst": "L0.data_independence", "why": "视图是数据独立性的实现手段" },
+      "extract_hint": "『为了实现/目的是/解决了…问题』"
+    },
+    "IMPLEMENTS": {
+      "transitive": false,
+      "desc": "机制→产品实现：具体 DBMS 如何实现该机制",
+      "direction": "产品实现 IMPLEMENTS 机制",
+      "example": { "src": "L2.innodb.clustered_index", "dst": "L1.btree", "why": "InnoDB 用 B+树实现聚簇索引" },
+      "extract_hint": "出现具体产品名 + 机制名"
+    },
+    "CONTRASTS_WITH": {
+      "transitive": false,
+      "desc": "实现差异对比：两者对同一问题的处理不同",
+      "direction": "无向（对称）",
+      "example": { "src": "L2.mysql.rr", "dst": "L2.pg.rr", "why": "MySQL RR 用间隙锁抑制幻读，PG RR 不抑制" },
+      "extract_hint": "『而/相比之下/不同于/与…相反』"
+    },
+    "INSTANCE_OF": {
+      "transitive": false,
+      "desc": "抽象→业务实例：某业务场景是该概念的真实应用",
+      "direction": "实例 INSTANCE_OF 抽象",
+      "example": { "src": "L3.bank.transfer", "dst": "S7.transaction.acid", "why": "银行转账是事务原子性的实例" },
+      "extract_hint": "业务场景 + 对应的技术概念"
+    },
+    "SCHEMA_PATTERN": {
+      "transitive": false,
+      "desc": "业务→表设计：该业务的表结构设计范式",
+      "direction": "业务 SCHEMA_PATTERN 表设计",
+      "example": { "src": "L3.bank.transfer", "dst": "L3.bank.account_table", "why": "转账需要账户表+流水表" },
+      "extract_hint": "出现表名/字段/外键/约束"
+    },
+    "USED_IN_ROLE": {
+      "transitive": false,
+      "desc": "知识→岗位能力：该知识用于哪个岗位",
+      "direction": "知识 USED_IN_ROLE 岗位",
+      "example": { "src": "L1.index.tuning", "dst": "role.dba", "why": "索引调优是 DBA 核心能力" },
+      "extract_hint": "出现岗位名/职责描述"
+    },
+    "GOVERNED_BY": {
+      "transitive": false,
+      "desc": "技术→合规要求：受某法规/标准约束",
+      "direction": "技术 GOVERNED_BY 规范",
+      "example": { "src": "L0.encryption", "dst": "law.pipl", "why": "个人信息保护法要求加密存储" },
+      "extract_hint": "出现法规名/标准号/合规要求"
+    },
+    "HISTORICAL_ORIGIN": {
+      "transitive": false,
+      "desc": "概念→起因：该概念为解决什么问题而提出",
+      "direction": "概念 HISTORICAL_ORIGIN 问题",
+      "example": { "src": "S3.normalization.3nf", "dst": "problem.update_anomaly", "why": "范式为解决更新异常而提出" },
+      "extract_hint": "『为了解决/由于…问题/早期存在』"
+    },
+    "COMMON_MISCONCEPTION": {
+      "transitive": false,
+      "desc": "知识→典型错误：学生常见误解",
+      "direction": "知识 COMMON_MISCONCEPTION 错误认识",
+      "example": { "src": "S4.null.semantics", "dst": "misconception.null_eq_null", "why": "误以为 NULL = NULL 为真" },
+      "extract_hint": "『容易混淆/错误地认为/注意区分』"
+    },
+    "ASSESSED_BY": {
+      "transitive": false,
+      "desc": "知识→考核方式：该知识点如何被考查",
+      "direction": "知识 ASSESSED_BY 题型",
+      "example": { "src": "S4.sql.join", "dst": "item.综合题", "why": "连接查询出现在操作题" },
+      "extract_hint": "题目/题型/分值/考试要求"
+    }
+  },
+  "entity_types": {
+    "concept": "技术概念（范式、事务、索引）",
+    "mechanism": "内核机制（B+树、WAL、MVCC）",
+    "product": "数据库产品（MySQL、openGauss）",
+    "feature": "产品特性（InnoDB 聚簇索引）",
+    "business": "业务场景（银行转账）",
+    "table": "表设计（账户表、流水表）",
+    "role": "岗位（DBA、数据工程师）",
+    "regulation": "法规标准（个人信息保护法）",
+    "problem": "问题（更新异常、脏读）",
+    "misconception": "常见误解",
+    "assessment": "考核方式",
+    "station": "查询生命周期站点（S1–S8）"
+  }
+}

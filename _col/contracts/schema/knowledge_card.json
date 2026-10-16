@@ -1,0 +1,138 @@
+{
+  "version": "2.0",
+  "name": "knowledge_card",
+  "description": "知识点建档 schema —— 从「关系抽取」升级为「可学知识」。v1 只抽关系，导致抽出的知识点看不出『是什么、能做什么、怎么用』。",
+  "motivation": {
+    "v1_problem": "用户反馈：log_filter_dragnet 词条只显示 SET GLOBAL 命令作证据，看不出含义、用途、是主动工具还是运行态组件。",
+    "root_cause": "v1 schema 只有 entities + edges，无『知识点定性』字段。手册 p1040-1041 本来有完整解释（INSTALL COMPONENT / SET GLOBAL vs SET PERSIST / 示例），但全部被丢弃。"
+  },
+
+  "card_fields": {
+    "name": {
+      "type": "string",
+      "required": true,
+      "desc": "知识点名称（原文措辞，标识符不译）"
+    },
+    "kind": {
+      "type": "enum",
+      "required": true,
+      "values": [
+        "sql_statement", "sql_clause", "function", "operator", "data_type",
+        "system_variable", "status_variable", "command_line_option",
+        "client_program", "server_program", "utility_program",
+        "storage_engine", "plugin", "component", "log_sink", "log_filter",
+        "table", "schema_object", "concept", "mechanism", "file", "protocol", "other"
+      ],
+      "desc": "★ v2 新增：知识点到底是什么东西。解决『不知道是工具还是组件』"
+    },
+    "one_line": {
+      "type": "string",
+      "required": true,
+      "max_len": 80,
+      "desc": "★ v2 新增：一句话说清『这是什么』。必须能在不读原文的情况下看懂"
+    },
+    "purpose": {
+      "type": "string",
+      "required": true,
+      "max_len": 120,
+      "desc": "★ v2 新增：『能做什么/解决什么问题』。若原文未说明则填 UNKNOWN"
+    },
+    "usage_mode": {
+      "type": "enum",
+      "required": true,
+      "values": ["user_invoked", "server_automatic", "both", "internal", "unknown"],
+      "desc": "★ v2 新增：用户主动使用 vs 服务器自动运行。解决『主动工具还是运行态组件』"
+    },
+    "operational_role": {
+      "type": "enum",
+      "required": true,
+      "values": ["feature", "maintenance", "performance", "security", "diagnostics",
+                 "replication", "storage", "configuration", "unknown"],
+      "desc": "★ v2 新增：实现功能 vs 维持系统。解决『是实现功能还是维持系统』"
+    },
+    "example": {
+      "type": "string",
+      "required": false,
+      "desc": "★ v2 新增：手册中的最小可用示例（代码原样，不加解释）。无则 null"
+    },
+    "example_explained": {
+      "type": "string",
+      "required": false,
+      "max_len": 150,
+      "desc": "★ v2 新增：示例在做什么（用中文说明，帮读者看懂 SET GLOBAL 这类语句）"
+    },
+    "lifecycle": {
+      "type": "enum",
+      "required": false,
+      "values": ["install_then_use", "set_runtime", "set_persistent", "option_file",
+                 "builtin", "unknown"],
+      "desc": "★ v2 新增：如何启用/配置，以及重启后是否保留"
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": "string",
+      "desc": "★ v2 新增：使用前必须先做什么（如『先 INSTALL COMPONENT』）"
+    },
+    "cautions": {
+      "type": "array",
+      "items": "string",
+      "desc": "★ v2 新增：注意事项/易错点（如『启用它会忽略 log_error_suppression_list』）"
+    },
+    "evidence_quote": {
+      "type": "string",
+      "required": true,
+      "desc": "支持 one_line 的原文引用（逐字）"
+    },
+    "evidence_page": {
+      "type": "integer",
+      "required": true
+    },
+    "confidence": {
+      "type": "number",
+      "required": true,
+      "desc": "0-1。信息不足时**必须低**，宁可标 unknown 也不要编"
+    }
+  },
+
+  "section_fields": {
+    "section_summary": {
+      "type": "string",
+      "desc": "★ v2 新增：本节讲什么（2-3 句），面向『想快速知道这节讲什么』的读者"
+    },
+    "learning_objectives": {
+      "type": "array",
+      "items": "string",
+      "desc": "★ v2 新增：读完这节应掌握什么（3-5 条，动词开头）"
+    },
+    "section_role": {
+      "type": "enum",
+      "values": ["concept_intro", "how_to", "reference", "troubleshooting",
+                 "best_practice", "internals", "comparison", "unknown"],
+      "desc": "★ v2 新增：这节的体裁。决定该怎么读"
+    },
+    "key_takeaways": {
+      "type": "array",
+      "items": "string",
+      "desc": "★ v2 新增：本节最重要的 3 条要点"
+    }
+  },
+
+  "relation_fields": {
+    "depends_on": {
+      "desc": "★ v2 强化：学习前置。原表达『必须先掌握 X』，而非『需要某权限』",
+      "negative_examples": ["需要 UPDATE 权限（这是权限要求，不是学习前置）"]
+    },
+    "learning_order": {
+      "type": "object",
+      "desc": "★ v2 新增：学习顺序信号（手册本身不含教学序，需从章节序+依赖显式推导）",
+      "fields": {"before": "应先学的", "reason": "为什么"}
+    }
+  },
+
+  "honesty_rules": [
+    "★ 原文没说的，一律填 UNKNOWN 或 null，**绝不编造**",
+    "one_line 必须能被不懂 MySQL 的人看懂",
+    "example 必须是原文中的代码，不得自己写",
+    "confidence < 0.5 表示这条卡片信息可能不完整，读者应回原文核对"
+  ]
+}
