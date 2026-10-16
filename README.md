@@ -137,6 +137,11 @@ npm run dev          # vite
 
 ## 6. 已知限制（如实列出）
 
+> ★ **已确认但暂未修复的缺陷**另见 **[`docs/BUGS.md`](docs/BUGS.md)** ——
+> 含症状、复现步骤、已定位的根因与修法方向（目前 2 条，均为 🔴 高）：
+> **BUG-001 视频目录死锁**（零目录时教师建不出第一个目录）·
+> **BUG-002 切换会话后消息加载不出来且无法继续对话**。
+
 - **未做 HTTPS/TLS、备份恢复、系统服务化（systemd）、CI** —— 仅适合本机/内网演示。
 - **沙箱只支持 SQLite**：MySQL / PostgreSQL / openGauss 的 adapter **未接入**（无 Docker 环境）。
 - **`/capabilities` 冷调用约 30 秒**（真探测所有 provider）；之后 5 分钟缓存。
